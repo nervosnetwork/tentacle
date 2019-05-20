@@ -7,6 +7,8 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
+/// Snappy compress/decompress
+mod compress;
 /// This module create a `DNSResolver` future task to DNS resolver
 pub mod dns;
 

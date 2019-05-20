@@ -21,6 +21,7 @@ log = "0.4"
 bytes = "0.4"
 tokio-threadpool = "0.1"
 
+snap = "0.2.5"
 flatbuffers = "0.6.0"
 flatbuffers-verifier = "0.2.0"
 multiaddr = { package = "parity-multiaddr", version = "0.4.0" }
