@@ -58,6 +58,8 @@ impl SecioKeyPair {
     }
 
     /// Returns the public key corresponding to this key pair.
+    /// deprecated on 0.3.0, rename to `public_key`
+    #[deprecated(since = "0.3.0", note = "rename to `public_key`")]
     pub fn to_public_key(&self) -> PublicKey {
         match self.inner {
             KeyPairInner::Secp256k1 { ref private } => {
@@ -68,9 +70,27 @@ impl SecioKeyPair {
         }
     }
 
+    /// Returns the public key corresponding to this key pair.
+    pub fn public_key(&self) -> PublicKey {
+        match self.inner {
+            KeyPairInner::Secp256k1 { ref private } => {
+                let secp = secp256k1::Secp256k1::signing_only();
+                let pubkey = secp256k1::key::PublicKey::from_secret_key(&secp, private);
+                PublicKey::Secp256k1(pubkey.serialize().to_vec())
+            }
+        }
+    }
+
     /// Generate Peer id
+    /// deprecated on 0.3.0, rename to `peer_id`
+    #[deprecated(since = "0.3.0", note = "rename to `peer_id`")]
     pub fn to_peer_id(&self) -> PeerId {
-        self.to_public_key().peer_id()
+        self.public_key().peer_id()
+    }
+
+    /// Generate Peer id
+    pub fn peer_id(&self) -> PeerId {
+        self.public_key().peer_id()
     }
 }
 

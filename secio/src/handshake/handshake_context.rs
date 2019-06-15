@@ -85,7 +85,7 @@ impl HandshakeContext<()> {
     pub fn with_local(self) -> HandshakeContext<Local> {
         let nonce: [u8; 16] = rand::random();
 
-        let public_key = self.config.key.to_public_key();
+        let public_key = self.config.key.public_key();
 
         // Send our proposition with our nonce, public key and supported protocols.
         let mut proposition = Propose::new();
@@ -151,7 +151,7 @@ impl HandshakeContext<Local> {
             }
         };
 
-        if public_key == self.config.key.to_public_key() {
+        if public_key == self.config.key.public_key() {
             return Err(SecioError::ConnectSelf);
         }
 
