@@ -22,7 +22,7 @@ use crate::{
     service::{
         config::{ServiceConfig, State},
         event::{Priority, ServiceTask},
-        future_task::{BoxedFutureTask, FutureTaskManager},
+        future_task::{BlockingFutureTask, BoxedFutureTask, FutureTaskManager},
     },
     session::{Session, SessionEvent, SessionMeta},
     traits::{ServiceHandle, ServiceProtocol, SessionProtocol},
@@ -1112,6 +1112,7 @@ where
 
     #[inline]
     fn send_future_task(&mut self, task: BoxedFutureTask) {
+        let task = Box::new(BlockingFutureTask::new(task));
         self.pending_tasks.push_back(task);
         self.send_pending_task();
     }

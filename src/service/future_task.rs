@@ -1,6 +1,7 @@
 use futures::{
     prelude::*,
     sync::{mpsc, oneshot},
+    try_ready,
 };
 use log::{debug, trace};
 use std::collections::HashMap;
@@ -148,6 +149,25 @@ impl Stream for FutureTaskManager {
         }
 
         Ok(Async::NotReady)
+    }
+}
+
+pub(crate) struct BlockingFutureTask {
+    task: BoxedFutureTask,
+}
+
+impl BlockingFutureTask {
+    pub(crate) fn new(task: BoxedFutureTask) -> BlockingFutureTask {
+        BlockingFutureTask { task }
+    }
+}
+
+impl Future for BlockingFutureTask {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        try_ready!(tokio_threadpool::blocking(|| self.task.poll()).map_err(|_| ()))
     }
 }
 
