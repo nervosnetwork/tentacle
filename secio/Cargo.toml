@@ -32,13 +32,14 @@ rand = "0.6"
 ring = "0.16.5"
 twofish = "0.2.0"
 aes-ctr = "0.3.0"
+aesni = { version = "0.6", default-features = false, features = ["nocheck"] }
 ctr = "0.3.0"
 unsigned-varint = "0.2.2"
 bs58 = "0.2.0"
 
 [dev-dependencies]
 env_logger = "0.6"
-criterion = "0.2"
+criterion = "0.3"
 
 [features]
 default = []

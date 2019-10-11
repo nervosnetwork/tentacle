@@ -5,8 +5,12 @@ use crate::codec::StreamCipher;
 use aes_ctr::stream_cipher::generic_array::GenericArray;
 use aes_ctr::stream_cipher::NewStreamCipher;
 use aes_ctr::{Aes128Ctr, Aes256Ctr};
+use aesni::{Aes128Ctr as NIAes128Ctr, Aes256Ctr as NIAes256Ctr};
 use ctr::Ctr128;
 use twofish::Twofish;
+
+static mut AES_NI: bool = false;
+static INIT: ::std::sync::Once = ::std::sync::Once::new();
 
 /// Possible encryption ciphers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,18 +43,40 @@ impl Cipher {
 /// Returns your stream cipher depending on `Cipher`.
 #[inline]
 pub fn ctr_init(key_size: Cipher, key: &[u8], iv: &[u8]) -> StreamCipher {
-    match key_size {
-        Cipher::Aes128 => Box::new(Aes128Ctr::new(
-            GenericArray::from_slice(key),
-            GenericArray::from_slice(iv),
-        )),
-        Cipher::Aes256 => Box::new(Aes256Ctr::new(
-            GenericArray::from_slice(key),
-            GenericArray::from_slice(iv),
-        )),
-        Cipher::TwofishCtr => Box::new(Ctr128::<Twofish>::new(
-            GenericArray::from_slice(key),
-            GenericArray::from_slice(iv),
-        )),
+    INIT.call_once(|| unsafe {
+        AES_NI = is_x86_feature_detected!("aes") && is_x86_feature_detected!("sse3");
+    });
+
+    let enable = unsafe { AES_NI };
+    if enable {
+        match key_size {
+            Cipher::Aes128 => Box::new(NIAes128Ctr::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            )),
+            Cipher::Aes256 => Box::new(NIAes256Ctr::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            )),
+            Cipher::TwofishCtr => Box::new(Ctr128::<Twofish>::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            )),
+        }
+    } else {
+        match key_size {
+            Cipher::Aes128 => Box::new(Aes128Ctr::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            )),
+            Cipher::Aes256 => Box::new(Aes256Ctr::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            )),
+            Cipher::TwofishCtr => Box::new(Ctr128::<Twofish>::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            )),
+        }
     }
 }
