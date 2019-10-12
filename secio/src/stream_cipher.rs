@@ -9,7 +9,9 @@ use aesni::{Aes128Ctr as NIAes128Ctr, Aes256Ctr as NIAes256Ctr};
 use ctr::Ctr128;
 use twofish::Twofish;
 
-static mut AES_NI: bool = false;
+use std::sync::atomic;
+
+static AES_NI: atomic::AtomicBool = atomic::AtomicBool::new(false);
 static INIT: ::std::sync::Once = ::std::sync::Once::new();
 
 /// Possible encryption ciphers.
@@ -43,12 +45,14 @@ impl Cipher {
 /// Returns your stream cipher depending on `Cipher`.
 #[inline]
 pub fn ctr_init(key_size: Cipher, key: &[u8], iv: &[u8]) -> StreamCipher {
-    INIT.call_once(|| unsafe {
-        AES_NI = is_x86_feature_detected!("aes") && is_x86_feature_detected!("sse3");
+    INIT.call_once(|| {
+        AES_NI.store(
+            is_x86_feature_detected!("aes") && is_x86_feature_detected!("sse3"),
+            atomic::Ordering::Relaxed,
+        );
     });
 
-    let enable = unsafe { AES_NI };
-    if enable {
+    if AES_NI.load(atomic::Ordering::Relaxed) {
         match key_size {
             Cipher::Aes128 => Box::new(NIAes128Ctr::new(
                 GenericArray::from_slice(key),
