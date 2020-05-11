@@ -25,6 +25,11 @@ jobs:
       script:
         - RUSTFLAGS='-F warnings' RUST_BACKTRACE=full cargo test --all --features molc
     - stage: Test
+      rust: 1.41.0
+      name: Unitest(molc + rust 1.41.0)
+      script:
+        - RUSTFLAGS='-F warnings' RUST_BACKTRACE=full cargo test --all --features molc
+    - stage: Test
       name: Bench(molc)
       script:
         - cd bench
