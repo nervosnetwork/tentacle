@@ -46,9 +46,11 @@ impl ServiceProtocol for PHandle {
         if context.session.ty.is_inbound() {
             for i in 0..1024 {
                 if i == 254 {
-                    let _res = context.quick_send_message(Bytes::from("high"));
+                    let data = Bytes::from("high");
+                    while let Err(_) = context.send_message(data.clone()) {}
                 }
-                let _res = context.send_message(Bytes::from("normal"));
+                let data = Bytes::from("normal");
+                while let Err(_) = context.send_message(data.clone()) {}
             }
         }
     }

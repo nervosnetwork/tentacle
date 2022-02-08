@@ -45,7 +45,8 @@ impl ServiceProtocol for PHandle {
             // NOTE: 256 is the send channel buffer size
             let length = 1024;
             for i in 0..length {
-                let _res = context.send_message(Bytes::from(format!("{}-{}", prefix, i)));
+                let data = Bytes::from(format!("{}-{}", prefix, i));
+                while let Err(_) = context.send_message(data.clone()) {}
             }
         }
     }
@@ -72,7 +73,8 @@ impl SessionProtocol for PHandle {
             // NOTE: 256 is the send channel buffer size
             let length = 1024;
             for i in 0..length {
-                let _res = context.send_message(Bytes::from(format!("{}-{}", prefix, i)));
+                let data = Bytes::from(format!("{}-{}", prefix, i));
+                while let Err(_) = context.send_message(data.clone()) {}
             }
         }
     }

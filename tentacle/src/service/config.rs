@@ -46,6 +46,8 @@ pub(crate) struct SessionConfig {
     pub send_buffer_size: usize,
     /// default is 24Mb
     pub recv_buffer_size: usize,
+    /// defautl is 128
+    pub channel_size: usize,
 }
 
 impl SessionConfig {
@@ -67,6 +69,7 @@ impl Default for SessionConfig {
         SessionConfig {
             recv_buffer_size: MAX_BUF_SIZE,
             send_buffer_size: MAX_BUF_SIZE,
+            channel_size: 128,
             yamux_config: YamuxConfig::default(),
         }
     }

@@ -25,7 +25,7 @@ use crate::{
     service::{
         config::{Meta, SessionConfig},
         future_task::BoxedFutureTask,
-        ServiceControl, SessionType, RECEIVED_SIZE, SEND_SIZE,
+        ServiceControl, SessionType,
     },
     substream::{ProtocolEvent, SubstreamBuilder, SubstreamWritePartBuilder},
     transports::MultiIncoming,
@@ -191,7 +191,7 @@ impl Session {
     ) -> Self {
         let socket = YamuxSession::new(socket, meta.config.yamux_config, meta.context.ty.into());
         let control = socket.control();
-        let (proto_event_sender, proto_event_receiver) = mpsc::channel(RECEIVED_SIZE);
+        let (proto_event_sender, proto_event_receiver) = mpsc::channel(meta.config.channel_size);
         let mut interval = proto_event_sender.clone();
 
         // NOTE: A Interval/Delay will block tokio runtime from gracefully shutdown.
@@ -411,7 +411,7 @@ impl Session {
 
         let before_receive_fn = (proto.before_receive)();
         let (session_to_proto_sender, session_to_proto_receiver) =
-            priority_mpsc::channel(SEND_SIZE);
+            priority_mpsc::channel(self.config.channel_size);
 
         self.substreams.insert(
             self.next_stream,

@@ -1177,7 +1177,7 @@ mod test {
 
     #[test]
     fn test_dynamically_config_the_window_size() {
-        let rt = rt();
+        let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (remote, local) = MockSocket::new();
 

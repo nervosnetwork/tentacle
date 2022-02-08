@@ -1,3 +1,8 @@
+## 0.4.0-alpha.3
+
+### Features
+- Make inner bound channel size configurable(#348)
+
 ## 0.4.0-alpha.2
 
 ### Features
