@@ -86,7 +86,7 @@ impl StreamHandle {
         self.send_window
     }
 
-    fn close(&mut self) -> Result<(), Error> {
+    fn close(&mut self, mut need_context: Option<&mut Context>) -> Result<(), Error> {
         match self.state {
             StreamState::SynSent
             | StreamState::SynReceived
@@ -94,6 +94,7 @@ impl StreamHandle {
             | StreamState::Init => {
                 self.state = StreamState::LocalClosing;
                 self.send_close()?;
+                self.close(need_context)?
             }
             StreamState::RemoteClosing => {
                 self.state = StreamState::Closed;
@@ -106,11 +107,28 @@ impl StreamHandle {
                 let event = StreamEvent::Closed(self.id);
                 self.unbound_send_event(event)?;
             }
-            StreamState::LocalClosing => {
-                self.state = StreamState::Closed;
-                let event = StreamEvent::Closed(self.id);
-                self.unbound_send_event(event)?;
-            }
+            StreamState::LocalClosing => loop {
+                let cx = match need_context.as_mut() {
+                    Some(cx) => cx,
+                    None => {
+                        debug!("required context not found");
+                        return Err(Error::StreamClosed);
+                    }
+                };
+                match Pin::new(&mut self.frame_receiver).as_mut().poll_next(*cx) {
+                    Poll::Ready(Some(frame)) if frame.flags().contains(Flag::Fin) => {
+                        self.handle_frame(frame)?;
+                        debug_assert!(matches!(self.state, StreamState::Closed));
+                        break;
+                    }
+                    Poll::Ready(Some(_)) => (),
+                    Poll::Ready(None) => {
+                        self.state = StreamState::RemoteClosing;
+                        return Err(Error::SessionShutdown);
+                    }
+                    Poll::Pending => break,
+                }
+            },
         }
         Ok(())
     }
@@ -197,7 +215,7 @@ impl StreamHandle {
         }
 
         if close_stream {
-            self.close()?;
+            self.close(None)?;
         }
         Ok(())
     }
@@ -308,25 +326,32 @@ impl StreamHandle {
         Ok(())
     }
 
-    fn check_self_state(&mut self) -> Result<(), io::Error> {
+    // Returns `Ok(Some(..))` if someting out of thin air should be returned to the user.
+    // Otherwise, returns `Err(Error)` whenever unable to read anything.
+    fn check_self_state(&mut self) -> io::Result<Option<io::Result<()>>> {
         // if read buf is empty and state is close, return close error
         if self.read_buf.is_empty() {
             match self.state {
                 StreamState::RemoteClosing => {
                     debug!("closed(EOF)");
-                    let _ignore = self.send_close();
-                    Err(io::ErrorKind::UnexpectedEof.into())
+                    if let Err(_e) = self.close(None) {
+                        return Err(io::ErrorKind::BrokenPipe.into());
+                    }
+                    // according to the docs of `poll_read`, an zero-size read indicates that EOF is reached.
+                    return Ok(Some(Ok(())));
                 }
                 StreamState::Reset => {
                     debug!("connection reset");
-                    let _ignore = self.send_close();
+                    if let Err(_e) = self.close(None) {
+                        return Err(io::ErrorKind::BrokenPipe.into());
+                    }
                     Err(io::ErrorKind::ConnectionReset.into())
                 }
                 StreamState::Closed => Err(io::ErrorKind::BrokenPipe.into()),
-                _ => Ok(()),
+                _ => Ok(None),
             }
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -337,7 +362,9 @@ impl AsyncRead for StreamHandle {
         cx: &mut Context,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.check_self_state()?;
+        if let Some(val) = self.check_self_state()? {
+            return Poll::Ready(val);
+        }
 
         if let Err(e) = self.recv_frames(cx) {
             match e {
@@ -350,7 +377,10 @@ impl AsyncRead for StreamHandle {
             }
         }
 
-        self.check_self_state()?;
+        // `recv_frames` may update the state. check again.
+        if let Some(val) = self.check_self_state()? {
+            return Poll::Ready(val);
+        }
 
         let n = ::std::cmp::min(buf.remaining(), self.read_buf.len());
         trace!(
@@ -369,7 +399,7 @@ impl AsyncRead for StreamHandle {
         match self.state {
             StreamState::RemoteClosing | StreamState::Closed | StreamState::Reset => (),
             StreamState::LocalClosing => {
-                if self.close().is_err() {
+                if self.close(None).is_err() {
                     return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
                 }
             }
@@ -434,11 +464,15 @@ impl AsyncWrite for StreamHandle {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         debug!("[{}] StreamHandle.shutdown()", self.id);
-        match self.close() {
+        match self.close(Some(cx)) {
             Err(_) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
-            Ok(()) => Poll::Ready(Ok(())),
+            Ok(()) if matches!(self.state, StreamState::Closed) => Poll::Ready(Ok(())),
+            Ok(()) => match self.state {
+                StreamState::Closed => Poll::Ready(Ok(())),
+                _ => Poll::Pending,
+            },
         }
     }
 }
@@ -506,7 +540,7 @@ mod test {
         channel::mpsc::{channel, unbounded},
         SinkExt, StreamExt,
     };
-    use std::io::ErrorKind;
+    use std::{io::ErrorKind, time::Duration};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -578,7 +612,7 @@ mod test {
         rt.block_on(async {
             let (_frame_sender, frame_receiver) = channel(2);
             let (unbound_sender, mut unbound_receiver) = unbounded();
-            let mut stream = StreamHandle::new(
+            let stream = StreamHandle::new(
                 0,
                 unbound_sender,
                 frame_receiver,
@@ -586,18 +620,13 @@ mod test {
                 INITIAL_STREAM_WINDOW,
             );
 
-            let _ignore = stream.shutdown().await;
-
+            drop(stream);
             let event = unbound_receiver.next().await.unwrap();
             match event {
-                StreamEvent::Frame(frame) => {
-                    assert!(frame.flags().contains(Flag::Fin));
-                    assert_eq!(frame.ty(), Type::WindowUpdate);
-                }
-                _ => panic!("must be fin window update"),
+                StreamEvent::Frame(frame) if frame.flags().contains(Flag::Rst) => (),
+                _ => panic!("must be state reset"),
             }
 
-            drop(stream);
             let event = unbound_receiver.next().await.unwrap();
             match event {
                 StreamEvent::Closed(_) => (),
@@ -678,6 +707,86 @@ mod test {
             match event {
                 StreamEvent::Frame(frame) => assert!(frame.ty() == Type::Data),
                 _ => panic!("must be a frame msg"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_remote_close_stream() {
+        let rt = rt();
+        rt.block_on(async {
+            let (mut frame_sender, frame_receiver) = channel(2);
+            let (unbound_sender, mut unbound_receiver) = unbounded();
+            let mut stream = StreamHandle::new(
+                0,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                INITIAL_STREAM_WINDOW,
+            );
+
+            let flags = Flags::from(Flag::Fin);
+            let frame = Frame::new_window_update(flags, stream.id(), 0);
+            frame_sender.send(frame).await.unwrap();
+            let mut b = [0; 1024];
+
+            assert_eq!(stream.read(&mut b).await.unwrap(), 0);
+            assert_eq!(stream.state(), StreamState::Closed);
+
+            let event = unbound_receiver.next().await.unwrap();
+            match event {
+                StreamEvent::Frame(ref frame) if frame.flags().contains(Flag::Fin) => (),
+                _ => panic!("must be frame with FIN specified"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shutdown() {
+        let rt = rt();
+        rt.block_on(async {
+            const TIMEOUT: Duration = Duration::from_secs(8);
+
+            let (mut frame_sender, frame_receiver) = channel(2);
+            let (unbound_sender, mut unbound_receiver) = unbounded();
+            let mut stream = StreamHandle::new(
+                0,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                INITIAL_STREAM_WINDOW,
+            );
+
+            let shutdown = tokio::spawn(async move {
+                tokio::time::timeout(TIMEOUT, stream.shutdown()).await.unwrap().unwrap();
+
+                assert_eq!(stream.state(), StreamState::Closed);
+            });
+
+            let feed_fin = tokio::spawn(async move {
+                let _feed_fin = async move {
+                    loop {
+                        match unbound_receiver.try_next() {
+                            Ok(Some(event)) if matches!(&event, StreamEvent::Frame(frame) if frame.flags().contains(Flag::Fin)) => {
+                                let flags = Flags::from(Flag::Fin);
+                                let frame = Frame::new_window_update(flags, 0, 32);
+                                frame_sender.send(frame).await.unwrap();
+                            }
+                            Ok(Some(event)) if matches!(&event, StreamEvent::Closed(_)) => {
+                                break;
+                            }
+                            Err(_) => (),
+                            Ok(Some(_)) | Ok(None) => panic!("expect only Frame(Fin) and Closed() event"),
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                };
+
+                tokio::time::timeout(TIMEOUT, _feed_fin).await.unwrap();
+            });
+
+            for jh in [shutdown, feed_fin] {
+                jh.await.unwrap()
             }
         });
     }
