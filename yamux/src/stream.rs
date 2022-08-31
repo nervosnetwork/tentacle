@@ -301,25 +301,24 @@ impl StreamHandle {
         Ok(())
     }
 
-    // Returns `Ok(Some(..))` if someting out of thin air should be returned to the user.
-    // Otherwise, returns `Err(Error)` whenever unable to read bytes.
-    fn check_self_state(&mut self) -> io::Result<Option<io::Result<()>>> {
+    // Returns Ok(true) only if eof is reached.
+    fn check_self_state(&mut self) -> io::Result<bool> {
         // if read buf is empty and state is close, return close error
         if self.read_buf.is_empty() {
             match self.state {
                 StreamState::RemoteClosing | StreamState::Closed => {
                     debug!("closed(EOF)");
                     // an empty read indicates that EOF is reached.
-                    Ok(Some(Ok(())))
+                    Ok(true)
                 }
                 StreamState::Reset => {
                     debug!("connection reset");
                     Err(io::ErrorKind::ConnectionReset.into())
                 }
-                _ => Ok(None),
+                _ => Ok(false),
             }
         } else {
-            Ok(None)
+            Ok(false)
         }
     }
 }
@@ -330,8 +329,8 @@ impl AsyncRead for StreamHandle {
         cx: &mut Context,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Some(val) = self.check_self_state()? {
-            return Poll::Ready(val);
+        if self.check_self_state()? {
+            return Poll::Ready(Ok(()));
         }
 
         if let Err(e) = self.recv_frames(cx) {
@@ -345,8 +344,8 @@ impl AsyncRead for StreamHandle {
             }
         }
 
-        if let Some(val) = self.check_self_state()? {
-            return Poll::Ready(val);
+        if self.check_self_state()? {
+            return Poll::Ready(Ok(()));
         }
 
         let n = ::std::cmp::min(buf.remaining(), self.read_buf.len());
