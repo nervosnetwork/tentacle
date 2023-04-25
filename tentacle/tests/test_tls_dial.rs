@@ -11,6 +11,7 @@ use tentacle::{
     context::{ProtocolContext, ProtocolContextMutRef, ServiceContext},
     error::{DialerErrorKind, ListenErrorKind},
     multiaddr::Multiaddr,
+    secio::NoopKeyProvider,
     service::{
         ProtocolHandle, ProtocolMeta, Service, ServiceError, ServiceEvent, SessionType,
         TargetProtocol, TlsConfig,
@@ -25,7 +26,7 @@ use tokio_rustls::rustls::{
     SupportedProtocolVersion, ALL_CIPHER_SUITES,
 };
 
-pub fn create<F>(meta: ProtocolMeta, shandle: F, cert_path: String) -> Service<F, ()>
+pub fn create<F>(meta: ProtocolMeta, shandle: F, cert_path: String) -> Service<F, NoopKeyProvider>
 where
     F: ServiceHandle + Unpin + 'static,
 {

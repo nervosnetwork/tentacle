@@ -118,8 +118,6 @@ impl Digest {
 pub trait KeyProvider: std::clone::Clone + Send + Sync + 'static {
     /// Error
     type Error: Into<crate::error::SecioError>;
-    /// Public key
-    type Pubkey: Pubkey;
 
     /// Constructs a signature for `msg` using the secret key `sk`
     #[cfg(feature = "async-trait")]
@@ -134,29 +132,18 @@ pub trait KeyProvider: std::clone::Clone + Send + Sync + 'static {
     fn sign_ecdsa<T: AsRef<[u8]>>(&self, message: T) -> Result<Vec<u8>, Self::Error>;
 
     /// Creates a new public key from the [`KeyProvider`].
-    fn pubkey(&self) -> Self::Pubkey;
-}
+    fn pubkey(&self) -> Vec<u8>;
 
-/// Public key for KeyProvider
-pub trait Pubkey: Send + Sync + 'static {
-    /// Error
-    type Error: Into<crate::error::SecioError>;
-    /// Checks that `sig` is a valid ECDSA signature for `msg` using the public
-    /// key `pubkey`.
-    fn verify_ecdsa<T: AsRef<[u8]>, F: AsRef<[u8]>>(&self, message: T, signature: F) -> bool;
-
-    /// serialized key into a bytes
-    fn serialize(&self) -> Vec<u8>;
-
-    /// Recover public key from slice
-    fn from_slice<T: AsRef<[u8]>>(key: T) -> Result<Self, Self::Error>
+    /// Checks that `sig` is a valid ECDSA signature for `msg` using the pubkey.
+    fn verify_ecdsa<P, T, F>(pubkey: P, message: T, signature: F) -> bool
     where
-        Self: Sized;
+        P: AsRef<[u8]>,
+        T: AsRef<[u8]>,
+        F: AsRef<[u8]>;
 }
 
 impl KeyProvider for SecioKeyPair {
     type Error = error::SecioError;
-    type Pubkey = secp256k1_compat::PublicKey;
 
     fn sign_ecdsa<T: AsRef<[u8]>>(&self, message: T) -> Result<Vec<u8>, Self::Error> {
         let msg = match crate::secp256k1_compat::message_from_slice(message.as_ref()) {
@@ -173,23 +160,26 @@ impl KeyProvider for SecioKeyPair {
         Ok(crate::secp256k1_compat::signature_to_vec(signature))
     }
 
-    fn pubkey(&self) -> Self::Pubkey {
+    fn pubkey(&self) -> Vec<u8> {
         match self.inner {
-            KeyPairInner::Secp256k1 { ref private } => {
-                crate::secp256k1_compat::from_secret_key(private)
-            }
+            KeyPairInner::Secp256k1 { ref private } => crate::secp256k1_compat::serialize_pubkey(
+                &crate::secp256k1_compat::from_secret_key(private),
+            ),
         }
     }
-}
 
-impl Pubkey for secp256k1_compat::PublicKey {
-    type Error = error::SecioError;
-    fn verify_ecdsa<T: AsRef<[u8]>, F: AsRef<[u8]>>(&self, message: T, signature: F) -> bool {
+    fn verify_ecdsa<P, T, F>(pubkey: P, message: T, signature: F) -> bool
+    where
+        P: AsRef<[u8]>,
+        T: AsRef<[u8]>,
+        F: AsRef<[u8]>,
+    {
         let signature = crate::secp256k1_compat::signature_from_der(signature.as_ref());
         let msg = crate::secp256k1_compat::message_from_slice(message.as_ref());
+        let pubkey = crate::secp256k1_compat::pubkey_from_slice(pubkey.as_ref());
 
-        if let (Ok(signature), Ok(message)) = (signature, msg) {
-            if !crate::secp256k1_compat::verify(&message, &signature, self) {
+        if let (Ok(signature), Ok(message), Ok(pubkey)) = (signature, msg, pubkey) {
+            if !crate::secp256k1_compat::verify(&message, &signature, &pubkey) {
                 log::debug!("failed to verify the remote's signature");
                 return false;
             }
@@ -199,41 +189,28 @@ impl Pubkey for secp256k1_compat::PublicKey {
         }
         true
     }
-
-    fn serialize(&self) -> Vec<u8> {
-        crate::secp256k1_compat::serialize_pubkey(self)
-    }
-
-    fn from_slice<T: AsRef<[u8]>>(key: T) -> Result<Self, Self::Error> {
-        crate::secp256k1_compat::pubkey_from_slice(key.as_ref())
-            .map_err(|_| crate::error::SecioError::SecretGenerationFailed)
-    }
 }
+/// Empty key provider
+#[derive(Debug, Clone)]
+pub struct NoopKeyProvider;
 
-impl KeyProvider for () {
+impl KeyProvider for NoopKeyProvider {
     type Error = error::SecioError;
-    type Pubkey = ();
 
     fn sign_ecdsa<T: AsRef<[u8]>>(&self, _message: T) -> Result<Vec<u8>, Self::Error> {
         Err(error::SecioError::NotSupportKeyProvider)
     }
 
-    fn pubkey(&self) -> Self::Pubkey {
-        ()
-    }
-}
-
-impl Pubkey for () {
-    type Error = error::SecioError;
-    fn verify_ecdsa<T: AsRef<[u8]>, F: AsRef<[u8]>>(&self, _message: T, _signature: F) -> bool {
-        false
-    }
-
-    fn serialize(&self) -> Vec<u8> {
+    fn pubkey(&self) -> Vec<u8> {
         Vec::new()
     }
 
-    fn from_slice<T: AsRef<[u8]>>(_key: T) -> Result<Self, Self::Error> {
-        Ok(())
+    fn verify_ecdsa<P, T, F>(_pubkey: P, _message: T, _signature: F) -> bool
+    where
+        P: AsRef<[u8]>,
+        T: AsRef<[u8]>,
+        F: AsRef<[u8]>,
+    {
+        false
     }
 }

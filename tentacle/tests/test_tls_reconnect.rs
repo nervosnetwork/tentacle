@@ -13,6 +13,7 @@ use tentacle::{
     builder::{MetaBuilder, ServiceBuilder},
     context::{ProtocolContext, ProtocolContextMutRef},
     multiaddr::Multiaddr,
+    secio::NoopKeyProvider,
     service::{ProtocolHandle, ProtocolMeta, Service, TargetProtocol, TlsConfig},
     traits::{ServiceHandle, ServiceProtocol},
     ProtocolId,
@@ -24,7 +25,7 @@ use tokio_rustls::rustls::{
     SupportedProtocolVersion, ALL_CIPHER_SUITES,
 };
 
-pub fn create<F>(meta: ProtocolMeta, shandle: F, cert_path: String) -> Service<F, ()>
+pub fn create<F>(meta: ProtocolMeta, shandle: F, cert_path: String) -> Service<F, NoopKeyProvider>
 where
     F: ServiceHandle + Unpin + 'static,
 {

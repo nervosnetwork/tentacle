@@ -5,6 +5,7 @@ use tentacle::{
     bytes::Bytes,
     context::{ProtocolContext, ProtocolContextMutRef},
     multiaddr::Multiaddr,
+    secio::NoopKeyProvider,
     service::{ProtocolHandle, ProtocolMeta, Service, TargetProtocol},
     traits::{ServiceHandle, ServiceProtocol},
     ProtocolId,
@@ -47,7 +48,7 @@ fn create_meta(id: ProtocolId) -> ProtocolMeta {
         .build()
 }
 
-pub fn create<F>(meta: ProtocolMeta, shandle: F) -> Service<F, ()>
+pub fn create<F>(meta: ProtocolMeta, shandle: F) -> Service<F, NoopKeyProvider>
 where
     F: ServiceHandle + Unpin + 'static,
 {

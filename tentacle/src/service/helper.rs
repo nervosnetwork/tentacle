@@ -222,31 +222,29 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl<K> Unpin for Listener<K> {}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl<K> Stream for Listener<K>
 where
     K: KeyProvider,
 {
     type Item = ();
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Safety: we just polled it and didn't move it
-        unsafe {
-            let this = self.get_unchecked_mut();
-            let executed = Pin::new_unchecked(&mut this.inner);
-            match executed.poll_next(cx) {
-                Poll::Ready(Some(Ok((remote_address, socket)))) => {
-                    this.handshake(socket, remote_address);
-                    Poll::Ready(Some(()))
-                }
-                Poll::Ready(None) => {
-                    this.close(io::ErrorKind::BrokenPipe.into());
-                    Poll::Ready(None)
-                }
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(Err(err))) => {
-                    this.close(err);
-                    Poll::Ready(None)
-                }
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok((remote_address, socket)))) => {
+                self.handshake(socket, remote_address);
+                Poll::Ready(Some(()))
+            }
+            Poll::Ready(None) => {
+                self.close(io::ErrorKind::BrokenPipe.into());
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Err(err))) => {
+                self.close(err);
+                Poll::Ready(None)
             }
         }
     }

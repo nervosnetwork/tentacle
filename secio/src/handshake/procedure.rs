@@ -17,7 +17,7 @@ use crate::{
         handshake_context::HandshakeContext,
         handshake_struct::{Exchange, PublicKey},
     },
-    EphemeralPublicKey, KeyProvider, Pubkey,
+    EphemeralPublicKey, KeyProvider,
 };
 use bytes::BytesMut;
 use tokio::io::AsyncWriteExt;
@@ -156,12 +156,11 @@ where
 
     let data_to_verify = crate::sha256_compat::sha256(&data_to_verify);
 
-    let remote_public_key = <K as KeyProvider>::Pubkey::from_slice(
+    if !<K as KeyProvider>::verify_ecdsa(
         ephemeral_context.state.remote.public_key.inner_ref(),
-    )
-    .map_err(Into::into)?;
-
-    if !remote_public_key.verify_ecdsa(&data_to_verify, &remote_exchanges.signature) {
+        &data_to_verify,
+        &remote_exchanges.signature,
+    ) {
         debug!("failed to verify the remote's signature");
         return Err(SecioError::SignatureVerificationFailed);
     }

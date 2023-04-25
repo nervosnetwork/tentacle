@@ -9,7 +9,7 @@ use crate::{
         handshake_struct::{Propose, PublicKey},
         Config,
     },
-    support, Digest, KeyProvider, Pubkey,
+    support, Digest, KeyProvider,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -89,7 +89,7 @@ where
         rand::thread_rng().fill_bytes(&mut nonce);
 
         let public_key = PublicKey {
-            key: self.config.key_provider.pubkey().serialize(),
+            key: self.config.key_provider.pubkey(),
         };
 
         // Send our proposition with our nonce, public key and supported protocols.
