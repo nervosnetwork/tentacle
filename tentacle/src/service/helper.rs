@@ -1,11 +1,10 @@
 use futures::{channel::mpsc, prelude::*};
 use log::{debug, error, trace};
 use multiaddr::Multiaddr;
-use secio::{handshake::Config, Signer};
+use secio::{handshake::Config, KeyProvider};
 use std::{
     io,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -74,7 +73,7 @@ impl From<SessionType> for YamuxType {
 }
 
 pub(crate) struct HandshakeContext<K> {
-    pub(crate) key_pair: Option<Arc<K>>,
+    pub(crate) key_provider: Option<K>,
     pub(crate) event_sender: mpsc::Sender<SessionEvent>,
     pub(crate) max_frame_length: usize,
     pub(crate) timeout: Duration,
@@ -85,17 +84,17 @@ pub(crate) struct HandshakeContext<K> {
 
 impl<K> HandshakeContext<K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     pub async fn handshake<H>(mut self, socket: H)
     where
         H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
     {
-        match self.key_pair {
-            Some(key_pair) => {
+        match self.key_provider {
+            Some(key_provider) => {
                 let result = crate::runtime::timeout(
                     self.timeout,
-                    Config::new(key_pair)
+                    Config::new(key_provider)
                         .max_frame_length(self.max_frame_length)
                         .handshake(socket),
                 )
@@ -158,7 +157,7 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Listener<K> {
     pub(crate) inner: MultiIncoming,
-    pub(crate) key_pair: Option<Arc<K>>,
+    pub(crate) key_provider: Option<K>,
     pub(crate) event_sender: mpsc::Sender<SessionEvent>,
     pub(crate) max_frame_length: usize,
     pub(crate) timeout: Duration,
@@ -169,7 +168,7 @@ pub struct Listener<K> {
 #[cfg(not(target_arch = "wasm32"))]
 impl<K> Listener<K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     fn close(&self, io_err: io::Error) {
         let mut event_sender = self.event_sender.clone();
@@ -201,7 +200,7 @@ where
             ty: SessionType::Inbound,
             remote_address,
             listen_address: Some(self.listen_addr.clone()),
-            key_pair: self.key_pair.clone(),
+            key_provider: self.key_provider.clone(),
             event_sender: self.event_sender.clone(),
             max_frame_length: self.max_frame_length,
             timeout: self.timeout,
@@ -225,24 +224,29 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 impl<K> Stream for Listener<K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     type Item = ();
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok((remote_address, socket)))) => {
-                self.handshake(socket, remote_address);
-                Poll::Ready(Some(()))
-            }
-            Poll::Ready(None) => {
-                self.close(io::ErrorKind::BrokenPipe.into());
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(err))) => {
-                self.close(err);
-                Poll::Ready(None)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Safety: we just polled it and didn't move it
+        unsafe {
+            let this = self.get_unchecked_mut();
+            let executed = Pin::new_unchecked(&mut this.inner);
+            match executed.poll_next(cx) {
+                Poll::Ready(Some(Ok((remote_address, socket)))) => {
+                    this.handshake(socket, remote_address);
+                    Poll::Ready(Some(()))
+                }
+                Poll::Ready(None) => {
+                    this.close(io::ErrorKind::BrokenPipe.into());
+                    Poll::Ready(None)
+                }
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Err(err))) => {
+                    this.close(err);
+                    Poll::Ready(None)
+                }
             }
         }
     }

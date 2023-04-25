@@ -17,7 +17,7 @@ use crate::{
         handshake_context::HandshakeContext,
         handshake_struct::{Exchange, PublicKey},
     },
-    EphemeralPublicKey, Pubkey, Signer,
+    EphemeralPublicKey, KeyProvider, Pubkey,
 };
 use bytes::BytesMut;
 use tokio::io::AsyncWriteExt;
@@ -37,7 +37,7 @@ pub(in crate::handshake) async fn handshake<T, K>(
 ) -> Result<(SecureStream<T>, PublicKey, EphemeralPublicKey), SecioError>
 where
     T: AsyncRead + AsyncWrite + Send + 'static + Unpin,
-    K: Signer,
+    K: KeyProvider,
 {
     // The handshake messages all start with a 4-bytes message length prefix.
     let mut socket = Builder::new()
@@ -104,13 +104,13 @@ where
             #[cfg(not(feature = "async-trait"))]
             let signature = ephemeral_context
                 .config
-                .key
+                .key_provider
                 .sign_ecdsa(AsRef::<[u8]>::as_ref(&data_to_sign))
                 .map_err(Into::into)?;
             #[cfg(feature = "async-trait")]
             let signature = ephemeral_context
                 .config
-                .key
+                .key_provider
                 .sign_ecdsa_async(AsRef::<[u8]>::as_ref(&data_to_sign))
                 .await
                 .map_err(Into::into)?;
@@ -156,9 +156,10 @@ where
 
     let data_to_verify = crate::sha256_compat::sha256(&data_to_verify);
 
-    let remote_public_key =
-        <K as Signer>::pubkey_from_slice(ephemeral_context.state.remote.public_key.inner_ref())
-            .map_err(Into::into)?;
+    let remote_public_key = <K as KeyProvider>::Pubkey::from_slice(
+        ephemeral_context.state.remote.public_key.inner_ref(),
+    )
+    .map_err(Into::into)?;
 
     if !remote_public_key.verify_ecdsa(&data_to_verify, &remote_exchanges.signature) {
         debug!("failed to verify the remote's signature");
@@ -290,7 +291,7 @@ fn generate_stream_cipher_and_hmac(
 #[cfg(test)]
 mod tests {
     use super::stretch_key;
-    use crate::{codec::hmac_compat::Hmac, handshake::Config, Digest, SecioKeyPair, Signer};
+    use crate::{codec::hmac_compat::Hmac, handshake::Config, Digest, KeyProvider, SecioKeyPair};
 
     use bytes::BytesMut;
     use futures::channel;
@@ -299,7 +300,7 @@ mod tests {
         net::{TcpListener, TcpStream},
     };
 
-    fn handshake_with_self_success<K: Signer>(
+    fn handshake_with_self_success<K: KeyProvider>(
         config_1: Config<K>,
         config_2: Config<K>,
         data: &'static [u8],

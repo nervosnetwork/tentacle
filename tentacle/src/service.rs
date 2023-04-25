@@ -1,7 +1,7 @@
 use futures::{channel::mpsc, future::poll_fn, prelude::*, stream::StreamExt, SinkExt};
 use log::{debug, error, trace};
 use nohash_hasher::IntMap;
-use secio::Signer;
+use secio::KeyProvider;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -63,7 +63,7 @@ struct InnerService<K> {
 
     multi_transport: MultiTransport,
 
-    key_pair: Option<Arc<K>>,
+    key_provider: Option<K>,
 
     listens: HashSet<Multiaddr>,
 
@@ -121,13 +121,13 @@ pub struct Service<T, K> {
 impl<T, K> Service<T, K>
 where
     T: ServiceHandle + Unpin,
-    K: Signer,
+    K: KeyProvider,
 {
     /// New a Service
     pub(crate) fn new(
         protocol_configs: IntMap<ProtocolId, ProtocolMeta>,
         handle: T,
-        key_pair: Option<Arc<K>>,
+        key_provider: Option<K>,
         forever: bool,
         config: ServiceConfig,
     ) -> Self {
@@ -164,7 +164,7 @@ where
                 before_sends: HashMap::default(),
                 handle_sender: user_handle_sender,
                 future_task_sender,
-                key_pair,
+                key_provider,
                 multi_transport: {
                     #[cfg(target_arch = "wasm32")]
                     let transport = MultiTransport::new(config.timeout);
@@ -284,13 +284,13 @@ where
 
 impl<K> InnerService<K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn_listener(&mut self, incoming: MultiIncoming, listen_address: Multiaddr) {
         let listener = Listener {
             inner: incoming,
-            key_pair: self.key_pair.clone(),
+            key_provider: self.key_provider.clone(),
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
             timeout: self.config.timeout,
@@ -345,7 +345,7 @@ where
         self.dial_protocols.insert(address.clone(), target);
         let dial_future = self.multi_transport.clone().dial(address.clone())?;
 
-        let key_pair = self.key_pair.clone();
+        let key_provider = self.key_provider.clone();
         let timeout = self.config.timeout;
         let max_frame_length = self.config.max_frame_length;
 
@@ -359,7 +359,7 @@ where
                         ty: SessionType::Outbound,
                         remote_address: addr,
                         listen_address: None,
-                        key_pair,
+                        key_provider,
                         event_sender: sender,
                         max_frame_length,
                         timeout,
@@ -523,7 +523,7 @@ where
             ty,
             remote_address,
             listen_address,
-            key_pair: self.key_pair.clone(),
+            key_provider: self.key_provider.clone(),
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
             timeout: self.config.timeout,

@@ -14,8 +14,8 @@ pub enum SecioError {
     /// Crypto error
     CryptoError,
 
-    /// Signer not support
-    NotSupportSigner,
+    /// Sign operation not supported
+    NotSupportKeyProvider,
 
     /// Failed to generate ephemeral key.
     EphemeralKeyGenerationFailed,
@@ -62,7 +62,7 @@ impl PartialEq for SecioError {
             | (HandshakeParsingFailure, HandshakeParsingFailure)
             | (SignatureVerificationFailed, SignatureVerificationFailed)
             | (InvalidMessage, InvalidMessage)
-            | (NotSupportSigner, NotSupportSigner) => true,
+            | (NotSupportKeyProvider, NotSupportKeyProvider) => true,
             _ => false,
         }
     }
@@ -118,7 +118,7 @@ impl fmt::Display for SecioError {
             SecioError::InvalidMessage => write!(f, "Invalid Message"),
             SecioError::SignatureVerificationFailed => write!(f, "Signature Verification Failed"),
             SecioError::InvalidProposition(e) => write!(f, "Invalid Proposition: {}", e),
-            SecioError::NotSupportSigner => write!(f, "Signer operation not supported"),
+            SecioError::NotSupportKeyProvider => write!(f, "Sign operation not supported"),
         }
     }
 }

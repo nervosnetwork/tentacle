@@ -176,7 +176,7 @@ impl fmt::Debug for PublicKey {
 #[cfg(test)]
 mod tests {
     use super::{Exchange, Propose, PublicKey};
-    use crate::{SecioKeyPair, Signer};
+    use crate::{KeyProvider, SecioKeyPair};
     use bytes::Bytes;
 
     #[test]
@@ -216,13 +216,13 @@ mod tests {
         let raw = privkey.public_key();
         let inner = raw.inner_ref();
 
-        let other = SecioKeyPair::pubkey_from_slice(inner).unwrap();
+        let other = <SecioKeyPair as KeyProvider>::Pubkey::from_slice(inner).unwrap();
         assert_eq!(raw.inner_ref(), other.serialize());
         let uncompressed = crate::secp256k1_compat::pubkey_from_slice(inner)
             .map(|key| key.serialize_uncompressed().to_vec())
             .unwrap();
 
-        let other_1 = SecioKeyPair::pubkey_from_slice(&uncompressed).unwrap();
+        let other_1 = <SecioKeyPair as KeyProvider>::Pubkey::from_slice(&uncompressed).unwrap();
         assert_eq!(raw.inner_ref(), other_1.serialize());
     }
 }

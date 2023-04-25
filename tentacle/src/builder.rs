@@ -7,7 +7,7 @@ use tokio_util::codec::LengthDelimitedCodec;
 use crate::service::config::TlsConfig;
 use crate::{
     protocol_select::SelectFn,
-    secio::Signer,
+    secio::KeyProvider,
     service::{
         config::{Meta, ServiceConfig},
         ProtocolHandle, ProtocolMeta, Service, TcpSocket,
@@ -20,7 +20,7 @@ use crate::{
 /// Builder for Service
 pub struct ServiceBuilder<K> {
     inner: IntMap<ProtocolId, ProtocolMeta>,
-    key_pair: Option<Arc<K>>,
+    key_provider: Option<K>,
     forever: bool,
     config: ServiceConfig,
 }
@@ -28,7 +28,7 @@ pub struct ServiceBuilder<K> {
 impl<K> Default for ServiceBuilder<K> {
     fn default() -> Self {
         Self {
-            key_pair: None,
+            key_provider: None,
             inner: IntMap::default(),
             forever: false,
             config: ServiceConfig::default(),
@@ -38,7 +38,7 @@ impl<K> Default for ServiceBuilder<K> {
 
 impl<K> ServiceBuilder<K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     /// New a default empty builder
     pub fn new() -> Self {
@@ -50,7 +50,13 @@ where
     where
         H: ServiceHandle + Unpin + 'static,
     {
-        Service::new(self.inner, handle, self.key_pair, self.forever, self.config)
+        Service::new(
+            self.inner,
+            handle,
+            self.key_provider,
+            self.forever,
+            self.config,
+        )
     }
 
     /// Insert a custom protocol
@@ -62,8 +68,8 @@ where
     /// Enable encrypted communication mode.
     ///
     /// If you do not need encrypted communication, you do not need to call this method
-    pub fn key_pair(mut self, key_pair: K) -> Self {
-        self.key_pair = Some(Arc::new(key_pair));
+    pub fn key_provider(mut self, key_provider: K) -> Self {
+        self.key_provider = Some(key_provider);
         self
     }
 

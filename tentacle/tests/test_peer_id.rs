@@ -22,7 +22,7 @@ where
     ServiceBuilder::default()
         .insert_protocol(meta)
         .forever(true)
-        .key_pair(key_pair)
+        .key_provider(key_pair)
         .build(shandle)
 }
 

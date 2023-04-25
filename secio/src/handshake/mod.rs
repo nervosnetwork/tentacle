@@ -7,8 +7,6 @@ use crate::{
 use crate::codec::secure_stream::SecureStream;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use std::sync::Arc;
-
 #[rustfmt::skip]
 #[allow(clippy::all)]
 #[allow(dead_code)]
@@ -23,7 +21,7 @@ const MAX_FRAME_SIZE: usize = 1024 * 1024 * 8;
 /// Config for Secio
 #[derive(Debug, Clone)]
 pub struct Config<K> {
-    pub(crate) key: Arc<K>,
+    pub(crate) key_provider: K,
     pub(crate) agreements_proposal: Option<String>,
     pub(crate) ciphers_proposal: Option<String>,
     pub(crate) digests_proposal: Option<String>,
@@ -32,12 +30,12 @@ pub struct Config<K> {
 
 impl<K> Config<K>
 where
-    K: crate::Signer,
+    K: crate::KeyProvider,
 {
     /// Create config
-    pub fn new(key_pair: K) -> Self {
+    pub fn new(key_provider: K) -> Self {
         Config {
-            key: Arc::new(key_pair),
+            key_provider,
             agreements_proposal: None,
             ciphers_proposal: None,
             digests_proposal: None,

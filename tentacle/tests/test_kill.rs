@@ -51,7 +51,7 @@ where
 
     if secio {
         builder
-            .key_pair(SecioKeyPair::secp256k1_generated())
+            .key_provider(SecioKeyPair::secp256k1_generated())
             .build(shandle)
     } else {
         builder.build(shandle)

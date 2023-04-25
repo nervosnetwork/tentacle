@@ -9,7 +9,7 @@ use crate::{
         handshake_struct::{Propose, PublicKey},
         Config,
     },
-    support, Digest, Pubkey, Signer,
+    support, Digest, KeyProvider, Pubkey,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -77,7 +77,7 @@ pub struct PubEphemeral {
 
 impl<K> HandshakeContext<(), K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     pub fn new(config: Config<K>) -> Self {
         HandshakeContext { config, state: () }
@@ -89,7 +89,7 @@ where
         rand::thread_rng().fill_bytes(&mut nonce);
 
         let public_key = PublicKey {
-            key: self.config.key.pubkey().serialize(),
+            key: self.config.key_provider.pubkey().serialize(),
         };
 
         // Send our proposition with our nonce, public key and supported protocols.
@@ -134,7 +134,7 @@ where
 
 impl<K> HandshakeContext<Local, K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     // Process remote proposition.
     pub fn with_remote(
@@ -262,7 +262,7 @@ where
 
 impl<K> HandshakeContext<Remote, K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     pub fn with_ephemeral(
         self,
@@ -282,7 +282,7 @@ where
 
 impl<K> HandshakeContext<Ephemeral, K>
 where
-    K: Signer,
+    K: KeyProvider,
 {
     pub fn take_private_key(
         self,
