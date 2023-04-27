@@ -13,7 +13,7 @@ use yamux::session::SessionType as YamuxType;
 
 use crate::{
     error::{HandshakeErrorKind, TransportErrorKind},
-    service::future_task::BoxedFutureTask,
+    service::{future_task::BoxedFutureTask, HandshakeType},
     session::SessionEvent,
     transports::MultiIncoming,
 };
@@ -73,7 +73,7 @@ impl From<SessionType> for YamuxType {
 }
 
 pub(crate) struct HandshakeContext<K> {
-    pub(crate) key_provider: Option<K>,
+    pub(crate) handshake_type: HandshakeType<K>,
     pub(crate) event_sender: mpsc::Sender<SessionEvent>,
     pub(crate) max_frame_length: usize,
     pub(crate) timeout: Duration,
@@ -90,8 +90,8 @@ where
     where
         H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
     {
-        match self.key_provider {
-            Some(key_provider) => {
+        match self.handshake_type {
+            HandshakeType::Secio(key_provider) => {
                 let result = crate::runtime::timeout(
                     self.timeout,
                     Config::new(key_provider)
@@ -138,7 +138,7 @@ where
                     error!("handshake result send back error: {:?}", err);
                 }
             }
-            None => {
+            HandshakeType::Noop => {
                 let event = SessionEvent::HandshakeSuccess {
                     handle: Box::new(socket),
                     public_key: None,
@@ -157,7 +157,7 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Listener<K> {
     pub(crate) inner: MultiIncoming,
-    pub(crate) key_provider: Option<K>,
+    pub(crate) handshake_type: HandshakeType<K>,
     pub(crate) event_sender: mpsc::Sender<SessionEvent>,
     pub(crate) max_frame_length: usize,
     pub(crate) timeout: Duration,
@@ -200,7 +200,7 @@ where
             ty: SessionType::Inbound,
             remote_address,
             listen_address: Some(self.listen_addr.clone()),
-            key_provider: self.key_provider.clone(),
+            handshake_type: self.handshake_type.clone(),
             event_sender: self.event_sender.clone(),
             max_frame_length: self.max_frame_length,
             timeout: self.timeout,

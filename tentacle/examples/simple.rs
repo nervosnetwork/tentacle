@@ -186,7 +186,7 @@ fn create_server() -> Service<SHandle, SecioKeyPair> {
     ServiceBuilder::default()
         .insert_protocol(create_meta(0.into()))
         .insert_protocol(create_meta(1.into()))
-        .key_provider(SecioKeyPair::secp256k1_generated())
+        .handshake_type(SecioKeyPair::secp256k1_generated().into())
         .build(SHandle)
 }
 
@@ -200,7 +200,7 @@ fn create_client() -> Service<SHandle, SecioKeyPair> {
         .insert_protocol(create_meta(0.into()))
         .insert_protocol(create_meta(1.into()))
         .insert_protocol(create_meta(2.into()))
-        .key_provider(SecioKeyPair::secp256k1_generated())
+        .handshake_type(SecioKeyPair::secp256k1_generated().into())
         .build(SHandle)
 }
 

@@ -9,7 +9,7 @@ use crate::{
     protocol_select::SelectFn,
     secio::KeyProvider,
     service::{
-        config::{Meta, ServiceConfig},
+        config::{HandshakeType, Meta, ServiceConfig},
         ProtocolHandle, ProtocolMeta, Service, TcpSocket,
     },
     traits::{Codec, ProtocolSpawn, ServiceHandle, ServiceProtocol, SessionProtocol},
@@ -20,7 +20,7 @@ use crate::{
 /// Builder for Service
 pub struct ServiceBuilder<K> {
     inner: IntMap<ProtocolId, ProtocolMeta>,
-    key_provider: Option<K>,
+    handshake_type: HandshakeType<K>,
     forever: bool,
     config: ServiceConfig,
 }
@@ -28,7 +28,7 @@ pub struct ServiceBuilder<K> {
 impl<K> Default for ServiceBuilder<K> {
     fn default() -> Self {
         Self {
-            key_provider: None,
+            handshake_type: HandshakeType::Noop,
             inner: IntMap::default(),
             forever: false,
             config: ServiceConfig::default(),
@@ -53,7 +53,7 @@ where
         Service::new(
             self.inner,
             handle,
-            self.key_provider,
+            self.handshake_type,
             self.forever,
             self.config,
         )
@@ -65,11 +65,11 @@ where
         self
     }
 
-    /// Enable encrypted communication mode.
+    /// Handshake encryption layer protocol selection
     ///
     /// If you do not need encrypted communication, you do not need to call this method
-    pub fn key_provider(mut self, key_provider: K) -> Self {
-        self.key_provider = Some(key_provider);
+    pub fn handshake_type(mut self, handshake_type: HandshakeType<K>) -> Self {
+        self.handshake_type = handshake_type;
         self
     }
 

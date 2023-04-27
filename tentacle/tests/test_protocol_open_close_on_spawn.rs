@@ -112,7 +112,7 @@ where
 
     if secio {
         builder
-            .key_provider(SecioKeyPair::secp256k1_generated())
+            .handshake_type(SecioKeyPair::secp256k1_generated().into())
             .build(shandle)
     } else {
         builder.build(shandle)

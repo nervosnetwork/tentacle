@@ -44,7 +44,9 @@ pub(crate) mod future_task;
 mod helper;
 
 pub use crate::service::{
-    config::{ProtocolHandle, ProtocolMeta, TargetProtocol, TargetSession, TcpSocket},
+    config::{
+        HandshakeType, ProtocolHandle, ProtocolMeta, TargetProtocol, TargetSession, TcpSocket,
+    },
     control::{ServiceAsyncControl, ServiceControl},
     event::{ServiceError, ServiceEvent},
     helper::SessionType,
@@ -63,7 +65,7 @@ struct InnerService<K> {
 
     multi_transport: MultiTransport,
 
-    key_provider: Option<K>,
+    handshake_type: HandshakeType<K>,
 
     listens: HashSet<Multiaddr>,
 
@@ -127,7 +129,7 @@ where
     pub(crate) fn new(
         protocol_configs: IntMap<ProtocolId, ProtocolMeta>,
         handle: T,
-        key_provider: Option<K>,
+        handshake_type: HandshakeType<K>,
         forever: bool,
         config: ServiceConfig,
     ) -> Self {
@@ -164,7 +166,7 @@ where
                 before_sends: HashMap::default(),
                 handle_sender: user_handle_sender,
                 future_task_sender,
-                key_provider,
+                handshake_type,
                 multi_transport: {
                     #[cfg(target_arch = "wasm32")]
                     let transport = MultiTransport::new(config.timeout);
@@ -290,7 +292,7 @@ where
     fn spawn_listener(&mut self, incoming: MultiIncoming, listen_address: Multiaddr) {
         let listener = Listener {
             inner: incoming,
-            key_provider: self.key_provider.clone(),
+            handshake_type: self.handshake_type.clone(),
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
             timeout: self.config.timeout,
@@ -345,7 +347,7 @@ where
         self.dial_protocols.insert(address.clone(), target);
         let dial_future = self.multi_transport.clone().dial(address.clone())?;
 
-        let key_provider = self.key_provider.clone();
+        let handshake_type = self.handshake_type.clone();
         let timeout = self.config.timeout;
         let max_frame_length = self.config.max_frame_length;
 
@@ -359,7 +361,7 @@ where
                         ty: SessionType::Outbound,
                         remote_address: addr,
                         listen_address: None,
-                        key_provider,
+                        handshake_type,
                         event_sender: sender,
                         max_frame_length,
                         timeout,
@@ -523,7 +525,7 @@ where
             ty,
             remote_address,
             listen_address,
-            key_provider: self.key_provider.clone(),
+            handshake_type: self.handshake_type.clone(),
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
             timeout: self.config.timeout,
