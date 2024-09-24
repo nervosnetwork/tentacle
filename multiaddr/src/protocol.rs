@@ -7,7 +7,7 @@ use std::{
     str::{self, FromStr},
 };
 
-use crate::error::Error;
+use crate::{error::Error, Onion3Addr};
 
 const DNS4: u32 = 0x36;
 const DNS6: u32 = 0x37;
@@ -19,6 +19,7 @@ const TLS: u32 = 0x01c0;
 const WS: u32 = 0x01dd;
 const WSS: u32 = 0x01de;
 const MEMORY: u32 = 0x0309;
+const ONION3: u32 = 0x01bd;
 
 const SHA256_CODE: u16 = 0x12;
 const SHA256_SIZE: u8 = 32;
@@ -37,6 +38,7 @@ pub enum Protocol<'a> {
     Wss,
     /// Contains the "port" to contact. Similar to TCP or UDP, 0 means "assign me a port".
     Memory(u64),
+    Onion3(Cow<'a, [u8; 35]>, u16),
 }
 
 impl<'a> Protocol<'a> {
@@ -86,6 +88,14 @@ impl<'a> Protocol<'a> {
             "memory" => {
                 let s = iter.next().ok_or(Error::InvalidProtocolString)?;
                 Ok(Protocol::Memory(s.parse()?))
+            }
+            "onion3" => {
+                let s = iter.next().ok_or(Error::InvalidProtocolString)?;
+                let onion3_addr = Onion3Addr::try_from(s)?;
+                Ok(Protocol::Onion3(Cow::Owned(
+                    onion3_addr.hash(),
+                    onion3_addr.port(),
+                )))
             }
             _ => Err(Error::UnknownProtocolString),
         }
@@ -160,6 +170,14 @@ impl<'a> Protocol<'a> {
                 let num = rdr.get_u64();
                 Ok((Protocol::Memory(num), rest))
             }
+            ONION3 => {
+                let (data, rest) = split_header(35, input)?;
+                let mut rdr = Cursor::new(data);
+                let mut hash = [0; 35];
+                rdr.copy_to_slice(&mut hash);
+                let port = rdr.get_u16();
+                Ok((Protocol::Onion3(Cow::Borrowed(&hash), port), rest))
+            }
             _ => Err(Error::UnknownProtocolId(id)),
         }
     }
@@ -213,6 +231,11 @@ impl<'a> Protocol<'a> {
                 w.put(encode::u32(MEMORY, &mut buf));
                 w.put_u64(*port)
             }
+            Protocol::Onion3(addr, port) => {
+                w.put(encode::u32(ONION3, &mut buf));
+                w.put(&addr[..]);
+                w.put_u16(*port);
+            }
         }
     }
 
@@ -229,6 +252,7 @@ impl<'a> Protocol<'a> {
             Protocol::Ws => Protocol::Ws,
             Protocol::Wss => Protocol::Wss,
             Protocol::Memory(a) => Protocol::Memory(a),
+            Protocol::Onion3(addr, port) => Protocol::Onion3(Cow::Owned(addr.into_owned()), port),
         }
     }
 }
@@ -247,6 +271,7 @@ impl<'a> fmt::Display for Protocol<'a> {
             Ws => write!(f, "/ws"),
             Wss => write!(f, "/wss"),
             Memory(port) => write!(f, "/memory/{}", port),
+            Onion3(addr, port) => write!(f, "/onion3/{}", Onion3Addr::new(addr, port)),
         }
     }
 }
