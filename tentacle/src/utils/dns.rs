@@ -12,7 +12,7 @@ use std::{
 use crate::{
     multiaddr::{Multiaddr, Protocol},
     secio::PeerId,
-    transports::{find_type, TransportType},
+    transports::{find_type, parse_tls_domain_name, TransportType},
     utils::{extract_peer_id, socketaddr_to_multiaddr},
 };
 
@@ -76,7 +76,14 @@ impl DnsResolver {
             Some(address) => {
                 let mut address = socketaddr_to_multiaddr(address);
                 match self.ty {
-                    TransportType::Tcp | TransportType::Memory | TransportType::Tls => (),
+                    TransportType::Tcp | TransportType::Memory => (),
+                    TransportType::Tls => {
+                        let domain_name = parse_tls_domain_name(&self.source_address)
+                            .map(Cow::Owned)
+                            .unwrap_or(Cow::Borrowed(""));
+
+                        address.push(Protocol::Tls(domain_name));
+                    }
                     TransportType::Ws => address.push(Protocol::Ws),
                     TransportType::Wss => address.push(Protocol::Wss),
                 }
