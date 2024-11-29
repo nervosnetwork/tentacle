@@ -1,0 +1,287 @@
+mod time;
+
+use crate::{
+    runtime::{proxy::socks5_config, CompatStream2},
+    service::config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer, TransformerContext},
+};
+use async_io::Async;
+use async_std::net::{TcpListener as AsyncListener, TcpStream as AsyncStream, ToSocketAddrs};
+use futures::{
+    channel::{
+        mpsc::{channel, Receiver},
+        oneshot::{self, Sender},
+    },
+    future::select,
+    FutureExt, SinkExt, StreamExt,
+};
+use multiaddr::MultiAddr;
+use std::{
+    pin::Pin,
+    str::FromStr,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+#[derive(Debug)]
+pub struct TcpListener {
+    /// Why does this need to be handled here?
+    ///
+    /// https://www.driftluo.com/article/9e85ea7c-219a-4b25-ab32-e66c5d3027d0
+    ///
+    /// Not only because of idempotent operation reasons, at the same time,
+    /// after the task is registered to the event monitor, the relationship between
+    /// the task and the corresponding waker needs to be ensured. If the task is dropped
+    /// immediately after registration, the waker cannot wake up the corresponding task.
+    ///
+    /// Since the async-std api was designed without leaving the corresponding poll interface,
+    /// this will force users to ensure that they are used in an async environment
+    recv: Receiver<io::Result<(AsyncStream, SocketAddr)>>,
+    local_addr: SocketAddr,
+    _close_sender: Sender<()>,
+}
+
+impl TcpListener {
+    fn new(listener: AsyncListener, local_addr: SocketAddr) -> TcpListener {
+        let (mut tx, rx) = channel(24);
+        let (tx_c, rx_c) = oneshot::channel::<()>();
+        let task = async move {
+            loop {
+                let res = listener.accept().await;
+                let _ignore = tx.send(res).await;
+            }
+        }
+        .boxed();
+        crate::runtime::spawn(select(task, rx_c));
+        TcpListener {
+            recv: rx,
+            local_addr,
+            _close_sender: tx_c,
+        }
+    }
+
+    pub async fn bind<A: ToSocketAddrs>(addrs: A) -> io::Result<TcpListener> {
+        let listener = AsyncListener::bind(addrs).await?;
+        let local_addr = listener.local_addr()?;
+        Ok(Self::new(listener, local_addr))
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    pub fn poll_accept(&mut self, cx: &mut Context) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+        match self.recv.poll_next_unpin(cx) {
+            Poll::Ready(Some(res)) => {
+                Poll::Ready(res.map(|x| (TcpStream(CompatStream2::new(x.0)), x.1)))
+            }
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TcpStream(CompatStream2<AsyncStream>);
+
+impl TcpStream {
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.0.get_ref().peer_addr()
+    }
+
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.get_ref().peek(buf).await
+    }
+}
+
+impl AsyncRead for TcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        AsyncRead::poll_read(Pin::new(&mut self.0), cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    #[inline]
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "async-timer")]
+pub use async_std::future::timeout;
+#[cfg(feature = "async-timer")]
+pub use time::*;
+
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
+use std::{io, net::SocketAddr};
+
+pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Result<TcpListener> {
+    let domain = Domain::for_address(addr);
+    let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
+
+    let socket = {
+        let transformer_context = TransformerContext::new_listen(addr);
+        let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket }, transformer_context)?;
+        t.inner
+    };
+    // `bind` twice will return error
+    //
+    // code 22 means:
+    // EINVAL The socket is already bound to an address.
+    // ref: https://man7.org/linux/man-pages/man2/bind.2.html
+    if let Err(e) = socket.bind(&addr.into()) {
+        if Some(22) != e.raw_os_error() {
+            return Err(e);
+        }
+    }
+    socket.listen(1024)?;
+
+    let listen = std::net::TcpListener::from(socket);
+    let addr = listen.local_addr()?;
+    Ok(TcpListener::new(AsyncListener::from(listen), addr))
+}
+
+async fn connect_direct(
+    addr: SocketAddr,
+    socket_transformer: TcpSocketTransformer,
+) -> io::Result<TcpStream> {
+    let domain = Domain::for_address(addr);
+    let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
+
+    let socket = {
+        // On platforms with Berkeley-derived sockets, this allows to quickly
+        // rebind a socket, without needing to wait for the OS to clean up the
+        // previous one.
+        //
+        // On Windows, this allows rebinding sockets which are actively in use,
+        // which allows “socket hijacking”, so we explicitly don't set it here.
+        // https://docs.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse
+        //
+        // user can disable it on tcp_config
+        #[cfg(not(windows))]
+        socket.set_reuse_address(true)?;
+        let transformer_context = TransformerContext::new_dial(addr);
+        let t = socket_transformer(TcpSocket { inner: socket }, transformer_context)?;
+        t.inner
+    };
+
+    // Begin async connect and ignore the inevitable "in progress" error.
+    socket.set_nonblocking(true)?;
+    socket.connect(&addr.into()).or_else(|err| {
+        // Check for EINPROGRESS on Unix and WSAEWOULDBLOCK on Windows.
+        #[cfg(unix)]
+        let in_progress = err.raw_os_error() == Some(libc::EINPROGRESS);
+        #[cfg(windows)]
+        let in_progress = err.kind() == io::ErrorKind::WouldBlock;
+
+        // If connect results with an "in progress" error, that's not an error.
+        if in_progress {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    })?;
+    let stream = Async::new(std::net::TcpStream::from(socket))?;
+
+    // The stream becomes writable when connected.
+    stream.writable().await?;
+
+    // Check if there was an error while connecting.
+    match stream.get_ref().take_error()? {
+        None => {
+            let tcp = stream.into_inner().unwrap();
+            Ok(TcpStream(CompatStream2::new(AsyncStream::from(tcp))))
+        }
+        Some(err) => Err(err),
+    }
+}
+
+async fn connect_by_proxy<A>(
+    target_addr: A,
+    socket_transformer: TcpSocketTransformer,
+    proxy_url: String,
+    onion_random_socks_auth: bool,
+) -> io::Result<TcpStream>
+where
+    A: Into<shadowsocks::relay::Address>,
+{
+    let socks5_config = socks5_config::parse(&proxy_url, onion_random_socks_auth)?;
+
+    let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
+    let stream = connect_direct(dial_addr, socket_transformer).await?;
+
+    crate::runtime::proxy::socks5::establish_connection(stream, target_addr, socks5_config)
+        .await
+        .map_err(io::Error::other)
+}
+
+pub(crate) async fn connect(
+    addr: SocketAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    let TcpSocketConfig {
+        socket_transformer,
+        proxy_url,
+        onion_url: _,
+        onion_random_socks_auth,
+    } = tcp_config;
+    match proxy_url {
+        Some(proxy_url) => {
+            connect_by_proxy(addr, socket_transformer, proxy_url, onion_random_socks_auth).await
+        }
+        None => connect_direct(addr, socket_transformer).await,
+    }
+}
+
+pub(crate) async fn connect_onion(
+    onion_addr: MultiAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    let TcpSocketConfig {
+        socket_transformer,
+        proxy_url,
+        onion_url,
+        onion_random_socks_auth,
+    } = tcp_config;
+    let onion_url = onion_url.or(proxy_url).ok_or(io::Error::other(
+        "need tor proxy server to connect to onion address",
+    ))?;
+
+    let onion_protocol = onion_addr.iter().next().ok_or(io::Error::other(
+        "connect_onion need Protocol::Onion3 multiaddr",
+    ))?;
+    // onion_str looks like: "/onion3/wsglappcvp4y4e2ff3ubowpkoxuoaudzvmih6gc54442vfabebwf42ad:8114"
+    let onion_str = onion_protocol.to_string();
+    // remove prefix "/onion3/", if not contains /onion3/, return error
+    let onion_str = onion_str
+        .strip_prefix("/onion3/")
+        .ok_or(io::Error::other(format!(
+            "connect_onion need Protocol::Onion3 multiaddr, but got {}",
+            onion_str
+        )))?;
+    let onion_address =
+        shadowsocks::relay::Address::from_str(onion_str).map_err(std::io::Error::other)?;
+
+    connect_by_proxy(
+        onion_address,
+        socket_transformer,
+        onion_url,
+        onion_random_socks_auth,
+    )
+    .await
+}
