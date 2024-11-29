@@ -145,7 +145,7 @@ mod os {
         let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
 
         let socket = {
-            let t = tcp_config(TcpSocket { inner: socket })?;
+            let t = tcp_config.tcp_socket_config(TcpSocket { inner: socket })?;
             t.inner
         };
         // `bind` twice will return error
@@ -184,7 +184,7 @@ mod os {
             // user can disable it on tcp_config
             #[cfg(not(windows))]
             socket.set_reuse_address(true)?;
-            let t = tcp_config(TcpSocket { inner: socket })?;
+            let t = tcp_config.tcp_socket_config(TcpSocket { inner: socket })?;
             t.inner
         };
 
