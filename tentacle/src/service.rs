@@ -53,6 +53,7 @@ pub use crate::service::{
 };
 use bytes::Bytes;
 
+pub use crate::service::config::ProxyConfig;
 #[cfg(feature = "tls")]
 pub use crate::service::config::TlsConfig;
 

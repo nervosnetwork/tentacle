@@ -1,3 +1,5 @@
+use libc::TCP_FASTOPEN_CONNECT;
+use shadowsocks_service::local::socks::client::Socks5TcpClient;
 pub use tokio::{
     net::{TcpListener, TcpStream},
     spawn,
@@ -10,8 +12,8 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-use std::{io, net::SocketAddr};
-use tokio::net::TcpSocket as TokioTcp;
+use std::{io, net::SocketAddr, pin::Pin};
+use tokio::net::{TcpSocket as TokioTcp, ToSocketAddrs};
 
 #[cfg(feature = "tokio-timer")]
 pub use {
@@ -88,7 +90,7 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
         // user can disable it on tcp_config
         #[cfg(not(windows))]
         socket.set_reuse_address(true)?;
-        let t = tcp_config(TcpSocket { inner: socket })?;
+        let t = (tcp_config.tcp_socket_config)(TcpSocket { inner: socket })?;
         t.inner.set_nonblocking(true)?;
         // safety: fd convert by socket2
         unsafe {
@@ -117,21 +119,28 @@ pub(crate) async fn connect(
     addr: SocketAddr,
     tcp_config: TcpSocketConfig,
 ) -> io::Result<TcpStream> {
-    let domain = Domain::for_address(addr);
-    let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
+    match tcp_config.proxy_config {
+        Some(proxy_config) => super::socks5::connect(addr, proxy_config.proxy_url)
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err)),
+        None => {
+            let domain = Domain::for_address(addr);
+            let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
 
-    let socket = {
-        let t = tcp_config(TcpSocket { inner: socket })?;
-        t.inner.set_nonblocking(true)?;
-        // safety: fd convert by socket2
-        unsafe {
-            #[cfg(unix)]
-            let socket = TokioTcp::from_raw_fd(t.into_raw_fd());
-            #[cfg(windows)]
-            let socket = TokioTcp::from_raw_socket(t.into_raw_socket());
-            socket
+            let socket = {
+                let t = (tcp_config.tcp_socket_config)(TcpSocket { inner: socket })?;
+                t.inner.set_nonblocking(true)?;
+                // safety: fd convert by socket2
+                unsafe {
+                    #[cfg(unix)]
+                    let socket = TokioTcp::from_raw_fd(t.into_raw_fd());
+                    #[cfg(windows)]
+                    let socket = TokioTcp::from_raw_socket(t.into_raw_socket());
+                    socket
+                }
+            };
+
+            socket.connect(addr).await
         }
-    };
-
-    socket.connect(addr).await
+    }
 }
