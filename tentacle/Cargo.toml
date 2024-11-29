@@ -46,6 +46,7 @@ igd = { version = "0.15", optional = true, package = "igd-next" }
 tokio-rustls = { version = "0.26.0", optional = true }
 shadowsocks-service = { version = "1.21.2", features = ["local"]}
 shadowsocks = "1.21.0"
+url = "2.5.4"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # rand 0.8 not support wasm32
