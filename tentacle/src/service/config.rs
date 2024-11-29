@@ -86,11 +86,31 @@ impl Default for SessionConfig {
     }
 }
 
-pub(crate) type TcpSocketConfig =
-    Arc<dyn Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static>;
+/// Proxy related config
+#[derive(Clone)]
+pub struct ProxyConfig {
+    /// proxy url, like: socks5://127.0.0.1:9050
+    pub proxy_url: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct TcpSocketConfig {
+    pub(crate) tcp_socket_config:
+        Arc<dyn Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static>,
+    pub(crate) proxy_config: Option<ProxyConfig>,
+}
+
+impl Default for TcpSocketConfig {
+    fn default() -> Self {
+        Self {
+            tcp_socket_config: Arc::new(Ok),
+            proxy_config: None,
+        }
+    }
+}
 
 /// This config Allow users to set various underlying parameters of TCP
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct TcpConfig {
     /// When dial/listen on tcp, tentacle will call it allow user to set all tcp socket config
     pub tcp: TcpSocketConfig,
@@ -100,18 +120,6 @@ pub(crate) struct TcpConfig {
     /// When dial/listen on tls, tentacle will call it allow user to set all tcp socket config
     #[cfg(feature = "tls")]
     pub tls: TcpSocketConfig,
-}
-
-impl Default for TcpConfig {
-    fn default() -> Self {
-        TcpConfig {
-            tcp: Arc::new(Ok),
-            #[cfg(feature = "ws")]
-            ws: Arc::new(Ok),
-            #[cfg(feature = "tls")]
-            tls: Arc::new(Ok),
-        }
-    }
 }
 
 /// A TCP socket that has not yet been converted to a `TcpStream` or
