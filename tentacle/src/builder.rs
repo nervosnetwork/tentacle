@@ -1,5 +1,7 @@
 use std::{io, sync::Arc, time::Duration};
 
+use crate::service::config::ProxyConfig;
+use crate::service::config::TcpSocketConfig;
 use nohash_hasher::IntMap;
 use tokio_util::codec::LengthDelimitedCodec;
 
@@ -219,7 +221,14 @@ where
     where
         F: Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
     {
-        self.config.tcp_config.tcp = Arc::new(f);
+        self.config.tcp_config.tcp.tcp_socket_config = Arc::new(f);
+        self
+    }
+
+    /// Proxy config for tcp
+    #[cfg(not(target_family = "wasm"))]
+    pub fn tcp_proxy_config(mut self, proxy_conifg: Option<ProxyConfig>) -> Self {
+        self.config.tcp_config.tcp.proxy_config = proxy_conifg;
         self
     }
 
@@ -230,7 +239,7 @@ where
     where
         F: Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
     {
-        self.config.tcp_config.ws = Arc::new(f);
+        self.config.tcp_config.ws.tcp_socket_config = Arc::new(f);
         self
     }
 
@@ -254,7 +263,7 @@ where
     where
         F: Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
     {
-        self.config.tcp_config.tls = Arc::new(f);
+        self.config.tcp_config.tls.tcp_socket_config = Arc::new(f);
         self
     }
 }

@@ -56,6 +56,8 @@ mod generic_split {
     }
 }
 
+mod socks5;
+
 mod budget;
 pub use budget::*;
 
