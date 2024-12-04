@@ -1,7 +1,6 @@
 use std::{io, sync::Arc, time::Duration};
 
 use crate::service::config::ProxyConfig;
-use crate::service::config::TcpSocketConfig;
 use nohash_hasher::IntMap;
 use tokio_util::codec::LengthDelimitedCodec;
 

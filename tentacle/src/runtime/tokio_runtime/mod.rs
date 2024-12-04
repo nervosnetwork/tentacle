@@ -1,5 +1,5 @@
-use libc::TCP_FASTOPEN_CONNECT;
-use shadowsocks_service::local::socks::client::Socks5TcpClient;
+pub(crate) mod socks5;
+use socks5::Socks5Config;
 pub use tokio::{
     net::{TcpListener, TcpStream},
     spawn,
@@ -12,8 +12,8 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-use std::{io, net::SocketAddr, pin::Pin};
-use tokio::net::{TcpSocket as TokioTcp, ToSocketAddrs};
+use std::{io, net::SocketAddr};
+use tokio::net::TcpSocket as TokioTcp;
 
 #[cfg(feature = "tokio-timer")]
 pub use {
@@ -120,9 +120,12 @@ pub(crate) async fn connect(
     tcp_config: TcpSocketConfig,
 ) -> io::Result<TcpStream> {
     match tcp_config.proxy_config {
-        Some(proxy_config) => super::socks5::connect(addr, proxy_config.proxy_url)
-            .await
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err)),
+        Some(proxy_config) => {
+            let proxy_config: Socks5Config = super::socks5::parse(&proxy_config.proxy_url)?;
+            super::socks5::connect(addr, proxy_config)
+                .await
+                .map_err(|err| io::Error::other(err))
+        }
         None => {
             let domain = Domain::for_address(addr);
             let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
