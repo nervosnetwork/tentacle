@@ -5,16 +5,17 @@ use shadowsocks::relay::socks5::{
     self, Address, Command, Error as Socks5Error, HandshakeRequest, HandshakeResponse,
     PasswdAuthRequest, PasswdAuthResponse, Reply, TcpRequestHeader, TcpResponseHeader,
 };
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use super::super::socks5_config::Socks5Config;
+use super::socks5_config::Socks5Config;
 
-pub async fn establish_connection<A>(
-    mut s: TcpStream,
+pub async fn establish_connection<S, A>(
+    mut s: S,
     target_addr: A,
     socks5_config: Socks5Config,
-) -> Result<TcpStream, Socks5Error>
+) -> Result<S, Socks5Error>
 where
+    S: AsyncRead + AsyncWrite + Unpin,
     A: Into<Address>,
 {
     debug!(

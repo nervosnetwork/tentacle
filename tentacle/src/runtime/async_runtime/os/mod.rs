@@ -1,3 +1,5 @@
+mod time;
+
 use crate::{
     runtime::{proxy::socks5_config, CompatStream2},
     service::{
@@ -18,12 +20,10 @@ use futures::{
 use multiaddr::MultiAddr;
 use std::{
     pin::Pin,
+    str::FromStr,
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-#[cfg(feature = "async-timer")]
-mod time;
 
 #[derive(Debug)]
 pub struct TcpListener {
@@ -158,9 +158,9 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
     Ok(TcpListener::new(AsyncListener::from(listen), addr))
 }
 
-pub(crate) async fn connect(
+async fn connect_direct(
     addr: SocketAddr,
-    tcp_config: TcpSocketConfig,
+    tcp_socket_transformer: TcpSocketTransformer,
 ) -> io::Result<TcpStream> {
     let domain = Domain::for_address(addr);
     let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
@@ -177,7 +177,7 @@ pub(crate) async fn connect(
         // user can disable it on tcp_config
         #[cfg(not(windows))]
         socket.set_reuse_address(true)?;
-        let t = (tcp_config.tcp_socket_config)(TcpSocket { inner: socket })?;
+        let t = tcp_socket_transformer(TcpSocket { inner: socket })?;
         t.inner
     };
 
@@ -230,9 +230,46 @@ where
         .map_err(io::Error::other)
 }
 
+pub(crate) async fn connect(
+    addr: SocketAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    let TcpSocketConfig {
+        tcp_socket_config,
+        proxy_config,
+    } = tcp_config;
+    match proxy_config {
+        Some(proxy_config) => connect_by_proxy(addr, tcp_socket_config, proxy_config).await,
+        None => connect_direct(addr, tcp_socket_config).await,
+    }
+}
+
 pub(crate) async fn connect_onion(
     onion_addr: MultiAddr,
     tcp_config: TcpSocketConfig,
 ) -> io::Result<TcpStream> {
-    todo!()
+    let TcpSocketConfig {
+        tcp_socket_config,
+        proxy_config,
+    } = tcp_config;
+    let proxy_config = proxy_config.ok_or(io::Error::other(
+        "need tor proxy server to connect to onion address",
+    ))?;
+
+    let onion_protocol = onion_addr.iter().next().ok_or(io::Error::other(
+        "connect_onion need Protocol::Onion3 multiaddr",
+    ))?;
+    // onion_str looks like: "/onion3/wsglappcvp4y4e2ff3ubowpkoxuoaudzvmih6gc54442vfabebwf42ad:8114"
+    let onion_str = onion_protocol.to_string();
+    // remove prefix "/onion3/", if not contains /onion3/, return error
+    let onion_str = onion_str
+        .strip_prefix("/onion3/")
+        .ok_or(io::Error::other(format!(
+            "connect_onion need Protocol::Onion3 multiaddr, but got {}",
+            onion_str
+        )))?;
+    let onion_address =
+        shadowsocks::relay::Address::from_str(onion_str).map_err(std::io::Error::other)?;
+
+    connect_by_proxy(onion_address, tcp_socket_config, proxy_config).await
 }

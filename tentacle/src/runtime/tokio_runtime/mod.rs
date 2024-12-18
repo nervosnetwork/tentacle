@@ -1,5 +1,4 @@
-use super::socks5_config;
-mod socks5;
+use super::proxy::socks5_config;
 use multiaddr::MultiAddr;
 pub use tokio::{
     net::{TcpListener, TcpStream},
@@ -155,7 +154,7 @@ where
     let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
     let stream = connect_direct(dial_addr, tcp_socket_transformer).await?;
 
-    super::tokio_runtime::socks5::establish_connection(stream, target_addr, socks5_config)
+    super::proxy::socks5::establish_connection(stream, target_addr, socks5_config)
         .await
         .map_err(io::Error::other)
 }
@@ -186,8 +185,21 @@ pub(crate) async fn connect_onion(
     let proxy_config = proxy_config.ok_or(io::Error::other(
         "need tor proxy server to connect to onion address",
     ))?;
-    let onion_address = shadowsocks::relay::Address::from_str(onion_addr.to_string().as_str())
-        .map_err(std::io::Error::other)?;
+    let onion_protocol = onion_addr.iter().next().ok_or(io::Error::other(
+        "connect_onion need Protocol::Onion3 multiaddr",
+    ))?;
+    // onion_str looks like: "/onion3/wsglappcvp4y4e2ff3ubowpkoxuoaudzvmih6gc54442vfabebwf42ad:8114"
+    let onion_str = onion_protocol.to_string();
+    // remove prefix "/onion3/", if not contains /onion3/, return error
+    let onion_str = onion_str
+        .strip_prefix("/onion3/")
+        .ok_or(io::Error::other(format!(
+            "connect_onion need Protocol::Onion3 multiaddr, but got {}",
+            onion_str
+        )))?;
+    let onion_str = onion_str.replace(":", ".onion:");
+    let onion_address =
+        shadowsocks::relay::Address::from_str(&onion_str).map_err(std::io::Error::other)?;
 
     connect_by_proxy(onion_address, tcp_socket_config, proxy_config).await
 }
