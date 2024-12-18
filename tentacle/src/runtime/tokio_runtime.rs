@@ -1,3 +1,4 @@
+use multiaddr::MultiAddr;
 pub use tokio::{
     net::{TcpListener, TcpStream},
     spawn,
@@ -134,4 +135,11 @@ pub(crate) async fn connect(
     };
 
     socket.connect(addr).await
+}
+
+pub(crate) async fn connect_tor_proxy(
+    addr: MultiAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    todo!("connect multiaddr by proxy");
 }
