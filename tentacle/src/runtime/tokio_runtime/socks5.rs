@@ -9,7 +9,11 @@ use tokio::net::TcpStream;
 
 use super::super::socks5_config::Socks5Config;
 
-pub async fn connect<A>(addr: A, socks5_config: Socks5Config) -> Result<TcpStream, Socks5Error>
+pub async fn establish_connection<A>(
+    mut s: TcpStream,
+    target_addr: A,
+    socks5_config: Socks5Config,
+) -> Result<TcpStream, Socks5Error>
 where
     A: Into<Address>,
 {
@@ -19,9 +23,7 @@ where
         socks5_config.auth.is_some()
     );
     // destruct socks5_config
-    let Socks5Config { auth, proxy_url } = socks5_config;
-
-    let mut s = TcpStream::connect(proxy_url).await?;
+    let Socks5Config { auth, proxy_url: _ } = socks5_config;
 
     // 1. Handshake
     let hs = {
@@ -62,7 +64,7 @@ where
     }
 
     // 2. Send request header
-    let h = TcpRequestHeader::new(Command::TcpConnect, addr.into());
+    let h = TcpRequestHeader::new(Command::TcpConnect, target_addr.into());
     debug!("going to connect, req: {:?}", h);
     h.write_to(&mut s).await?;
 
