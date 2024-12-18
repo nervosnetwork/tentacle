@@ -1,4 +1,5 @@
 pub(crate) mod socks5;
+use multiaddr::MultiAddr;
 use socks5::Socks5Config;
 pub use tokio::{
     net::{TcpListener, TcpStream},
@@ -12,7 +13,7 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, str::FromStr};
 use tokio::net::TcpSocket as TokioTcp;
 
 #[cfg(feature = "tokio-timer")]
@@ -146,4 +147,19 @@ pub(crate) async fn connect(
             socket.connect(addr).await
         }
     }
+}
+
+pub(crate) async fn connect_tor_proxy(
+    onion_addr: MultiAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    let proxy_config = tcp_config.proxy_config.ok_or(std::io::Error::other(
+        "need tor proxy server to connect to onion address",
+    ))?;
+    let socks5_config: Socks5Config = super::socks5::parse(&proxy_config.proxy_url)?;
+    let address = shadowsocks::relay::Address::from_str(onion_addr.to_string().as_str())
+        .map_err(|err| std::io::Error::other(err))?;
+    super::socks5::connect(address, socks5_config)
+        .await
+        .map_err(|err| io::Error::other(err))
 }

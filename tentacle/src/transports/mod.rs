@@ -16,6 +16,8 @@ mod browser;
 #[cfg(not(target_family = "wasm"))]
 mod memory;
 #[cfg(not(target_family = "wasm"))]
+mod onion;
+#[cfg(not(target_family = "wasm"))]
 mod tcp;
 #[cfg(not(target_family = "wasm"))]
 mod tcp_base_listen;
@@ -95,6 +97,8 @@ mod os {
     };
 
     use futures::{prelude::Stream, FutureExt, StreamExt};
+    use multiaddr::MultiAddr;
+    use onion::OnionTransport;
     use std::{
         collections::HashMap,
         fmt,
@@ -202,6 +206,8 @@ mod os {
                 }
                 #[cfg(not(feature = "tls"))]
                 TransportType::Tls => Err(TransportErrorKind::NotSupported(address)),
+
+                TransportType::Onion => Err(TransportErrorKind::NotSupported(address)),
             }
         }
     }
@@ -212,6 +218,12 @@ mod os {
             match find_type(&address) {
                 TransportType::Tcp => {
                     match TcpTransport::new(self.timeout, self.tcp_config.tcp).dial(address) {
+                        Ok(res) => Ok(MultiDialFuture::Tcp(res)),
+                        Err(e) => Err(e),
+                    }
+                }
+                TransportType::Onion => {
+                    match OnionTransport::new(self.timeout, self.tcp_config.tcp).dial(address) {
                         Ok(res) => Ok(MultiDialFuture::Tcp(res)),
                         Err(e) => Err(e),
                     }
@@ -432,6 +444,24 @@ mod os {
         timeout: Duration,
     ) -> Result<TcpStream> {
         match crate::runtime::timeout(timeout, crate::runtime::connect(addr, tcp_config)).await {
+            Err(_) => Err(TransportErrorKind::Io(io::ErrorKind::TimedOut.into())),
+            Ok(res) => res.map_err(Into::into),
+        }
+    }
+
+    /// onion common dial realization
+    #[inline(always)]
+    pub async fn onion_dial(
+        onion_addr: MultiAddr,
+        tcp_config: TcpSocketConfig,
+        timeout: Duration,
+    ) -> Result<TcpStream> {
+        match crate::runtime::timeout(
+            timeout,
+            crate::runtime::connect_tor_proxy(onion_addr, tcp_config),
+        )
+        .await
+        {
             Err(_) => Err(TransportErrorKind::Io(io::ErrorKind::TimedOut.into())),
             Ok(res) => res.map_err(Into::into),
         }
