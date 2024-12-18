@@ -1,6 +1,9 @@
 use crate::{
-    runtime::CompatStream2,
-    service::config::{TcpSocket, TcpSocketConfig},
+    runtime::{proxy::socks5_config, CompatStream2},
+    service::{
+        config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer},
+        ProxyConfig,
+    },
 };
 use async_io::Async;
 use async_std::net::{TcpListener as AsyncListener, TcpStream as AsyncStream, ToSocketAddrs};
@@ -12,6 +15,7 @@ use futures::{
     future::select,
     FutureExt, SinkExt, StreamExt,
 };
+use multiaddr::MultiAddr;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -206,4 +210,29 @@ pub(crate) async fn connect(
         }
         Some(err) => Err(err),
     }
+}
+
+async fn connect_by_proxy<A>(
+    target_addr: A,
+    tcp_socket_transformer: TcpSocketTransformer,
+    proxy_config: ProxyConfig,
+) -> io::Result<TcpStream>
+where
+    A: Into<shadowsocks::relay::Address>,
+{
+    let socks5_config = socks5_config::parse(&proxy_config.proxy_url)?;
+
+    let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
+    let stream = connect_direct(dial_addr, tcp_socket_transformer).await?;
+
+    crate::runtime::proxy::socks5::establish_connection(stream, target_addr, socks5_config)
+        .await
+        .map_err(io::Error::other)
+}
+
+pub(crate) async fn connect_onion(
+    onion_addr: MultiAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    todo!()
 }
