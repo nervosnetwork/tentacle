@@ -7,7 +7,10 @@ pub use tokio::{
     task::{block_in_place, spawn_blocking, yield_now, JoinHandle},
 };
 
-use crate::service::config::{TcpSocket, TcpSocketConfig};
+use crate::service::{
+    config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer},
+    ProxyConfig,
+};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -116,51 +119,75 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
     socket.listen(1024)
 }
 
-pub(crate) async fn connect(
+async fn connect_direct(
     addr: SocketAddr,
+    tcp_socket_transformer: TcpSocketTransformer,
+) -> io::Result<TcpStream> {
+    let domain = Domain::for_address(addr);
+    let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
+
+    let socket = {
+        let t = tcp_socket_transformer(TcpSocket { inner: socket })?;
+        t.inner.set_nonblocking(true)?;
+        // safety: fd convert by socket2
+        unsafe {
+            #[cfg(unix)]
+            let socket = TokioTcp::from_raw_fd(t.into_raw_fd());
+            #[cfg(windows)]
+            let socket = TokioTcp::from_raw_socket(t.into_raw_socket());
+            socket
+        }
+    };
+
+    socket.connect(addr).await
+}
+
+async fn connect_by_proxy<A>(
+    target_addr: A,
+    tcp_socket_transformer: TcpSocketTransformer,
+    proxy_config: ProxyConfig,
+) -> io::Result<TcpStream>
+where
+    A: Into<shadowsocks::relay::Address>,
+{
+    let socks5_config = socks5_config::parse(&proxy_config.proxy_url)?;
+
+    let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
+    let stream = connect_direct(dial_addr, tcp_socket_transformer).await?;
+
+    super::tokio_runtime::socks5::establish_connection(stream, target_addr, socks5_config)
+        .await
+        .map_err(io::Error::other)
+}
+
+pub(crate) async fn connect(
+    target_addr: SocketAddr,
     tcp_config: TcpSocketConfig,
 ) -> io::Result<TcpStream> {
-    match tcp_config.proxy_config {
-        Some(proxy_config) => {
-            let proxy_config: socks5_config::Socks5Config =
-                socks5_config::parse(&proxy_config.proxy_url)?;
-            super::tokio_runtime::socks5::connect(addr, proxy_config)
-                .await
-                .map_err(io::Error::other)
-        }
-        None => {
-            let domain = Domain::for_address(addr);
-            let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
+    let TcpSocketConfig {
+        tcp_socket_config,
+        proxy_config,
+    } = tcp_config;
 
-            let socket = {
-                let t = (tcp_config.tcp_socket_config)(TcpSocket { inner: socket })?;
-                t.inner.set_nonblocking(true)?;
-                // safety: fd convert by socket2
-                unsafe {
-                    #[cfg(unix)]
-                    let socket = TokioTcp::from_raw_fd(t.into_raw_fd());
-                    #[cfg(windows)]
-                    let socket = TokioTcp::from_raw_socket(t.into_raw_socket());
-                    socket
-                }
-            };
-
-            socket.connect(addr).await
-        }
+    match proxy_config {
+        Some(proxy_config) => connect_by_proxy(target_addr, tcp_socket_config, proxy_config).await,
+        None => connect_direct(target_addr, tcp_socket_config).await,
     }
 }
 
-pub(crate) async fn connect_tor_proxy(
+pub(crate) async fn connect_onion(
     onion_addr: MultiAddr,
     tcp_config: TcpSocketConfig,
 ) -> io::Result<TcpStream> {
-    let proxy_config = tcp_config.proxy_config.ok_or(std::io::Error::other(
+    let TcpSocketConfig {
+        tcp_socket_config,
+        proxy_config,
+    } = tcp_config;
+    let proxy_config = proxy_config.ok_or(io::Error::other(
         "need tor proxy server to connect to onion address",
     ))?;
-    let socks5_config: socks5_config::Socks5Config = socks5_config::parse(&proxy_config.proxy_url)?;
-    let address = shadowsocks::relay::Address::from_str(onion_addr.to_string().as_str())
+    let onion_address = shadowsocks::relay::Address::from_str(onion_addr.to_string().as_str())
         .map_err(std::io::Error::other)?;
-    socks5::connect(address, socks5_config)
-        .await
-        .map_err(io::Error::other)
+
+    connect_by_proxy(onion_address, tcp_socket_config, proxy_config).await
 }

@@ -458,7 +458,7 @@ mod os {
     ) -> Result<TcpStream> {
         match crate::runtime::timeout(
             timeout,
-            crate::runtime::connect_tor_proxy(onion_addr, tcp_config),
+            crate::runtime::connect_onion(onion_addr, tcp_config),
         )
         .await
         {

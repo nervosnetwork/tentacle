@@ -93,10 +93,12 @@ pub struct ProxyConfig {
     pub proxy_url: String,
 }
 
+pub(crate) type TcpSocketTransformer =
+    Arc<dyn Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static>;
 #[derive(Clone)]
+
 pub(crate) struct TcpSocketConfig {
-    pub(crate) tcp_socket_config:
-        Arc<dyn Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static>,
+    pub(crate) tcp_socket_config: TcpSocketTransformer,
     pub(crate) proxy_config: Option<ProxyConfig>,
 }
 
