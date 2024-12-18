@@ -1,6 +1,6 @@
-pub(crate) mod socks5;
+use super::socks5_config;
+mod socks5;
 use multiaddr::MultiAddr;
-use socks5::Socks5Config;
 pub use tokio::{
     net::{TcpListener, TcpStream},
     spawn,
@@ -122,10 +122,11 @@ pub(crate) async fn connect(
 ) -> io::Result<TcpStream> {
     match tcp_config.proxy_config {
         Some(proxy_config) => {
-            let proxy_config: Socks5Config = super::socks5::parse(&proxy_config.proxy_url)?;
-            super::socks5::connect(addr, proxy_config)
+            let proxy_config: socks5_config::Socks5Config =
+                socks5_config::parse(&proxy_config.proxy_url)?;
+            super::tokio_runtime::socks5::connect(addr, proxy_config)
                 .await
-                .map_err(|err| io::Error::other(err))
+                .map_err(io::Error::other)
         }
         None => {
             let domain = Domain::for_address(addr);
@@ -156,10 +157,10 @@ pub(crate) async fn connect_tor_proxy(
     let proxy_config = tcp_config.proxy_config.ok_or(std::io::Error::other(
         "need tor proxy server to connect to onion address",
     ))?;
-    let socks5_config: Socks5Config = super::socks5::parse(&proxy_config.proxy_url)?;
+    let socks5_config: socks5_config::Socks5Config = socks5_config::parse(&proxy_config.proxy_url)?;
     let address = shadowsocks::relay::Address::from_str(onion_addr.to_string().as_str())
-        .map_err(|err| std::io::Error::other(err))?;
-    super::socks5::connect(address, socks5_config)
+        .map_err(std::io::Error::other)?;
+    socks5::connect(address, socks5_config)
         .await
-        .map_err(|err| io::Error::other(err))
+        .map_err(io::Error::other)
 }

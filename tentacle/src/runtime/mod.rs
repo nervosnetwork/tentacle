@@ -16,6 +16,7 @@ mod async_runtime;
     all(target_family = "wasm", feature = "wasm-timer")
 ))]
 mod generic_timer;
+pub(crate) mod socks5_config;
 #[cfg(all(not(target_family = "wasm"), feature = "tokio-runtime"))]
 mod tokio_runtime;
 #[cfg(target_family = "wasm")]
