@@ -220,7 +220,7 @@ where
     where
         F: Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
     {
-        self.config.tcp_config.tcp.tcp_socket_config = Arc::new(f);
+        self.config.tcp_config.tcp.socket_transformer = Arc::new(f);
         self
     }
 
@@ -238,7 +238,7 @@ where
     where
         F: Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
     {
-        self.config.tcp_config.ws.tcp_socket_config = Arc::new(f);
+        self.config.tcp_config.ws.socket_transformer = Arc::new(f);
         self
     }
 
@@ -262,7 +262,7 @@ where
     where
         F: Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
     {
-        self.config.tcp_config.tls.tcp_socket_config = Arc::new(f);
+        self.config.tcp_config.tls.socket_transformer = Arc::new(f);
         self
     }
 }
