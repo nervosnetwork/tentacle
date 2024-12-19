@@ -197,8 +197,9 @@ pub(crate) async fn connect_onion(
             "connect_onion need Protocol::Onion3 multiaddr, but got {}",
             onion_str
         )))?;
+    let onion_str = onion_str.replace(":", ".onion:");
     let onion_address =
-        shadowsocks::relay::Address::from_str(onion_str).map_err(std::io::Error::other)?;
+        shadowsocks::relay::Address::from_str(&onion_str).map_err(std::io::Error::other)?;
 
     connect_by_proxy(onion_address, socket_transformer, proxy_config).await
 }
