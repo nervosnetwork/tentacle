@@ -138,7 +138,7 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
     let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
 
     let socket = {
-        let t = (tcp_config.tcp_socket_config)(TcpSocket { inner: socket })?;
+        let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket })?;
         t.inner
     };
     // `bind` twice will return error
@@ -160,7 +160,7 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
 
 async fn connect_direct(
     addr: SocketAddr,
-    tcp_socket_transformer: TcpSocketTransformer,
+    socket_transformer: TcpSocketTransformer,
 ) -> io::Result<TcpStream> {
     let domain = Domain::for_address(addr);
     let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
@@ -177,7 +177,7 @@ async fn connect_direct(
         // user can disable it on tcp_config
         #[cfg(not(windows))]
         socket.set_reuse_address(true)?;
-        let t = tcp_socket_transformer(TcpSocket { inner: socket })?;
+        let t = socket_transformer(TcpSocket { inner: socket })?;
         t.inner
     };
 
@@ -214,7 +214,7 @@ async fn connect_direct(
 
 async fn connect_by_proxy<A>(
     target_addr: A,
-    tcp_socket_transformer: TcpSocketTransformer,
+    socket_transformer: TcpSocketTransformer,
     proxy_config: ProxyConfig,
 ) -> io::Result<TcpStream>
 where
@@ -223,7 +223,7 @@ where
     let socks5_config = socks5_config::parse(&proxy_config.proxy_url)?;
 
     let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
-    let stream = connect_direct(dial_addr, tcp_socket_transformer).await?;
+    let stream = connect_direct(dial_addr, socket_transformer).await?;
 
     crate::runtime::proxy::socks5::establish_connection(stream, target_addr, socks5_config)
         .await
@@ -235,12 +235,12 @@ pub(crate) async fn connect(
     tcp_config: TcpSocketConfig,
 ) -> io::Result<TcpStream> {
     let TcpSocketConfig {
-        tcp_socket_config,
+        socket_transformer,
         proxy_config,
     } = tcp_config;
     match proxy_config {
-        Some(proxy_config) => connect_by_proxy(addr, tcp_socket_config, proxy_config).await,
-        None => connect_direct(addr, tcp_socket_config).await,
+        Some(proxy_config) => connect_by_proxy(addr, socket_transformer, proxy_config).await,
+        None => connect_direct(addr, socket_transformer).await,
     }
 }
 
@@ -249,7 +249,7 @@ pub(crate) async fn connect_onion(
     tcp_config: TcpSocketConfig,
 ) -> io::Result<TcpStream> {
     let TcpSocketConfig {
-        tcp_socket_config,
+        socket_transformer,
         proxy_config,
     } = tcp_config;
     let proxy_config = proxy_config.ok_or(io::Error::other(
@@ -271,5 +271,5 @@ pub(crate) async fn connect_onion(
     let onion_address =
         shadowsocks::relay::Address::from_str(onion_str).map_err(std::io::Error::other)?;
 
-    connect_by_proxy(onion_address, tcp_socket_config, proxy_config).await
+    connect_by_proxy(onion_address, socket_transformer, proxy_config).await
 }

@@ -95,17 +95,17 @@ pub struct ProxyConfig {
 
 pub(crate) type TcpSocketTransformer =
     Arc<dyn Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static>;
-#[derive(Clone)]
 
+#[derive(Clone)]
 pub(crate) struct TcpSocketConfig {
-    pub(crate) tcp_socket_config: TcpSocketTransformer,
+    pub(crate) socket_transformer: TcpSocketTransformer,
     pub(crate) proxy_config: Option<ProxyConfig>,
 }
 
 impl Default for TcpSocketConfig {
     fn default() -> Self {
         Self {
-            tcp_socket_config: Arc::new(Ok),
+            socket_transformer: Arc::new(Ok),
             proxy_config: None,
         }
     }
