@@ -45,7 +45,8 @@ mod helper;
 
 pub use crate::service::{
     config::{
-        HandshakeType, ProtocolHandle, ProtocolMeta, TargetProtocol, TargetSession, TcpSocket,
+        HandshakeType, ProtocolHandle, ProtocolMeta, SocketState, TargetProtocol, TargetSession,
+        TcpSocket, TransformerContext,
     },
     control::{ServiceAsyncControl, ServiceControl},
     event::{ServiceError, ServiceEvent},
@@ -53,6 +54,7 @@ pub use crate::service::{
 };
 use bytes::Bytes;
 
+pub use crate::service::config::ProxyConfig;
 #[cfg(feature = "tls")]
 pub use crate::service::config::TlsConfig;
 
