@@ -13,7 +13,7 @@ use std::os::{
     fd::AsFd,
     unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd},
 };
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 
@@ -93,8 +93,38 @@ pub struct ProxyConfig {
     pub proxy_url: String,
 }
 
-pub(crate) type TcpSocketTransformer =
-    Arc<dyn Fn(TcpSocket) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static>;
+pub enum SocketState {
+    Listen,
+    Dial,
+}
+
+pub struct TransformerContext {
+    pub state: SocketState,
+    // if dial, remote address; if listen, local address
+    pub address: SocketAddr,
+}
+
+impl TransformerContext {
+    pub fn new_listen(address: SocketAddr) -> Self {
+        TransformerContext {
+            state: SocketState::Listen,
+            address,
+        }
+    }
+    pub fn new_dial(address: SocketAddr) -> Self {
+        TransformerContext {
+            state: SocketState::Dial,
+            address,
+        }
+    }
+}
+
+pub(crate) type TcpSocketTransformer = Arc<
+    dyn Fn(TcpSocket, TransformerContext) -> Result<TcpSocket, std::io::Error>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 #[derive(Clone)]
 pub(crate) struct TcpSocketConfig {
@@ -105,7 +135,7 @@ pub(crate) struct TcpSocketConfig {
 impl Default for TcpSocketConfig {
     fn default() -> Self {
         Self {
-            socket_transformer: Arc::new(Ok),
+            socket_transformer: Arc::new(|tcp_socket, _| Ok(tcp_socket)),
             proxy_config: None,
         }
     }
