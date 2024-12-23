@@ -7,7 +7,7 @@ pub use tokio::{
 };
 
 use crate::service::{
-    config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer},
+    config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer, TransformerContext},
     ProxyConfig,
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
@@ -93,7 +93,8 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
         // user can disable it on tcp_config
         #[cfg(not(windows))]
         socket.set_reuse_address(true)?;
-        let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket })?;
+        let transformer_context = TransformerContext::new_listen(addr);
+        let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket }, transformer_context)?;
         t.inner.set_nonblocking(true)?;
         // safety: fd convert by socket2
         unsafe {
@@ -126,7 +127,8 @@ async fn connect_direct(
     let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
 
     let socket = {
-        let t = socket_transformer(TcpSocket { inner: socket })?;
+        let transformer_context = TransformerContext::new_dial(addr);
+        let t = socket_transformer(TcpSocket { inner: socket }, transformer_context)?;
         t.inner.set_nonblocking(true)?;
         // safety: fd convert by socket2
         unsafe {

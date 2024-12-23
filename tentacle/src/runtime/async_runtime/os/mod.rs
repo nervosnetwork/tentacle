@@ -3,7 +3,7 @@ mod time;
 use crate::{
     runtime::{proxy::socks5_config, CompatStream2},
     service::{
-        config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer},
+        config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer, TransformerContext},
         ProxyConfig,
     },
 };
@@ -138,7 +138,8 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
     let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
 
     let socket = {
-        let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket })?;
+        let transformer_context = TransformerContext::new_listen(addr);
+        let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket }, transformer_context)?;
         t.inner
     };
     // `bind` twice will return error
@@ -177,7 +178,8 @@ async fn connect_direct(
         // user can disable it on tcp_config
         #[cfg(not(windows))]
         socket.set_reuse_address(true)?;
-        let t = socket_transformer(TcpSocket { inner: socket })?;
+        let transformer_context = TransformerContext::new_dial(addr);
+        let t = socket_transformer(TcpSocket { inner: socket }, transformer_context)?;
         t.inner
     };
 
