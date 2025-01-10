@@ -8,7 +8,8 @@ pub(crate) struct Socks5Config {
 
 // parse proxy url like "socks5://username:password@localhost:1080" to Socks5Config
 pub(crate) fn parse(proxy_url: &str) -> io::Result<Socks5Config> {
-    let parsed_url = url::Url::parse(proxy_url).map_err(io::Error::other)?;
+    let parsed_url = url::Url::parse(proxy_url)
+        .map_err(|err| io::Error::other(format!("parse proxy_url {} failed, {}", proxy_url, err)))?;
     let scheme = parsed_url.scheme();
     match scheme {
         "socks5" => {

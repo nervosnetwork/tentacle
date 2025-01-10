@@ -2,10 +2,7 @@ mod time;
 
 use crate::{
     runtime::{proxy::socks5_config, CompatStream2},
-    service::{
-        config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer, TransformerContext},
-        ProxyConfig,
-    },
+    service::config::{TcpSocket, TcpSocketConfig, TcpSocketTransformer, TransformerContext},
 };
 use async_io::Async;
 use async_std::net::{TcpListener as AsyncListener, TcpStream as AsyncStream, ToSocketAddrs};
@@ -217,12 +214,12 @@ async fn connect_direct(
 async fn connect_by_proxy<A>(
     target_addr: A,
     socket_transformer: TcpSocketTransformer,
-    proxy_config: ProxyConfig,
+    proxy_url: String,
 ) -> io::Result<TcpStream>
 where
     A: Into<shadowsocks::relay::Address>,
 {
-    let socks5_config = socks5_config::parse(&proxy_config.proxy_url)?;
+    let socks5_config = socks5_config::parse(&proxy_url)?;
 
     let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
     let stream = connect_direct(dial_addr, socket_transformer).await?;
@@ -238,10 +235,11 @@ pub(crate) async fn connect(
 ) -> io::Result<TcpStream> {
     let TcpSocketConfig {
         socket_transformer,
-        proxy_config,
+        proxy_url,
+        onion_url: _,
     } = tcp_config;
-    match proxy_config {
-        Some(proxy_config) => connect_by_proxy(addr, socket_transformer, proxy_config).await,
+    match proxy_url {
+        Some(proxy_url) => connect_by_proxy(addr, socket_transformer, proxy_url).await,
         None => connect_direct(addr, socket_transformer).await,
     }
 }
@@ -252,9 +250,10 @@ pub(crate) async fn connect_onion(
 ) -> io::Result<TcpStream> {
     let TcpSocketConfig {
         socket_transformer,
-        proxy_config,
+        proxy_url,
+        onion_url,
     } = tcp_config;
-    let proxy_config = proxy_config.ok_or(io::Error::other(
+    let onion_url = onion_url.or(proxy_url).ok_or(io::Error::other(
         "need tor proxy server to connect to onion address",
     ))?;
 
@@ -273,5 +272,5 @@ pub(crate) async fn connect_onion(
     let onion_address =
         shadowsocks::relay::Address::from_str(onion_str).map_err(std::io::Error::other)?;
 
-    connect_by_proxy(onion_address, socket_transformer, proxy_config).await
+    connect_by_proxy(onion_address, socket_transformer, onion_url).await
 }
