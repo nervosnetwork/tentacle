@@ -86,13 +86,6 @@ impl Default for SessionConfig {
     }
 }
 
-/// Proxy related config
-#[derive(Clone)]
-pub struct ProxyConfig {
-    /// proxy url, like: socks5://127.0.0.1:9050
-    pub proxy_url: String,
-}
-
 pub enum SocketState {
     Listen,
     Dial,
@@ -129,14 +122,16 @@ pub(crate) type TcpSocketTransformer = Arc<
 #[derive(Clone)]
 pub(crate) struct TcpSocketConfig {
     pub(crate) socket_transformer: TcpSocketTransformer,
-    pub(crate) proxy_config: Option<ProxyConfig>,
+    pub(crate) proxy_url: Option<String>,
+    pub(crate) onion_url: Option<String>,
 }
 
 impl Default for TcpSocketConfig {
     fn default() -> Self {
         Self {
             socket_transformer: Arc::new(|tcp_socket, _| Ok(tcp_socket)),
-            proxy_config: None,
+            proxy_url: None,
+            onion_url: None,
         }
     }
 }

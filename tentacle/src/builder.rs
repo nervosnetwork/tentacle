@@ -1,6 +1,5 @@
 use std::{io, sync::Arc, time::Duration};
 
-use crate::service::config::ProxyConfig;
 use crate::service::config::TransformerContext;
 use nohash_hasher::IntMap;
 use tokio_util::codec::LengthDelimitedCodec;
@@ -230,8 +229,15 @@ where
 
     /// Proxy config for tcp
     #[cfg(not(target_family = "wasm"))]
-    pub fn tcp_proxy_config(mut self, proxy_conifg: Option<ProxyConfig>) -> Self {
-        self.config.tcp_config.tcp.proxy_config = proxy_conifg;
+    pub fn tcp_proxy_config(mut self, proxy_url: Option<String>) -> Self {
+        self.config.tcp_config.tcp.proxy_url = proxy_url;
+        self
+    }
+
+    /// Onion config for tcp
+    #[cfg(not(target_family = "wasm"))]
+    pub fn tcp_onion_config(mut self, onion_url: Option<String>) -> Self {
+        self.config.tcp_config.tcp.onion_url = onion_url;
         self
     }
 
@@ -240,7 +246,10 @@ where
     #[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
     pub fn tcp_config_on_ws<F>(mut self, f: F) -> Self
     where
-        F: Fn(TcpSocket, TransformerContext) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
+        F: Fn(TcpSocket, TransformerContext) -> Result<TcpSocket, std::io::Error>
+            + Send
+            + Sync
+            + 'static,
     {
         self.config.tcp_config.ws.socket_transformer = Arc::new(f);
         self
@@ -264,7 +273,10 @@ where
     #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
     pub fn tcp_config_on_tls<F>(mut self, f: F) -> Self
     where
-        F: Fn(TcpSocket, TransformerContext) -> Result<TcpSocket, std::io::Error> + Send + Sync + 'static,
+        F: Fn(TcpSocket, TransformerContext) -> Result<TcpSocket, std::io::Error>
+            + Send
+            + Sync
+            + 'static,
     {
         self.config.tcp_config.tls.socket_transformer = Arc::new(f);
         self
