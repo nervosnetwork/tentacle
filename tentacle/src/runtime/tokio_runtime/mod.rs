@@ -1,16 +1,20 @@
+use super::proxy::socks5_config;
+use multiaddr::MultiAddr;
 pub use tokio::{
     net::{TcpListener, TcpStream},
     spawn,
     task::{block_in_place, spawn_blocking, yield_now, JoinHandle},
 };
 
-use crate::service::config::{TcpSocket, TcpSocketConfig};
+use crate::service::config::{
+    TcpSocket, TcpSocketConfig, TcpSocketTransformer, TransformerContext,
+};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, str::FromStr};
 use tokio::net::TcpSocket as TokioTcp;
 
 #[cfg(feature = "tokio-timer")]
@@ -88,7 +92,8 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
         // user can disable it on tcp_config
         #[cfg(not(windows))]
         socket.set_reuse_address(true)?;
-        let t = tcp_config(TcpSocket { inner: socket })?;
+        let transformer_context = TransformerContext::new_listen(addr);
+        let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket }, transformer_context)?;
         t.inner.set_nonblocking(true)?;
         // safety: fd convert by socket2
         unsafe {
@@ -113,15 +118,16 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
     socket.listen(1024)
 }
 
-pub(crate) async fn connect(
+async fn connect_direct(
     addr: SocketAddr,
-    tcp_config: TcpSocketConfig,
+    socket_transformer: TcpSocketTransformer,
 ) -> io::Result<TcpStream> {
     let domain = Domain::for_address(addr);
     let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
 
     let socket = {
-        let t = tcp_config(TcpSocket { inner: socket })?;
+        let transformer_context = TransformerContext::new_dial(addr);
+        let t = socket_transformer(TcpSocket { inner: socket }, transformer_context)?;
         t.inner.set_nonblocking(true)?;
         // safety: fd convert by socket2
         unsafe {
@@ -134,4 +140,69 @@ pub(crate) async fn connect(
     };
 
     socket.connect(addr).await
+}
+
+async fn connect_by_proxy<A>(
+    target_addr: A,
+    socket_transformer: TcpSocketTransformer,
+    proxy_url: String,
+) -> io::Result<TcpStream>
+where
+    A: Into<shadowsocks::relay::Address>,
+{
+    let socks5_config = socks5_config::parse(&proxy_url)?;
+
+    let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
+    let stream = connect_direct(dial_addr, socket_transformer).await?;
+
+    super::proxy::socks5::establish_connection(stream, target_addr, socks5_config)
+        .await
+        .map_err(io::Error::other)
+}
+
+pub(crate) async fn connect(
+    target_addr: SocketAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    let TcpSocketConfig {
+        socket_transformer,
+        proxy_url,
+        onion_url: _,
+    } = tcp_config;
+
+    match proxy_url {
+        Some(proxy_url) => connect_by_proxy(target_addr, socket_transformer, proxy_url).await,
+        None => connect_direct(target_addr, socket_transformer).await,
+    }
+}
+
+pub(crate) async fn connect_onion(
+    onion_addr: MultiAddr,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    let TcpSocketConfig {
+        socket_transformer,
+        proxy_url,
+        onion_url,
+    } = tcp_config;
+    let onion_url = onion_url.or(proxy_url).ok_or(io::Error::other(
+        "need tor proxy server to connect to onion address",
+    ))?;
+    let onion_protocol = onion_addr.iter().next().ok_or(io::Error::other(
+        "connect_onion need Protocol::Onion3 multiaddr",
+    ))?;
+    // onion_str looks like: "/onion3/wsglappcvp4y4e2ff3ubowpkoxuoaudzvmih6gc54442vfabebwf42ad:8114"
+    let onion_str = onion_protocol.to_string();
+    // remove prefix "/onion3/", if not contains /onion3/, return error
+    let onion_str = onion_str
+        .strip_prefix("/onion3/")
+        .ok_or(io::Error::other(format!(
+            "connect_onion need Protocol::Onion3 multiaddr, but got {}",
+            onion_str
+        )))?;
+    let onion_str = onion_str.replace(":", ".onion:");
+    let onion_address =
+        shadowsocks::relay::Address::from_str(&onion_str).map_err(std::io::Error::other)?;
+
+    connect_by_proxy(onion_address, socket_transformer, onion_url).await
 }
