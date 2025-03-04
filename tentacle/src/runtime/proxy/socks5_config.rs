@@ -1,5 +1,7 @@
 use std::io;
 
+use rand::Rng;
+
 #[derive(Debug)]
 pub(crate) struct Socks5Config {
     pub(crate) proxy_url: String,
@@ -7,14 +9,31 @@ pub(crate) struct Socks5Config {
 }
 
 // parse proxy url like "socks5://username:password@localhost:1080" to Socks5Config
-pub(crate) fn parse(proxy_url: &str) -> io::Result<Socks5Config> {
-    let parsed_url = url::Url::parse(proxy_url)
-        .map_err(|err| io::Error::other(format!("parse proxy_url {} failed, {}", proxy_url, err)))?;
+pub(crate) fn parse(proxy_url: &str, onion_random_socks_auth: bool) -> io::Result<Socks5Config> {
+    let parsed_url = url::Url::parse(proxy_url).map_err(|err| {
+        io::Error::other(format!("parse proxy_url {} failed, {}", proxy_url, err))
+    })?;
     let scheme = parsed_url.scheme();
     match scheme {
         "socks5" => {
             let auth = match parsed_url.username() {
-                "" => None,
+                "" => {
+                    if onion_random_socks_auth {
+                        let username = rand::thread_rng()
+                            .sample_iter(&rand::distributions::Alphanumeric)
+                            .take(8)
+                            .map(char::from)
+                            .collect();
+                        let password = rand::thread_rng()
+                            .sample_iter(&rand::distributions::Alphanumeric)
+                            .take(16)
+                            .map(char::from)
+                            .collect();
+                        Some((username, password))
+                    } else {
+                        None
+                    }
+                }
                 username => Some((
                     username.to_string(),
                     parsed_url.password().unwrap_or("").to_string(),
