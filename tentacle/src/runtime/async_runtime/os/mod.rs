@@ -215,11 +215,12 @@ async fn connect_by_proxy<A>(
     target_addr: A,
     socket_transformer: TcpSocketTransformer,
     proxy_url: String,
+    onion_random_socks_auth: bool,
 ) -> io::Result<TcpStream>
 where
     A: Into<shadowsocks::relay::Address>,
 {
-    let socks5_config = socks5_config::parse(&proxy_url)?;
+    let socks5_config = socks5_config::parse(&proxy_url, onion_random_socks_auth)?;
 
     let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
     let stream = connect_direct(dial_addr, socket_transformer).await?;
@@ -237,9 +238,12 @@ pub(crate) async fn connect(
         socket_transformer,
         proxy_url,
         onion_url: _,
+        onion_random_socks_auth,
     } = tcp_config;
     match proxy_url {
-        Some(proxy_url) => connect_by_proxy(addr, socket_transformer, proxy_url).await,
+        Some(proxy_url) => {
+            connect_by_proxy(addr, socket_transformer, proxy_url, onion_random_socks_auth).await
+        }
         None => connect_direct(addr, socket_transformer).await,
     }
 }
@@ -252,6 +256,7 @@ pub(crate) async fn connect_onion(
         socket_transformer,
         proxy_url,
         onion_url,
+        onion_random_socks_auth,
     } = tcp_config;
     let onion_url = onion_url.or(proxy_url).ok_or(io::Error::other(
         "need tor proxy server to connect to onion address",
@@ -272,5 +277,11 @@ pub(crate) async fn connect_onion(
     let onion_address =
         shadowsocks::relay::Address::from_str(onion_str).map_err(std::io::Error::other)?;
 
-    connect_by_proxy(onion_address, socket_transformer, onion_url).await
+    connect_by_proxy(
+        onion_address,
+        socket_transformer,
+        onion_url,
+        onion_random_socks_auth,
+    )
+    .await
 }

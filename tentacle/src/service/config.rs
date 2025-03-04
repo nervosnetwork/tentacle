@@ -132,6 +132,7 @@ pub(crate) struct TcpSocketConfig {
     pub(crate) socket_transformer: TcpSocketTransformer,
     pub(crate) proxy_url: Option<String>,
     pub(crate) onion_url: Option<String>,
+    pub(crate) onion_random_socks_auth: bool,
 }
 
 impl Default for TcpSocketConfig {
@@ -140,6 +141,7 @@ impl Default for TcpSocketConfig {
             socket_transformer: Arc::new(|tcp_socket, _| Ok(tcp_socket)),
             proxy_url: None,
             onion_url: None,
+            onion_random_socks_auth: false,
         }
     }
 }

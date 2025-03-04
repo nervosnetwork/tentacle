@@ -241,6 +241,13 @@ where
         self
     }
 
+    /// Onion config for tcp
+    #[cfg(not(target_family = "wasm"))]
+    pub fn tcp_onion_random_socks_auth(mut self, onion_random_socks_auth: bool) -> Self {
+        self.config.tcp_config.tcp.onion_random_socks_auth = onion_random_socks_auth;
+        self
+    }
+
     /// The same as tcp config, but use on ws transport
     #[cfg(feature = "ws")]
     #[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
