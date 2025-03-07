@@ -73,13 +73,13 @@ impl RingAeadCipher {
     pub fn encrypt(&mut self, input: &[u8]) -> Result<Vec<u8>, SecioError> {
         let mut output = vec![0; input.len()];
         output.copy_from_slice(input);
-        if let RingAeadCryptoVariant::Seal(ref mut key) = self.cipher {
+        match self.cipher { RingAeadCryptoVariant::Seal(ref mut key) => {
             key.seal_in_place_append_tag(Aad::empty(), &mut output)
                 .map_err::<SecioError, _>(Into::into)?;
             Ok(output)
-        } else {
+        } _ => {
             unreachable!("encrypt is called on a non-seal cipher")
-        }
+        }}
     }
 
     /// Decrypt `input` to `output` with `tag`. `output.len()` should equals to `input.len() - tag.len()`.
@@ -97,11 +97,11 @@ impl RingAeadCipher {
 
         buf.copy_from_slice(input);
 
-        if let RingAeadCryptoVariant::Open(ref mut key) = self.cipher {
+        match self.cipher { RingAeadCryptoVariant::Open(ref mut key) => {
             key.open_in_place(Aad::empty(), &mut buf)?;
-        } else {
+        } _ => {
             unreachable!("encrypt is called on a non-open cipher")
-        }
+        }}
         buf.truncate(output_len);
         Ok(buf)
     }
@@ -112,11 +112,11 @@ impl RingAeadCipher {
             .checked_sub(self.cipher_type.tag_size())
             .ok_or(SecioError::FrameTooShort)?;
 
-        if let RingAeadCryptoVariant::Open(ref mut key) = self.cipher {
+        match self.cipher { RingAeadCryptoVariant::Open(ref mut key) => {
             key.open_in_place(Aad::empty(), input)?;
-        } else {
+        } _ => {
             unreachable!("encrypt is called on a non-open cipher")
-        }
+        }}
         input.truncate(output_len);
         Ok(())
     }

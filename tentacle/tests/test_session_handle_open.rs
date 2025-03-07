@@ -45,7 +45,7 @@ struct SHandle {
 #[async_trait]
 impl ServiceHandle for SHandle {
     async fn handle_event(&mut self, control: &mut ServiceContext, event: ServiceEvent) {
-        if let ServiceEvent::SessionOpen { session_context } = event {
+        match event { ServiceEvent::SessionOpen { session_context } => {
             self.addr = Some(session_context.address.clone());
             if session_context.ty.is_outbound() {
                 control
@@ -53,7 +53,7 @@ impl ServiceHandle for SHandle {
                     .await
                     .unwrap();
             }
-        } else if let ServiceEvent::SessionClose { session_context } = event {
+        } _ => { match event { ServiceEvent::SessionClose { session_context } => {
             // Test ends after 10 connections and opening session protocol
             if session_context.ty.is_outbound() {
                 self.count += 1;
@@ -65,7 +65,7 @@ impl ServiceHandle for SHandle {
                         .await;
                 }
             }
-        }
+        } _ => {}}}}
     }
 }
 

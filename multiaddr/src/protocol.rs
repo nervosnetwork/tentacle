@@ -322,7 +322,7 @@ fn check_p2p(data: &[u8]) -> Result<(), Error> {
 }
 
 macro_rules! read_onion_impl {
-    ($name:ident, $len:expr, $encoded_len:expr) => {
+    ($name:ident, $len:expr_2021, $encoded_len:expr_2021) => {
         fn $name(s: &str) -> Result<([u8; $len], u16), Error> {
             let mut parts = s.split(':');
 
