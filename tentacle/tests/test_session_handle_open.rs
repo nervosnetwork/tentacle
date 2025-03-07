@@ -53,7 +53,7 @@ impl ServiceHandle for SHandle {
                     .await
                     .unwrap();
             }
-        } _ => { match event { ServiceEvent::SessionClose { session_context } => {
+        } _ => { if let ServiceEvent::SessionClose { session_context } = event {
             // Test ends after 10 connections and opening session protocol
             if session_context.ty.is_outbound() {
                 self.count += 1;
@@ -65,7 +65,7 @@ impl ServiceHandle for SHandle {
                         .await;
                 }
             }
-        } _ => {}}}}
+        }}}
     }
 }
 
