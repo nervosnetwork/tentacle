@@ -410,7 +410,7 @@ impl<'de> Deserialize<'de> for Multiaddr {
 /// For example, `Ip4([127, 0, 0, 1])` works because `Ipv4Addr` implements `From<[u8; 4]>`.
 #[macro_export]
 macro_rules! multiaddr {
-    ($($comp:ident $(($param:expr))*),+) => {
+    ($($comp:ident $(($param:expr_2021))*),+) => {
         {
             use std::iter;
             let elem = iter::empty::<$crate::Protocol>();

@@ -450,7 +450,7 @@ where
                 }
             }
             let disconnected = {
-                if let Some(frame_sender) = self.streams.get_mut(&stream_id) {
+                match self.streams.get_mut(&stream_id) { Some(frame_sender) => {
                     match frame_sender.poll_ready(cx) {
                         Poll::Ready(Ok(())) => match frame_sender.try_send(frame) {
                             Ok(_) => false,
@@ -477,14 +477,14 @@ where
                             true
                         }
                     }
-                } else {
+                } _ => {
                     // TODO: stream already closed ?
                     debug!(
                         "substream({}) should exist but not, may drop by self",
                         stream_id
                     );
                     false
-                }
+                }}
             };
             if disconnected {
                 debug!("substream({}) removed, session.ty={:?}", stream_id, self.ty);
