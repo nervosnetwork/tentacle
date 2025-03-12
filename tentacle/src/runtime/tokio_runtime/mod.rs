@@ -154,11 +154,17 @@ where
     let socks5_config = socks5_config::parse(&proxy_url, onion_random_socks_auth)?;
 
     let dial_addr: SocketAddr = socks5_config.proxy_url.parse().map_err(io::Error::other)?;
-    let stream = connect_direct(dial_addr, socket_transformer).await?;
+    let stream = connect_direct(dial_addr, socket_transformer)
+        .await
+        .map_err(|err| {
+            io::Error::other(format!("connect to proxy:{}, failed: {:?}", dial_addr, err))
+        })?;
 
     super::proxy::socks5::establish_connection(stream, target_addr, socks5_config)
         .await
-        .map_err(io::Error::other)
+        .map_err(|err| {
+            io::Error::other(format!("failed to establish connection to target:{}", err))
+        })
 }
 
 pub(crate) async fn connect(
@@ -174,7 +180,14 @@ pub(crate) async fn connect(
 
     match proxy_url {
         Some(proxy_url) => {
-            connect_by_proxy(target_addr, socket_transformer, proxy_url, false).await
+            connect_by_proxy(target_addr, socket_transformer, proxy_url.clone(), false)
+                .await
+                .map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("connect_by_proxy: {}, error: {}", proxy_url, err),
+                    )
+                })
         }
         None => connect_direct(target_addr, socket_transformer).await,
     }

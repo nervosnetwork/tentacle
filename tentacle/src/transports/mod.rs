@@ -445,7 +445,13 @@ mod os {
     ) -> Result<TcpStream> {
         match crate::runtime::timeout(timeout, crate::runtime::connect(addr, tcp_config)).await {
             Err(_) => Err(TransportErrorKind::Io(io::ErrorKind::TimedOut.into())),
-            Ok(res) => res.map_err(Into::into),
+            Ok(res) => res.map_err(|err| {
+                if err.to_string().contains("connect_by_proxy") {
+                    TransportErrorKind::ProxyError(err)
+                } else {
+                    err.into()
+                }
+            }),
         }
     }
 
@@ -463,7 +469,13 @@ mod os {
         .await
         {
             Err(_) => Err(TransportErrorKind::Io(io::ErrorKind::TimedOut.into())),
-            Ok(res) => res.map_err(Into::into),
+            Ok(res) => res.map_err(|err| {
+                if err.to_string().contains("connect_by_proxy") {
+                    TransportErrorKind::ProxyError(err)
+                } else {
+                    err.into()
+                }
+            }),
         }
     }
 }
