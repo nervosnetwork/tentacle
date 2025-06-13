@@ -309,7 +309,7 @@ where
             handshake_type: self.handshake_type.clone(),
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
-            timeout: self.config.timeout,
+            timeout: self.config.timeout.timeout,
             listen_addr: listen_address,
             future_task_sender: self.future_task_sender.clone(),
         };
@@ -362,7 +362,7 @@ where
         self.dial_protocols.insert(address.clone(), target);
 
         let handshake_type = self.handshake_type.clone();
-        let timeout = self.config.timeout;
+        let timeout = self.config.timeout.by_addr(&address);
         let max_frame_length = self.config.max_frame_length;
 
         let mut sender = self.session_event_sender.clone();
@@ -535,6 +535,7 @@ where
     ) where
         H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
     {
+        let timeout = self.config.timeout.by_addr(&remote_address);
         let handshake_task = HandshakeContext {
             ty,
             remote_address,
@@ -542,7 +543,7 @@ where
             handshake_type: self.handshake_type.clone(),
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
-            timeout: self.config.timeout,
+            timeout,
         }
         .handshake(socket);
 
@@ -681,7 +682,7 @@ where
         });
 
         let meta = SessionMeta::new(
-            self.config.timeout,
+            self.config.timeout.timeout,
             session_context.clone(),
             service_event_sender,
             self.service_context.control().clone(),

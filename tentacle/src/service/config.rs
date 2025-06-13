@@ -4,6 +4,7 @@ use crate::{
     traits::{Codec, ProtocolSpawn, ServiceProtocol, SessionProtocol},
     yamux::config::Config as YamuxConfig,
 };
+use multiaddr::{Multiaddr, Protocol};
 #[cfg(windows)]
 use std::os::windows::io::{
     AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, RawSocket,
@@ -20,8 +21,34 @@ use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 /// Default max buffer size
 const MAX_BUF_SIZE: usize = 24 * 1024 * 1024;
 
-pub(crate) struct ServiceConfig {
+#[derive(Clone, Copy)]
+pub(crate) struct ServiceTimeout {
     pub timeout: Duration,
+    pub onion_timeout: Duration,
+}
+
+impl Default for ServiceTimeout {
+    fn default() -> Self {
+        ServiceTimeout {
+            timeout: Duration::from_secs(10),
+            onion_timeout: Duration::from_secs(120),
+        }
+    }
+}
+
+impl ServiceTimeout {
+    pub fn by_addr(&self, addr: &Multiaddr) -> Duration {
+        // if addr is onion address, return onion_timeout, else return timeout
+        if addr.iter().any(|p| matches!(p, Protocol::Onion3(_))) {
+            self.onion_timeout
+        } else {
+            self.timeout
+        }
+    }
+}
+
+pub(crate) struct ServiceConfig {
+    pub timeout: ServiceTimeout,
     pub session_config: SessionConfig,
     pub max_frame_length: usize,
     pub keep_buffer: bool,
@@ -36,7 +63,7 @@ pub(crate) struct ServiceConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         ServiceConfig {
-            timeout: Duration::from_secs(10),
+            timeout: ServiceTimeout::default(),
             session_config: SessionConfig::default(),
             max_frame_length: 1024 * 1024 * 8,
             keep_buffer: false,
