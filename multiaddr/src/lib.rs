@@ -219,6 +219,9 @@ impl FromStr for Multiaddr {
             let p = Protocol::from_str_peek(&mut parts)?;
             p.write_to_bytes(&mut writer);
         }
+        if writer.is_empty() {
+            return Err(Error::InvalidMultiaddr);
+        }
 
         Ok(Multiaddr {
             bytes: writer.freeze(),
@@ -455,5 +458,17 @@ mod test {
             (Protocol::P2P(s_1), OtherProtocol::P2p(s_2)) => assert_eq!(s_1, s_2.to_bytes()),
             e => panic!("not expect protocol: {:?}", e),
         }
+    }
+
+    #[test]
+    fn empty_test() {
+        let address = "/".parse::<Multiaddr>().unwrap_err();
+        assert_eq!(address.to_string(), "unknown protocol string");
+
+        let address = " ".parse::<Multiaddr>().unwrap_err();
+        assert_eq!(address.to_string(), "invalid multiaddr");
+
+        let address = "".parse::<Multiaddr>().unwrap_err();
+        assert_eq!(address.to_string(), "invalid multiaddr");
     }
 }
