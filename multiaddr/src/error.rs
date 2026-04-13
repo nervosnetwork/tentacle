@@ -7,6 +7,7 @@ pub enum Error {
     InvalidMultiaddr,
     InvalidOnion3Addr,
     InvalidProtocolString,
+    InvalidPort,
     InvalidUvar(decode::Error),
     ParsingError(Box<dyn error::Error + Send + Sync>),
     UnknownHash,
@@ -26,6 +27,7 @@ impl fmt::Display for Error {
             Error::UnknownHash => write!(f, "unknown hash"),
             Error::UnknownProtocolId(id) => write!(f, "unknown protocol id: {}", id),
             Error::UnknownProtocolString => f.write_str("unknown protocol string"),
+            Error::InvalidPort => f.write_str("Invalid port")
         }
     }
 }
