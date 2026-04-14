@@ -23,8 +23,8 @@ const WS: u32 = 0x01dd;
 const WSS: u32 = 0x01de;
 const MEMORY: u32 = 0x0309;
 const ONION3: u32 = 0x01bd;
-const QUIC: u32 = 0x1111;
-const UDP: u32 = 0x01cc;
+const QUICV1: u32 = 0x01cd;
+const UDP: u32 = 0x0111;
 
 const SHA256_CODE: u64 = 0x12;
 const SHA256_SIZE: u8 = 32;
@@ -45,7 +45,7 @@ pub enum Protocol<'a> {
     Memory(u64),
     Onion3(Onion3Addr<'a>),
     Udp(u16),
-    Quic,
+    QuicV1,
 }
 
 impl<'a> Protocol<'a> {
@@ -103,11 +103,9 @@ impl<'a> Protocol<'a> {
                 .map(|(a, p)| Protocol::Onion3((a, p).into())),
             "udp" => {
                 let s = iter.next().ok_or(Error::InvalidProtocolString)?;
-                Ok(Protocol::Udp(
-                    u16::from_str_radix(s, 10).map_err(|_| Error::InvalidPort)?,
-                ))
+                Ok(Protocol::Udp(s.parse()?))
             }
-            "quic" => Ok(Protocol::Quic),
+            "quic-v1" => Ok(Protocol::QuicV1),
             _ => Err(Error::UnknownProtocolString),
         }
     }
@@ -195,7 +193,7 @@ impl<'a> Protocol<'a> {
                 let port = BigEndian::read_u16(&data[..]);
                 Ok((Protocol::Udp(port), rest))
             }
-            QUIC => Ok((Protocol::Quic, input)),
+            QUICV1 => Ok((Protocol::QuicV1, input)),
             _ => Err(Error::UnknownProtocolId(id)),
         }
     }
@@ -258,7 +256,7 @@ impl<'a> Protocol<'a> {
                 w.put(encode::u32(UDP, &mut buf));
                 w.put_u16(*port);
             }
-            Protocol::Quic => w.put(encode::u32(QUIC, &mut buf)),
+            Protocol::QuicV1 => w.put(encode::u32(QUICV1, &mut buf)),
         }
     }
 
@@ -277,7 +275,7 @@ impl<'a> Protocol<'a> {
             Protocol::Memory(a) => Protocol::Memory(a),
             Protocol::Onion3(addr) => Protocol::Onion3(addr.acquire()),
             Protocol::Udp(port) => Protocol::Udp(port),
-            Protocol::Quic => Protocol::Quic,
+            Protocol::QuicV1 => Protocol::QuicV1,
         }
     }
 }
@@ -300,7 +298,7 @@ impl fmt::Display for Protocol<'_> {
                 write!(f, "/onion3/{}:{}", addr.hash_string(), addr.port())
             }
             Udp(port) => write!(f, "/udp/{}", port),
-            Quic => write!(f, "/quic"),
+            QuicV1 => write!(f, "/quic-v1"),
         }
     }
 }
