@@ -51,13 +51,13 @@ rand = "0.8"
 socket2 = { version = "0.6.0", features = ["all"] }
 fast-socks5 = "0.10.0"
 quinn = { version = "0.11", optional = true, default-features = false, features = [
-    "runtime-tokio", "rustls"
+    "runtime-tokio", "rustls-aws-lc-rs"
 ] }
 rustls = { version = "0.23", optional = true, default-features = false, features = [
-    "ring", "std"
+    "aws_lc_rs", "std"
 ] }
 rcgen = { version = "0.13", optional = true, default-features = false, features = [
-    "pem", "ring"
+    "pem", "aws_lc_rs"
 ] }
 x509-parser = { version = "0.16", optional = true }
 ring = { version = "0.17", optional = true }
