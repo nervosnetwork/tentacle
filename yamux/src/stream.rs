@@ -319,16 +319,16 @@ impl StreamHandle {
                 return Err(Error::SubStreamRemoteClosing);
             }
 
-            match self.frame_receiver.try_recv() {
-                Ok(frame) => {
+            match self.frame_receiver.try_next() {
+                Ok(Some(frame)) => {
                     self.handle_frame(frame)?;
                     has_new_frame = true;
                 }
-                Err(futures::channel::mpsc::TryRecvError::Closed) => {
+                Ok(None) => {
                     self.state = StreamState::RemoteClosing;
                     return Err(Error::SubStreamRemoteClosing);
                 }
-                Err(futures::channel::mpsc::TryRecvError::Empty) => break,
+                Err(_) => break,
             }
         }
         Ok(has_new_frame)
@@ -923,10 +923,11 @@ mod test {
 
             let jh = tokio::spawn(tokio::time::timeout(std::time::Duration::from_secs(4), async move {
                 loop {
-                    match unbound_receiver.try_recv() {
-                        Ok(ref event) if matches!(event, StreamEvent::Frame(frame) if frame.length() == TEXT.len() as u32) => break,
+                    match unbound_receiver.try_next() {
+                        Ok(Some(ref event)) if matches!(event, StreamEvent::Frame(frame) if frame.length() == TEXT.len() as u32) => break,
+                        Ok(None) => panic!("channel closed unexpectedly"),
                         Err(_) => (),
-                        _ => panic!("must be frame with written text"),
+                        Ok(Some(_)) => panic!("must be frame with written text"),
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
