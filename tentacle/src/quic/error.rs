@@ -19,5 +19,5 @@ pub enum QuicErrorKind {
 
     /// Multiple identity found
     #[error("Multiple identity found")]
-    MultipleIdentityFound
+    MultipleIdentityFound,
 }

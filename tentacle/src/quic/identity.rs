@@ -208,13 +208,8 @@ mod tests {
         let identity = extract_identity(&cert.cert_der).expect("extract identity");
         let binding_sig = identity.binding_sig().raw_data().to_vec();
 
-        verify_binding(
-            &key,
-            &key.public_key(),
-            &spki_der,
-            &binding_sig,
-        )
-        .expect("binding verification should pass");
+        verify_binding(&key, &key.public_key(), &spki_der, &binding_sig)
+            .expect("binding verification should pass");
     }
 
     #[test]
@@ -278,10 +273,9 @@ mod tests {
     #[test]
     fn test_extract_missing_extension() {
         // Build a cert via rcgen directly, without the tentacle custom extension
-        let keypair =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
-        let params = rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()])
-            .expect("params");
+        let keypair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
+        let params =
+            rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()]).expect("params");
         let cert = params.self_signed(&keypair).expect("self sign");
 
         let result = extract_identity(cert.der());
@@ -295,11 +289,9 @@ mod tests {
     #[test]
     fn test_extract_malformed_payload() {
         // Cert with the correct OID but random bytes as the extension payload
-        let keypair =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
+        let keypair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
         let mut params =
-            rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()])
-                .expect("params");
+            rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()]).expect("params");
         let bogus = vec![0xde, 0xad, 0xbe, 0xef];
         let ext = rcgen::CustomExtension::from_oid_content(TENTACLE_QUIC_IDENT_OID, bogus);
         params.custom_extensions.push(ext);
@@ -340,11 +332,9 @@ mod tests {
             .as_bytes()
             .to_vec();
 
-        let keypair =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
+        let keypair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
         let mut params =
-            rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()])
-                .expect("params");
+            rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()]).expect("params");
         let ext = rcgen::CustomExtension::from_oid_content(TENTACLE_QUIC_IDENT_OID, payload);
         params.custom_extensions.push(ext);
         let cert = params.self_signed(&keypair).expect("self sign");
@@ -385,11 +375,9 @@ mod tests {
                 .to_vec()
         };
 
-        let keypair =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
+        let keypair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("gen keypair");
         let mut params =
-            rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()])
-                .expect("params");
+            rcgen::CertificateParams::new(vec!["tentacle.invalid".to_string()]).expect("params");
 
         let ext1 =
             rcgen::CustomExtension::from_oid_content(TENTACLE_QUIC_IDENT_OID, build_payload());
