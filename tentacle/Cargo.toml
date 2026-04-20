@@ -91,6 +91,10 @@ nix = { version = "0.29", default-features = false, features = ["signal"] }
 name = "simple_using_spawn"
 required-features = ["unstable"]
 
+[[example]]
+name = "quic_simple"
+required-features = ["quic"]
+
 [features]
 default = ["tokio-runtime", "tokio-timer", "quic"]
 ws = ["tokio-tungstenite", "httparse"]
