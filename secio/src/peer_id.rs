@@ -14,6 +14,7 @@ const SHA256_SIZE: u8 = 32;
 /// The data is a hash of the public key of the peer
 #[derive(Clone, PartialOrd, PartialEq, Eq, Hash)]
 pub struct PeerId {
+    /// The length of this field is 34 bytes.
     inner: Vec<u8>,
 }
 

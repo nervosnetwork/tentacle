@@ -3,7 +3,7 @@ use secio::KeyProvider;
 
 use crate::quic::error::QuicErrorKind;
 use crate::quic::identity_mol::{
-    Bytes as MolBytes, TentacleQuicIdentityV1, TentacleQuicIdentityV1Reader, U8 as MolU8,
+    self, Bytes as MolBytes, TentacleQuicIdentityV1, TentacleQuicIdentityV1Reader, Uint8,
 };
 
 /// OID for tentacle QUIC identity X.509 extension.
@@ -78,13 +78,11 @@ pub fn build_self_signed<K: KeyProvider>(key: &K) -> Result<TentacleQuicCert, Qu
 
 /// Encode the identity fields as a molecule `TentacleQuicIdentityV1` payload.
 fn encode_identity_payload(secio_pubkey: &[u8], peer_id: &[u8], binding_sig: &[u8]) -> Vec<u8> {
-    let version = MolU8::new_builder().nth0(IDENTITY_VERSION.into()).build();
+    let version = Uint8::new_builder().nth0(IDENTITY_VERSION.into()).build();
     let secio_pubkey = MolBytes::new_builder()
         .extend(secio_pubkey.iter().copied().map(Into::into))
         .build();
-    let peer_id = MolBytes::new_builder()
-        .extend(peer_id.iter().copied().map(Into::into))
-        .build();
+    let peer_id = identity_mol::PeerId::from(TryInto::<[u8; 34]>::try_into(peer_id).unwrap());
     let binding_sig = MolBytes::new_builder()
         .extend(binding_sig.iter().copied().map(Into::into))
         .build();
@@ -161,6 +159,8 @@ pub fn verify_binding<K: KeyProvider>(
 
 #[cfg(test)]
 mod tests {
+    use crate::quic::identity_mol::PeerId;
+
     use super::*;
     use secio::SecioKeyPair;
     use x509_parser::parse_x509_certificate;
@@ -311,15 +311,14 @@ mod tests {
         let key = SecioKeyPair::secp256k1_generated();
         let secio_pubkey = key.public_key().inner_ref().to_vec();
         let peer_id = key.public_key().peer_id().into_bytes();
+        println!("peer id raw length {}", peer_id.len());
         let binding_sig = vec![0u8; 64];
 
-        let version = MolU8::new_builder().nth0(2u8.into()).build();
+        let version = Uint8::new_builder().nth0(2u8.into()).build();
         let secio_pubkey_mol = MolBytes::new_builder()
             .extend(secio_pubkey.iter().copied().map(Into::into))
             .build();
-        let peer_id_mol = MolBytes::new_builder()
-            .extend(peer_id.iter().copied().map(Into::into))
-            .build();
+        let peer_id_mol = PeerId::from(TryInto::<[u8; 34]>::try_into(peer_id).unwrap());
         let sig_mol = MolBytes::new_builder()
             .extend(binding_sig.iter().copied().map(Into::into))
             .build();
@@ -355,13 +354,11 @@ mod tests {
         let peer_id = key.public_key().peer_id().into_bytes();
 
         let build_payload = || {
-            let version = MolU8::new_builder().nth0(IDENTITY_VERSION.into()).build();
+            let version = Uint8::new_builder().nth0(IDENTITY_VERSION.into()).build();
             let p_mol = MolBytes::new_builder()
                 .extend(secio_pubkey.iter().copied().map(Into::into))
                 .build();
-            let id_mol = MolBytes::new_builder()
-                .extend(peer_id.iter().copied().map(Into::into))
-                .build();
+            let id_mol = PeerId::from(TryInto::<[u8; 34]>::try_into(peer_id.clone()).unwrap());
             let sig_mol = MolBytes::new_builder()
                 .extend(vec![0u8; 64].into_iter().map(Into::into))
                 .build();
