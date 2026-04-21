@@ -923,11 +923,10 @@ mod test {
 
             let jh = tokio::spawn(tokio::time::timeout(std::time::Duration::from_secs(4), async move {
                 loop {
-                    match unbound_receiver.try_next() {
-                        Ok(Some(ref event)) if matches!(event, StreamEvent::Frame(frame) if frame.length() == TEXT.len() as u32) => break,
-                        Ok(None) => panic!("channel closed unexpectedly"),
+                    match unbound_receiver.try_recv() {
+                        Ok(ref event) if matches!(event, StreamEvent::Frame(frame) if frame.length() == TEXT.len() as u32) => break,
                         Err(_) => (),
-                        Ok(Some(_)) => panic!("must be frame with written text"),
+                        _ => panic!("must be frame with written text"),
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
