@@ -319,16 +319,16 @@ impl StreamHandle {
                 return Err(Error::SubStreamRemoteClosing);
             }
 
-            match self.frame_receiver.try_next() {
-                Ok(Some(frame)) => {
+            match self.frame_receiver.try_recv() {
+                Ok(frame) => {
                     self.handle_frame(frame)?;
                     has_new_frame = true;
                 }
-                Ok(None) => {
+                Err(futures::channel::mpsc::TryRecvError::Closed) => {
                     self.state = StreamState::RemoteClosing;
                     return Err(Error::SubStreamRemoteClosing);
                 }
-                Err(_) => break,
+                Err(futures::channel::mpsc::TryRecvError::Empty) => break,
             }
         }
         Ok(has_new_frame)
