@@ -78,7 +78,7 @@ pub fn build_self_signed<K: KeyProvider>(key: &K) -> Result<TentacleQuicCert, Qu
 
 /// Encode the identity fields as a molecule `TentacleQuicIdentityV1` payload.
 fn encode_identity_payload(secio_pubkey: &[u8], peer_id: &[u8], binding_sig: &[u8]) -> Vec<u8> {
-    let version = Uint8::new_builder().nth0(IDENTITY_VERSION.into()).build();
+    let version = Uint8::new_builder().nth0(IDENTITY_VERSION).build();
     let secio_pubkey = MolBytes::new_builder()
         .extend(secio_pubkey.iter().copied().map(Into::into))
         .build();
@@ -314,7 +314,7 @@ mod tests {
         println!("peer id raw length {}", peer_id.len());
         let binding_sig = vec![0u8; 64];
 
-        let version = Uint8::new_builder().nth0(2u8.into()).build();
+        let version = Uint8::new_builder().nth0(2u8).build();
         let secio_pubkey_mol = MolBytes::new_builder()
             .extend(secio_pubkey.iter().copied().map(Into::into))
             .build();
@@ -354,7 +354,7 @@ mod tests {
         let peer_id = key.public_key().peer_id().into_bytes();
 
         let build_payload = || {
-            let version = Uint8::new_builder().nth0(IDENTITY_VERSION.into()).build();
+            let version = Uint8::new_builder().nth0(IDENTITY_VERSION).build();
             let p_mol = MolBytes::new_builder()
                 .extend(secio_pubkey.iter().copied().map(Into::into))
                 .build();
