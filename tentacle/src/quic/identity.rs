@@ -44,7 +44,7 @@ pub fn build_self_signed<K: KeyProvider>(key: &K) -> Result<TentacleQuicCert, Qu
 
     let binding_sig = key
         .sign_ecdsa(digest.as_ref())
-        .map_err(|e| QuicErrorKind::SigningError(format!("{:?}", e.into())))?;
+        .map_err(|e| QuicErrorKind::SigningError(e.into().to_string()))?;
 
     // 4. Build molecule payload and wrap as a custom X.509 extension
     let secio_pubkey = key.pubkey();
@@ -123,7 +123,7 @@ pub fn extract_identity(leaf_der: &[u8]) -> Result<TentacleQuicIdentityV1, QuicE
     if let Some(identity) = identity {
         let version = identity.version().nth0().into();
 
-        if version != 1 {
+        if version != IDENTITY_VERSION {
             return Err(QuicErrorKind::IdentityVersionUnsupported(version));
         }
         return Ok(identity);

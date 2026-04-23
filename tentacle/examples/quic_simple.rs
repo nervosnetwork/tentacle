@@ -31,11 +31,13 @@ async fn main() {
             let (mut send_conn, mut recv_conn) = conn.accept_bi().await.unwrap();
             let read_data = recv_conn.read_u32_le().await.unwrap();
             if read_data == 0xdeadbeef {
-                println!("Server got 0xdeadbeef, writting 0xcafebabe");
+                println!("Server got 0xdeadbeef, writing 0xcafebabe");
                 send_conn.write_u32_le(0xcafebabe).await.unwrap();
                 send_conn.finish().unwrap();
             } else {
-                todo!();
+                eprintln!("Server got unexpected value: {read_data:#x}, closing connection");
+                conn.close(1u32.into(), b"unexpected request value");
+                return;
             }
             // Keep conn alive until the peer closes the connection
             conn.closed().await;
