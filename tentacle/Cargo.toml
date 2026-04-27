@@ -95,6 +95,10 @@ required-features = ["unstable"]
 name = "quic_simple"
 required-features = ["quic"]
 
+[[test]]
+name = "test_quic_verifier"
+required-features = ["quic"]
+
 [features]
 default = ["tokio-runtime", "tokio-timer", "quic"]
 ws = ["tokio-tungstenite", "httparse"]
