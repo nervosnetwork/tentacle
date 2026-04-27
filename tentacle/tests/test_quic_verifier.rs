@@ -76,27 +76,38 @@ fn spawn_quinn_server(rustls_cfg: ServerConfig) -> (quinn::Endpoint, std::net::S
 }
 
 /// Stand up a quinn client and start connecting to `server_addr`.
+///
+/// Returns both the `Endpoint` and the `Connecting`. The caller MUST keep the
+/// `Endpoint` alive until the handshake completes — quinn's `Connecting` does
+/// not hold a clone of the `Endpoint`, so dropping the last `Endpoint` clone
+/// terminates the `EndpointDriver` that routes inbound UDP datagrams, which
+/// would silently break the handshake (or just make the test flaky).
 fn connect_quinn_client(
     rustls_cfg: ClientConfig,
     server_addr: std::net::SocketAddr,
-) -> quinn::Connecting {
+) -> (quinn::Endpoint, quinn::Connecting) {
     let quinn_cfg =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_cfg).unwrap()));
     let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
-    endpoint
+    let connecting = endpoint
         .connect_with(quinn_cfg, server_addr, "tentacle.invalid")
-        .expect("connect_with")
+        .expect("connect_with");
+    (endpoint, connecting)
 }
 
-/// Pull the peer certificate chain from a quinn connection and decode the
-/// tentacle identity extension from its leaf certificate.
+/// Pull the peer certificate chain from a quinn connection and derive the
+/// peer's `PeerId` the same way the verifier does — from the `secio_pubkey`
+/// field of the tentacle identity extension. The `PeerId` is **not** stored
+/// in the extension; it is a deterministic derivation.
 fn peer_identity_peer_id_bytes(conn: &quinn::Connection) -> Vec<u8> {
     let any = conn.peer_identity().expect("peer_identity present");
     let chain = any
         .downcast::<Vec<CertificateDer<'static>>>()
         .expect("cert chain downcast");
     let identity = extract_identity(chain[0].as_ref()).expect("extract identity");
-    identity.peer_id().raw_data().as_ref().to_vec()
+    let secio_pubkey =
+        tentacle::secio::PublicKey::from_raw_key(identity.secio_pubkey().raw_data().to_vec());
+    secio_pubkey.peer_id().into_bytes()
 }
 
 // ────────────────────────── end-to-end test cases ──────────────────────────
@@ -127,11 +138,11 @@ async fn e2e_handshake_succeeds_with_tentacle_identities() {
         observed
     });
 
-    // Client connects with the expected server PeerId pinned.
+    // Client connects with the expected server PeerId pinned. We bind the
+    // endpoint to a local so it stays alive for the lifetime of the handshake.
     let rustls_client = tentacle_client_config(client_key, client_cert, Some(server_peer_id));
-    let client_conn = connect_quinn_client(rustls_client, server_addr)
-        .await
-        .expect("client handshake ok");
+    let (_client_endpoint, client_connecting) = connect_quinn_client(rustls_client, server_addr);
+    let client_conn = client_connecting.await.expect("client handshake ok");
 
     // Client sees the server's PeerId in the presented cert.
     let observed_server = peer_identity_peer_id_bytes(&client_conn);
@@ -175,7 +186,8 @@ async fn e2e_handshake_fails_when_client_has_no_extension() {
         )
         .expect("client rustls config");
 
-    let client_result = connect_quinn_client(rustls_client, server_addr).await;
+    let (_client_endpoint, client_connecting) = connect_quinn_client(rustls_client, server_addr);
+    let client_result = client_connecting.await;
     let server_result = server_task.await.expect("server join");
 
     // Either side may surface the failure first; we only require that the

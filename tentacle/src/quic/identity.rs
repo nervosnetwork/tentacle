@@ -3,7 +3,7 @@ use secio::KeyProvider;
 
 use crate::quic::error::QuicErrorKind;
 use crate::quic::identity_mol::{
-    self, Bytes as MolBytes, TentacleQuicIdentityV1, TentacleQuicIdentityV1Reader, Uint8,
+    Bytes as MolBytes, TentacleQuicIdentityV1, TentacleQuicIdentityV1Reader, Uint8,
 };
 
 /// OID for tentacle QUIC identity X.509 extension.
@@ -24,9 +24,11 @@ pub struct TentacleQuicCert {
 ///   1. Generate a fresh Ed25519 TLS keypair (K_tls).
 ///   2. Extract the DER-encoded SubjectPublicKeyInfo of K_tls.
 ///   3. Compute `binding_sig = secp256k1_sign(K_secio, sha256(BINDING_DOMAIN || spki))`.
-///   4. Encode `(version, secio_pubkey, peer_id, binding_sig)` as a molecule
+///   4. Encode `(version, secio_pubkey, binding_sig)` as a molecule
 ///      `TentacleQuicIdentityV1` payload and attach it as a private X.509
-///      extension with OID `TENTACLE_QUIC_IDENT_OID`.
+///      extension with OID `TENTACLE_QUIC_IDENT_OID`. The `PeerId` is **not**
+///      stored in the payload — it is deterministically derived from
+///      `secio_pubkey` by both sides.
 ///   5. Self-sign the certificate.
 pub fn build_self_signed<K: KeyProvider>(key: &K) -> Result<TentacleQuicCert, QuicErrorKind> {
     // 1. Generate TLS keypair (K_tls)
@@ -48,11 +50,7 @@ pub fn build_self_signed<K: KeyProvider>(key: &K) -> Result<TentacleQuicCert, Qu
 
     // 4. Build molecule payload and wrap as a custom X.509 extension
     let secio_pubkey = key.pubkey();
-    let peer_id = secio::PublicKey::from_raw_key(secio_pubkey.clone())
-        .peer_id()
-        .into_bytes();
-
-    let payload = encode_identity_payload(&secio_pubkey, &peer_id, &binding_sig);
+    let payload = encode_identity_payload(&secio_pubkey, &binding_sig);
     let ext = rcgen::CustomExtension::from_oid_content(TENTACLE_QUIC_IDENT_OID, payload);
 
     // 5. Build CertificateParams and self-sign
@@ -77,12 +75,11 @@ pub fn build_self_signed<K: KeyProvider>(key: &K) -> Result<TentacleQuicCert, Qu
 }
 
 /// Encode the identity fields as a molecule `TentacleQuicIdentityV1` payload.
-fn encode_identity_payload(secio_pubkey: &[u8], peer_id: &[u8], binding_sig: &[u8]) -> Vec<u8> {
+fn encode_identity_payload(secio_pubkey: &[u8], binding_sig: &[u8]) -> Vec<u8> {
     let version = Uint8::new_builder().nth0(IDENTITY_VERSION).build();
     let secio_pubkey = MolBytes::new_builder()
         .extend(secio_pubkey.iter().copied().map(Into::into))
         .build();
-    let peer_id = identity_mol::PeerId::from(TryInto::<[u8; 34]>::try_into(peer_id).unwrap());
     let binding_sig = MolBytes::new_builder()
         .extend(binding_sig.iter().copied().map(Into::into))
         .build();
@@ -90,7 +87,6 @@ fn encode_identity_payload(secio_pubkey: &[u8], peer_id: &[u8], binding_sig: &[u
     TentacleQuicIdentityV1::new_builder()
         .version(version)
         .secio_pubkey(secio_pubkey)
-        .peer_id(peer_id)
         .binding_sig(binding_sig)
         .build()
         .as_bytes()
@@ -159,8 +155,6 @@ pub fn verify_binding<K: KeyProvider>(
 
 #[cfg(test)]
 mod tests {
-    use crate::quic::identity_mol::PeerId;
-
     use super::*;
     use secio::SecioKeyPair;
     use x509_parser::parse_x509_certificate;
@@ -182,18 +176,16 @@ mod tests {
         let version: u8 = identity.version().nth0().into();
         assert_eq!(version, IDENTITY_VERSION);
 
-        // secio_pubkey must round-trip
+        // secio_pubkey must round-trip exactly
         assert_eq!(
             identity.secio_pubkey().raw_data().as_ref(),
             key.public_key().inner_ref()
         );
 
-        // peer_id must be derivable from secio_pubkey
-        let expected_peer_id = key.public_key().peer_id().into_bytes();
-        assert_eq!(
-            identity.peer_id().raw_data().as_ref(),
-            expected_peer_id.as_slice()
-        );
+        // PeerId can be derived from secio_pubkey (no separate field stored)
+        let derived =
+            secio::PublicKey::from_raw_key(identity.secio_pubkey().raw_data().to_vec()).peer_id();
+        assert_eq!(derived, key.public_key().peer_id());
 
         // binding_sig must be non-empty
         assert!(!identity.binding_sig().raw_data().is_empty());
@@ -310,22 +302,18 @@ mod tests {
         // Build a properly-formatted molecule payload but with version = 2
         let key = SecioKeyPair::secp256k1_generated();
         let secio_pubkey = key.public_key().inner_ref().to_vec();
-        let peer_id = key.public_key().peer_id().into_bytes();
-        println!("peer id raw length {}", peer_id.len());
         let binding_sig = vec![0u8; 64];
 
         let version = Uint8::new_builder().nth0(2u8).build();
         let secio_pubkey_mol = MolBytes::new_builder()
             .extend(secio_pubkey.iter().copied().map(Into::into))
             .build();
-        let peer_id_mol = PeerId::from(TryInto::<[u8; 34]>::try_into(peer_id).unwrap());
         let sig_mol = MolBytes::new_builder()
             .extend(binding_sig.iter().copied().map(Into::into))
             .build();
         let payload = TentacleQuicIdentityV1::new_builder()
             .version(version)
             .secio_pubkey(secio_pubkey_mol)
-            .peer_id(peer_id_mol)
             .binding_sig(sig_mol)
             .build()
             .as_bytes()
@@ -351,21 +339,18 @@ mod tests {
         // Two extensions with the same OID — should be rejected
         let key = SecioKeyPair::secp256k1_generated();
         let secio_pubkey = key.public_key().inner_ref().to_vec();
-        let peer_id = key.public_key().peer_id().into_bytes();
 
         let build_payload = || {
             let version = Uint8::new_builder().nth0(IDENTITY_VERSION).build();
             let p_mol = MolBytes::new_builder()
                 .extend(secio_pubkey.iter().copied().map(Into::into))
                 .build();
-            let id_mol = PeerId::from(TryInto::<[u8; 34]>::try_into(peer_id.clone()).unwrap());
             let sig_mol = MolBytes::new_builder()
                 .extend(vec![0u8; 64].into_iter().map(Into::into))
                 .build();
             TentacleQuicIdentityV1::new_builder()
                 .version(version)
                 .secio_pubkey(p_mol)
-                .peer_id(id_mol)
                 .binding_sig(sig_mol)
                 .build()
                 .as_bytes()

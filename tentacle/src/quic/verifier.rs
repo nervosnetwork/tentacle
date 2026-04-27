@@ -10,17 +10,16 @@
 //! 2. The leaf certificate's validity period covers the current time.
 //! 3. The leaf contains **exactly one** X.509 extension with OID
 //!    [`TENTACLE_QUIC_IDENT_OID`]. The payload decodes as a
-//!    molecule `TentacleQuicIdentityV1` structure with `version == 1`.
+//!    molecule `TentacleQuicIdentityV1 { version, secio_pubkey, binding_sig }`
+//!    with `version == 1`. The peer's `PeerId` is **not** stored in the
+//!    payload — it is deterministically derived from `secio_pubkey` by both
+//!    sides at verification time.
 //! 4. The secp256k1 signature in `binding_sig` is valid for
 //!    `sha256(BINDING_DOMAIN || leaf_spki_der)` under `secio_pubkey`,
 //!    proving the TLS key and the secio identity share an owner.
 //! 5. For a client dialling a target address that contains `/p2p/<expected>`,
 //!    `expected` must equal `PeerId::from_public_key(secio_pubkey)`
 //!    (server-side verifier skips this step).
-//!
-//! Note: the `peer_id` field in the extension payload is **not** verified
-//! against `secio_pubkey` — it is a redundant deterministic derivation.
-//! The verifier always derives `PeerId` from `secio_pubkey` directly.
 //!
 //! SAN and hostname are never checked.
 //!
@@ -324,9 +323,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::quic::identity::{IDENTITY_VERSION, TENTACLE_QUIC_IDENT_OID, build_self_signed};
-    use crate::quic::identity_mol::{
-        Bytes as MolBytes, PeerId as MolPeerId, TentacleQuicIdentityV1, Uint8,
-    };
+    use crate::quic::identity_mol::{Bytes as MolBytes, TentacleQuicIdentityV1, Uint8};
 
     fn now() -> UnixTime {
         UnixTime::now()
@@ -354,22 +351,11 @@ mod tests {
     }
 
     /// Molecule-encode an identity payload with arbitrary field values.
-    ///
-    /// `peer_id` must be exactly 34 bytes (the fixed multihash length).
-    fn encode_identity(
-        version: u8,
-        secio_pubkey: &[u8],
-        peer_id: &[u8],
-        binding_sig: &[u8],
-    ) -> Vec<u8> {
+    fn encode_identity(version: u8, secio_pubkey: &[u8], binding_sig: &[u8]) -> Vec<u8> {
         let v = Uint8::new_builder().nth0(version).build();
         let sp = MolBytes::new_builder()
             .extend(secio_pubkey.iter().copied().map(Into::into))
             .build();
-        let pid_array: [u8; 34] = peer_id
-            .try_into()
-            .expect("peer_id must be 34 bytes for the molecule PeerId array");
-        let pid = MolPeerId::from(pid_array);
         let sig = MolBytes::new_builder()
             .extend(binding_sig.iter().copied().map(Into::into))
             .build();
@@ -377,7 +363,6 @@ mod tests {
         TentacleQuicIdentityV1::new_builder()
             .version(v)
             .secio_pubkey(sp)
-            .peer_id(pid)
             .binding_sig(sig)
             .build()
             .as_bytes()
@@ -466,9 +451,8 @@ mod tests {
     fn test_server_verify_wrong_version() {
         let key = SecioKeyPair::secp256k1_generated();
         let pubkey = key.public_key().inner_ref().to_vec();
-        let peer_id = key.public_key().peer_id().into_bytes();
 
-        let payload = encode_identity(2, &pubkey, &peer_id, &[0u8; 64]);
+        let payload = encode_identity(2, &pubkey, &[0u8; 64]);
         let cert_bytes = build_cert_with_payload(payload);
 
         let verifier = TentacleQuicServerCertVerifier::new(key, None);
@@ -482,11 +466,10 @@ mod tests {
     fn test_server_verify_binding_sig_invalid() {
         let key = SecioKeyPair::secp256k1_generated();
         let pubkey = key.public_key().inner_ref().to_vec();
-        let peer_id = key.public_key().peer_id().into_bytes();
 
         // A syntactically reasonable but semantically wrong signature.
         let bogus_sig = vec![0xab; 64];
-        let payload = encode_identity(IDENTITY_VERSION, &pubkey, &peer_id, &bogus_sig);
+        let payload = encode_identity(IDENTITY_VERSION, &pubkey, &bogus_sig);
         let cert_bytes = build_cert_with_payload(payload);
 
         let verifier = TentacleQuicServerCertVerifier::new(key, None);
