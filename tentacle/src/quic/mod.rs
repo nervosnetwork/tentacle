@@ -9,3 +9,7 @@ pub mod identity;
 
 /// Error types of QUIC protocol
 pub mod error;
+
+#[allow(missing_docs)]
+/// Verifier for rustls
+pub mod verifier;

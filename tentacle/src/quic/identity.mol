@@ -1,9 +1,7 @@
 vector Bytes <byte>;
-array PeerId [byte; 34];
 array Uint8 [byte; 1];
 table TentacleQuicIdentityV1 {
-    version:      Uint8,        
-    secio_pubkey: Bytes,     
-    peer_id:      PeerId,     
-    binding_sig:  Bytes,     
+    version:      Uint8,
+    secio_pubkey: Bytes,
+    binding_sig:  Bytes,
 }
