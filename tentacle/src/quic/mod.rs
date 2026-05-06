@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 #[allow(missing_docs)]
 pub mod identity_mol;
 
@@ -13,3 +15,5 @@ pub mod error;
 #[allow(missing_docs)]
 /// Verifier for rustls
 pub mod verifier;
+
+pub mod stream;

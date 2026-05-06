@@ -16,7 +16,7 @@ use yamux::{Control, Session as YamuxSession, StreamHandle};
 use crate::{
     ProtocolId, SessionId, StreamId, SubstreamReadPart,
     buffer::{Buffer, PriorityBuffer, SendResult},
-    channel::{QuickSinkExt, mpsc as priority_mpsc, mpsc::Priority},
+    channel::{QuickSinkExt, mpsc::{self as priority_mpsc, Priority}},
     context::SessionContext,
     error::{HandshakeErrorKind, ProtocolHandleErrorKind, TransportErrorKind},
     multiaddr::Multiaddr,
@@ -28,7 +28,7 @@ use crate::{
         config::{Meta, SessionConfig},
         future_task::BoxedFutureTask,
     },
-    substream::{ProtocolEvent, SubstreamBuilder, SubstreamWritePartBuilder},
+    substream::{ProtocolEvent, SubstreamBuilder, SubstreamInner, SubstreamWritePartBuilder},
     transports::MultiIncoming,
 };
 
@@ -260,7 +260,7 @@ impl Session {
         procedure: impl Future<
             Output = Result<
                 (
-                    Framed<StreamHandle, LengthDelimitedCodec>,
+                    Framed<SubstreamInner, LengthDelimitedCodec>,
                     String,
                     Option<String>,
                 ),
@@ -325,7 +325,7 @@ impl Session {
 
         let task = async move {
             let handle = match control.open_stream().await {
-                Ok(handle) => handle,
+                Ok(handle) => SubstreamInner::Yamux(handle),
                 Err(e) => {
                     debug!("session {} open stream error: {}", id, e);
                     return Err(io::ErrorKind::BrokenPipe.into());
@@ -398,7 +398,7 @@ impl Session {
             })
             .collect();
 
-        let task = server_select(substream, proto_metas);
+        let task = server_select(SubstreamInner::Yamux(substream), proto_metas);
         self.select_procedure(task);
     }
 
@@ -407,7 +407,7 @@ impl Session {
         cx: &mut Context,
         name: String,
         version: String,
-        substream: Box<Framed<StreamHandle, LengthDelimitedCodec>>,
+        substream: Box<Framed<SubstreamInner, LengthDelimitedCodec>>,
     ) {
         let proto = match self.protocol_configs_by_name.get(&name) {
             Some(proto) => proto,
