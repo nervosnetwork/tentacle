@@ -17,3 +17,8 @@ pub mod error;
 pub mod verifier;
 
 pub mod stream;
+
+pub mod endpoint;
+
+/// QUIC session wrapper (placeholder until PR 4 §步骤 E lands the full main loop).
+pub mod session;
