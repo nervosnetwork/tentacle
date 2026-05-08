@@ -410,8 +410,8 @@ mod tests {
     fn parse_ip4_quic_with_peer() {
         let key = SecioKeyPair::secp256k1_generated();
         let pid = key.peer_id().to_base58();
-        let addr = Multiaddr::from_str(&format!("/ip4/127.0.0.1/udp/4433/quic-v1/p2p/{}", pid))
-            .unwrap();
+        let addr =
+            Multiaddr::from_str(&format!("/ip4/127.0.0.1/udp/4433/quic-v1/p2p/{}", pid)).unwrap();
         let (sock, peer) = parse_quic_multiaddr(&addr).unwrap();
         assert_eq!(sock, "127.0.0.1:4433".parse::<SocketAddr>().unwrap());
         assert_eq!(peer.unwrap(), key.peer_id());
@@ -505,8 +505,7 @@ mod tests {
     async fn end_to_end_dial_and_echo() {
         let server_key = SecioKeyPair::secp256k1_generated();
         let server_pid = server_key.peer_id();
-        let server_endpoint =
-            QuicEndpoint::new(server_key.clone(), QuicConfig::default()).unwrap();
+        let server_endpoint = QuicEndpoint::new(server_key.clone(), QuicConfig::default()).unwrap();
 
         let listener = server_endpoint
             .listen(Multiaddr::from_str("/ip4/127.0.0.1/udp/0/quic-v1").unwrap())
@@ -567,8 +566,7 @@ mod tests {
     #[tokio::test]
     async fn dial_rejects_wrong_peer_id() {
         let server_key = SecioKeyPair::secp256k1_generated();
-        let server_endpoint =
-            QuicEndpoint::new(server_key.clone(), QuicConfig::default()).unwrap();
+        let server_endpoint = QuicEndpoint::new(server_key.clone(), QuicConfig::default()).unwrap();
 
         let listener = server_endpoint
             .listen(Multiaddr::from_str("/ip4/127.0.0.1/udp/0/quic-v1").unwrap())

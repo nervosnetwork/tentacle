@@ -20,5 +20,7 @@ pub mod stream;
 
 pub mod endpoint;
 
-/// QUIC session wrapper (placeholder until PR 4 §步骤 E lands the full main loop).
+/// QUIC session wrapper
 pub mod session;
+
+pub mod manager;

@@ -16,7 +16,10 @@ use yamux::{Control, Session as YamuxSession, StreamHandle};
 use crate::{
     ProtocolId, SessionId, StreamId, SubstreamReadPart,
     buffer::{Buffer, PriorityBuffer, SendResult},
-    channel::{QuickSinkExt, mpsc::{self as priority_mpsc, Priority}},
+    channel::{
+        QuickSinkExt,
+        mpsc::{self as priority_mpsc, Priority},
+    },
     context::SessionContext,
     error::{HandshakeErrorKind, ProtocolHandleErrorKind, TransportErrorKind},
     multiaddr::Multiaddr,
