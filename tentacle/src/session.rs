@@ -39,7 +39,7 @@ pub trait AsyncRw: AsyncWrite + AsyncRead {}
 
 impl<T: AsyncRead + AsyncWrite> AsyncRw for T {}
 
-fn split_spawn_framed<T, U>(
+pub(crate) fn split_spawn_framed<T, U>(
     part: FramedParts<T, U>,
 ) -> (
     futures::stream::SplitSink<Framed<T, U>, bytes::Bytes>,
@@ -848,17 +848,17 @@ mod tests {
 }
 
 pub(crate) struct SessionMeta {
-    config: SessionConfig,
-    protocol_configs_by_name: HashMap<String, Arc<Meta>>,
-    protocol_configs_by_id: IntMap<ProtocolId, Arc<Meta>>,
-    context: Arc<SessionContext>,
-    timeout: Duration,
-    keep_buffer: bool,
-    service_proto_senders: IntMap<ProtocolId, Buffer<ServiceProtocolEvent>>,
-    session_proto_senders: IntMap<ProtocolId, Buffer<SessionProtocolEvent>>,
-    event_sender: priority_mpsc::Sender<SessionEvent>,
-    service_control: ServiceAsyncControl,
-    session_proto_handles: Vec<(
+    pub(crate) config: SessionConfig,
+    pub(crate) protocol_configs_by_name: HashMap<String, Arc<Meta>>,
+    pub(crate) protocol_configs_by_id: IntMap<ProtocolId, Arc<Meta>>,
+    pub(crate) context: Arc<SessionContext>,
+    pub(crate) timeout: Duration,
+    pub(crate) keep_buffer: bool,
+    pub(crate) service_proto_senders: IntMap<ProtocolId, Buffer<ServiceProtocolEvent>>,
+    pub(crate) session_proto_senders: IntMap<ProtocolId, Buffer<SessionProtocolEvent>>,
+    pub(crate) event_sender: priority_mpsc::Sender<SessionEvent>,
+    pub(crate) service_control: ServiceAsyncControl,
+    pub(crate) session_proto_handles: Vec<(
         Option<futures::channel::oneshot::Sender<()>>,
         crate::runtime::JoinHandle<()>,
     )>,
@@ -949,12 +949,12 @@ pub(crate) enum SessionState {
 
 impl SessionState {
     #[inline]
-    fn is_local_close(self) -> bool {
+    pub(crate) fn is_local_close(self) -> bool {
         matches!(self, SessionState::LocalClose)
     }
 
     #[inline]
-    fn is_normal(self) -> bool {
+    pub(crate) fn is_normal(self) -> bool {
         matches!(self, SessionState::Normal)
     }
 }

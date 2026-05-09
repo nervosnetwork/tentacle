@@ -8,6 +8,14 @@ pub struct QuicBiStream {
     pub(crate) recv: quinn::RecvStream,
 }
 
+impl QuicBiStream {
+    /// Wrap a quinn bidirectional stream pair into an `AsyncRead + AsyncWrite`
+    /// substream usable by the protocol layer.
+    pub(crate) fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Self { send, recv }
+    }
+}
+
 impl AsyncRead for QuicBiStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,

@@ -5,10 +5,10 @@
 //!   pre-built `quinn::ServerConfig`. It is the user-facing entry point that
 //!   the higher-level service builder hands to the transport layer.
 //! - [`QuicEndpoint::listen`] binds a UDP socket and returns a
-//!   [`QuicListener`] that yields accepted [`QuicSession`]s (each one with
+//!   [`QuicListener`] that yields accepted [`QuicHandshake`]s (each one with
 //!   its TLS handshake already completed and verified).
 //! - [`QuicEndpoint::dial`] opens a one-shot client endpoint and dials the
-//!   given multiaddr, returning a fully-handshaken [`QuicSession`].
+//!   given multiaddr, returning a fully-handshaken [`QuicHandshake`].
 //! - [`parse_quic_multiaddr`] enforces the legal address shape.
 //!
 //! Endpoint reuse / pooling is left to a future manager layer; this module
@@ -26,7 +26,7 @@ use crate::{
         config::QuicConfig,
         error::QuicErrorKind,
         identity::{TentacleQuicCert, build_self_signed, extract_identity},
-        session::QuicSession,
+        session::QuicHandshake,
         verifier::{TentacleQuicClientCertVerifier, TentacleQuicServerCertVerifier},
     },
     secio::{KeyProvider, PeerId, PublicKey},
@@ -90,12 +90,12 @@ impl<K: KeyProvider> QuicEndpoint<K> {
 
     /// Dial a remote QUIC peer and complete the TLS handshake.
     ///
-    /// On success the returned [`QuicSession`] holds a `quinn::Connection`
+    /// On success the returned [`QuicHandshake`] holds a `quinn::Connection`
     /// whose peer certificate has already passed the tentacle verifier
     /// checks. The remote secio public key is recovered from the peer cert's
     /// identity extension and made available via
-    /// [`QuicSession::remote_pubkey`].
-    pub async fn dial(&self, addr: Multiaddr) -> Result<QuicSession, QuicErrorKind> {
+    /// [`QuicHandshake::remote_pubkey`].
+    pub async fn dial(&self, addr: Multiaddr) -> Result<QuicHandshake, QuicErrorKind> {
         let (socket_addr, expected_peer_id) = parse_quic_multiaddr(&addr)?;
 
         let client_config = build_quinn_client_config(
@@ -125,7 +125,7 @@ impl<K: KeyProvider> QuicEndpoint<K> {
         // is implemented.
         spawn_endpoint_keepalive(endpoint, conn.clone());
 
-        Ok(QuicSession::new(conn, remote_pubkey))
+        Ok(QuicHandshake::new(conn, remote_pubkey))
     }
 
     /// Read-only access to the configured transport parameters.
@@ -139,7 +139,7 @@ impl<K: KeyProvider> QuicEndpoint<K> {
 /// Server-side QUIC listener, wrapping a bound `quinn::Endpoint`.
 ///
 /// Each call to [`QuicListener::accept`] yields a fully-handshaken
-/// [`QuicSession`] together with the multiaddr of the remote peer.
+/// [`QuicHandshake`] together with the multiaddr of the remote peer.
 pub struct QuicListener {
     endpoint: quinn::Endpoint,
     listen_addr: Multiaddr,
@@ -153,11 +153,11 @@ impl QuicListener {
     }
 
     /// Accept the next incoming connection, drive its TLS handshake to
-    /// completion, and return the resulting [`QuicSession`] paired with the
+    /// completion, and return the resulting [`QuicHandshake`] paired with the
     /// remote peer's multiaddr.
     ///
     /// Returns `Ok(None)` when the endpoint has been closed.
-    pub async fn accept(&self) -> Result<Option<(Multiaddr, QuicSession)>, QuicErrorKind> {
+    pub async fn accept(&self) -> Result<Option<(Multiaddr, QuicHandshake)>, QuicErrorKind> {
         let incoming = match self.endpoint.accept().await {
             Some(i) => i,
             None => return Ok(None),
@@ -167,7 +167,7 @@ impl QuicListener {
         let remote_pubkey = peer_pubkey_from_connection(&conn)?;
         Ok(Some((
             socketaddr_to_quic_multiaddr(remote_addr),
-            QuicSession::new(conn, remote_pubkey),
+            QuicHandshake::new(conn, remote_pubkey),
         )))
     }
 
