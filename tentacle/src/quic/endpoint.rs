@@ -364,8 +364,7 @@ fn peer_pubkey_from_connection(conn: &quinn::Connection) -> Result<PublicKey, Qu
         .map_err(|_| QuicErrorKind::NoPeerCert)?;
     let leaf = chain.first().ok_or(QuicErrorKind::NoPeerCert)?;
     let identity = extract_identity(leaf.as_ref())?;
-    let pubkey_bytes = identity.secio_pubkey().raw_data().to_vec();
-    Ok(PublicKey::from_raw_key(pubkey_bytes))
+    Ok(PublicKey::from_raw_key(identity.secio_pubkey))
 }
 
 /// Drop guard that keeps a `quinn::Endpoint` alive for the lifetime of a

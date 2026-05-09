@@ -1,7 +1,16 @@
+//! Adapter that exposes a `quinn` bidirectional stream pair (one
+//! [`quinn::SendStream`] + one [`quinn::RecvStream`]) as a single tokio
+//! [`AsyncRead`] + [`AsyncWrite`] handle, so it can carry the same
+//! length-prefixed protocol layer used by the yamux backend.
+
 use std::pin::Pin;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// A `quinn` bidirectional stream packaged as a single
+/// `AsyncRead + AsyncWrite` so the protocol layer (`Substream<U>`,
+/// `client_select`, `server_select`, …) can sit on top of QUIC the
+/// same way it sits on top of yamux.
 #[derive(Debug)]
 pub struct QuicBiStream {
     pub(crate) send: quinn::SendStream,
