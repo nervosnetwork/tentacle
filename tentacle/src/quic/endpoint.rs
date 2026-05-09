@@ -376,7 +376,9 @@ fn spawn_endpoint_keepalive(endpoint: quinn::Endpoint, conn: quinn::Connection) 
     crate::runtime::spawn(async move {
         let _ = conn.closed().await;
         endpoint.close(0u32.into(), b"closed");
-        let _ = tokio::time::timeout(Duration::from_millis(100), endpoint.wait_idle()).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(100), endpoint.wait_idle())
+            .await
+            .unwrap();
     });
 }
 

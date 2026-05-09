@@ -84,7 +84,10 @@ impl ServiceProtocol for EchoCounter {
     }
 
     async fn received(&mut self, context: ProtocolContextMutRef<'_>, data: Bytes) {
-        let _ = self.sender.try_send((context.proto_id, data.clone())).unwrap();
+        let _ = self
+            .sender
+            .try_send((context.proto_id, data.clone()))
+            .unwrap();
         self.seen += 1;
         if self.seen >= self.target {
             return;
