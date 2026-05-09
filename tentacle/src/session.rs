@@ -76,6 +76,11 @@ pub(crate) enum SessionEvent {
         /// listen addr
         listen_address: Option<Multiaddr>,
     },
+    /// QUIC handshake completed (TLS + tentacle identity verified) for either
+    /// a dial or accept. Bypasses the secio handshake path; the recipient
+    /// dispatches into `quic_session_open`.
+    #[cfg(feature = "quic")]
+    QuicListenAccepted(QuicListenAccepted),
     HandshakeError {
         /// remote address
         address: Multiaddr,
@@ -845,6 +850,19 @@ mod tests {
 
         assert_eq!(first.freeze(), Bytes::from_static(b"init"));
     }
+}
+
+/// Carrier for a successfully-handshaken QUIC session that needs to be
+/// registered with `InnerService`. Used by the listen task and by
+/// `dial_inner` to hand a [`crate::quic::QuicHandshake`] back to
+/// `InnerService` without coupling the `SessionEvent` enum to quinn types.
+#[cfg(feature = "quic")]
+pub(crate) struct QuicListenAccepted {
+    pub(crate) session: crate::quic::session::QuicHandshake,
+    pub(crate) public_key: PublicKey,
+    pub(crate) address: Multiaddr,
+    pub(crate) listen_address: Option<Multiaddr>,
+    pub(crate) ty: SessionType,
 }
 
 pub(crate) struct SessionMeta {

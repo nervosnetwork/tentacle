@@ -376,8 +376,46 @@ fn spawn_endpoint_keepalive(endpoint: quinn::Endpoint, conn: quinn::Connection) 
     crate::runtime::spawn(async move {
         let _ = conn.closed().await;
         endpoint.close(0u32.into(), b"closed");
-        let _ = tokio::time::timeout(Duration::from_millis(100), endpoint.wait_idle()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(100), endpoint.wait_idle()).await.unwrap();
     });
+}
+
+// ─────────────────────────── type-erased dyn dispatch ───────────────────────────
+
+/// Object-safe view of a [`QuicEndpoint`].
+///
+/// Used by the service layer so that `InnerService<K>` does not have to
+/// thread the `K: KeyProvider` bound through types that otherwise have no
+/// reason to know about it (e.g. when `quic` is feature-disabled).
+pub trait QuicEndpointHandle: Send + Sync {
+    /// Bind a server-capable QUIC endpoint to the given multiaddr.
+    fn listen_dyn(&self, addr: Multiaddr) -> Result<QuicListener, QuicErrorKind>;
+
+    /// Dial a remote QUIC peer and complete the TLS handshake.
+    fn dial_dyn<'a>(
+        &'a self,
+        addr: Multiaddr,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<QuicHandshake, QuicErrorKind>> + Send + 'a>,
+    >;
+}
+
+impl<K> QuicEndpointHandle for QuicEndpoint<K>
+where
+    K: KeyProvider,
+{
+    fn listen_dyn(&self, addr: Multiaddr) -> Result<QuicListener, QuicErrorKind> {
+        self.listen(addr)
+    }
+
+    fn dial_dyn<'a>(
+        &'a self,
+        addr: Multiaddr,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<QuicHandshake, QuicErrorKind>> + Send + 'a>,
+    > {
+        Box::pin(self.dial(addr))
+    }
 }
 
 // ──────────────────────────────────── tests ────────────────────────────────────
@@ -576,7 +614,7 @@ mod tests {
         // Drive the listener so the handshake can progress (the server-side
         // failure is fine; we only need the listener task to keep polling).
         let _server_task = tokio::spawn(async move {
-            let _ = listener.accept().await;
+            let _ = listener.accept().await.unwrap();
         });
 
         let client_key = SecioKeyPair::secp256k1_generated();

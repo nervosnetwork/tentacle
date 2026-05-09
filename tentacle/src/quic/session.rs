@@ -837,7 +837,7 @@ mod tests {
         quic::{config::QuicConfig, endpoint::QuicEndpoint},
         secio::SecioKeyPair,
         service::{ServiceAsyncControl, ServiceControl, SessionType, config::SessionConfig},
-        session::{SessionEvent, SessionMeta},
+        session::SessionMeta,
     };
     use futures::channel::mpsc as fmpsc;
 
