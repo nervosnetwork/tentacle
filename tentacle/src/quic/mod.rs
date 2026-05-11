@@ -23,7 +23,6 @@
 //!   tokio `AsyncRead + AsyncWrite`.
 //! - [`session`]: per-connection main loop, mirroring
 //!   [`crate::session::Session`] for the QUIC backend.
-//! - [`manager`]: pooled UDP-endpoint reuse keyed on listen address.
 
 /// Molecule-generated codec for the tentacle QUIC identity payload.
 ///
@@ -57,6 +56,3 @@ pub mod endpoint;
 
 /// QUIC-backed tentacle session main loop.
 pub mod session;
-
-/// Pooled UDP-endpoint reuse keyed on listen address.
-pub mod manager;
