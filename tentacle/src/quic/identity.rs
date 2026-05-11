@@ -228,11 +228,13 @@ mod tests {
         assert_eq!(identity.version, IDENTITY_VERSION);
 
         // secio_pubkey must round-trip exactly
-        assert_eq!(identity.secio_pubkey.as_slice(), key.public_key().inner_ref());
+        assert_eq!(
+            identity.secio_pubkey.as_slice(),
+            key.public_key().inner_ref()
+        );
 
         // PeerId can be derived from secio_pubkey (no separate field stored)
-        let derived =
-            secio::PublicKey::from_raw_key(identity.secio_pubkey.clone()).peer_id();
+        let derived = secio::PublicKey::from_raw_key(identity.secio_pubkey.clone()).peer_id();
         assert_eq!(derived, key.public_key().peer_id());
 
         // binding_sig must be non-empty
@@ -282,7 +284,12 @@ mod tests {
         let identity = extract_identity(&cert_a.cert_der).expect("extract identity");
 
         // Signature was made by key_a, but we try to verify with key_b's public key
-        let result = verify_binding(&key_a, &key_b.public_key(), &spki_der, &identity.binding_sig);
+        let result = verify_binding(
+            &key_a,
+            &key_b.public_key(),
+            &spki_der,
+            &identity.binding_sig,
+        );
         assert!(
             matches!(result, Err(QuicErrorKind::SigningError(_))),
             "expected SigningError, got {:?}",
