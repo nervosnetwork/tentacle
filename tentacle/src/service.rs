@@ -305,13 +305,11 @@ where
     pub async fn dial(&mut self, address: Multiaddr, target: TargetProtocol) -> Result<&mut Self> {
         let inner = self.inner_service.as_mut().unwrap();
 
-        #[cfg(feature = "quic")]
-        if matches!(find_type(&address), TransportType::QuicV1) {
-            inner.dial_inner_quic(address, target)?;
-            return Ok(self);
-        }
-
-        if !(inner.dial_protocols.contains_key(&address)
+        // Skip if the exact address or any other address with the same
+        // /p2p/<peer_id> is already being dialed. Mirrors the check in
+        // `handle_service_task`'s `ServiceTask::Dial` arm so both entry
+        // points behave identically across transports.
+        if inner.dial_protocols.contains_key(&address)
             || extract_peer_id(&address)
                 .map(|peer_id| {
                     inner.dial_protocols.keys().any(|addr| {
@@ -322,21 +320,27 @@ where
                         }
                     })
                 })
-                .unwrap_or_default())
+                .unwrap_or_default()
         {
-            let dial_future = inner.multi_transport.clone().dial(address.clone())?;
+            return Ok(self);
+        }
 
-            match dial_future.await {
-                Ok((addr, incoming)) => {
-                    inner.handshake(incoming, SessionType::Outbound, addr, None);
-                    inner.dial_protocols.insert(address, target);
-                    inner.state.increase();
-                    Ok(self)
-                }
-                Err(err) => Err(err),
+        #[cfg(feature = "quic")]
+        if matches!(find_type(&address), TransportType::QuicV1) {
+            inner.dial_inner_quic(address, target)?;
+            return Ok(self);
+        }
+
+        let dial_future = inner.multi_transport.clone().dial(address.clone())?;
+
+        match dial_future.await {
+            Ok((addr, incoming)) => {
+                inner.handshake(incoming, SessionType::Outbound, addr, None);
+                inner.dial_protocols.insert(address, target);
+                inner.state.increase();
+                Ok(self)
             }
-        } else {
-            Ok(self)
+            Err(err) => Err(err),
         }
     }
 
