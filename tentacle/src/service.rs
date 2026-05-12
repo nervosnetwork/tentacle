@@ -597,15 +597,11 @@ where
                         }
                     }
                     Ok(None) => break,
+                    // Per-connection handshake failure (bad cert, peer-id
+                    // mismatch, dropped client, …). The endpoint is still
+                    // alive — log and keep accepting.
                     Err(error) => {
-                        let event = SessionEvent::ListenError {
-                            address: listen_addr_for_loop.clone(),
-                            error: TransportErrorKind::QuicError(error),
-                        };
-                        if sender.send(event).await.is_err() {
-                            break;
-                        }
-                        break;
+                        log::debug!("quic accept handshake failed: {:?}", error);
                     }
                 }
             }
@@ -684,15 +680,10 @@ where
                         }
                     }
                     Ok(None) => break,
+                    // Per-connection handshake failure; endpoint is still
+                    // alive — log and keep accepting.
                     Err(error) => {
-                        let event = SessionEvent::ListenError {
-                            address: listen_address.clone(),
-                            error: TransportErrorKind::QuicError(error),
-                        };
-                        if sender.send(event).await.is_err() {
-                            break;
-                        }
-                        break;
+                        log::debug!("quic accept handshake failed: {:?}", error);
                     }
                 }
             }

@@ -156,7 +156,11 @@ impl QuicListener {
     /// completion, and return the resulting [`QuicHandshake`] paired with the
     /// remote peer's multiaddr.
     ///
-    /// Returns `Ok(None)` when the endpoint has been closed.
+    /// Returns `Ok(None)` when the endpoint has been closed. `Err(_)` means
+    /// **this particular handshake attempt** failed (bad cert, peer-id
+    /// mismatch, dropped client, …); the underlying UDP endpoint is still
+    /// alive and the caller is expected to call `accept()` again to take
+    /// the next connection.
     pub async fn accept(&self) -> Result<Option<(Multiaddr, QuicHandshake)>, QuicErrorKind> {
         let incoming = match self.endpoint.accept().await {
             Some(i) => i,
