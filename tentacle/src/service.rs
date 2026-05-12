@@ -85,8 +85,15 @@ struct InnerService<K> {
 
     multi_transport: MultiTransport,
 
+    /// Three-state QUIC endpoint slot, surfaces a precise error to the
+    /// user when QUIC was requested in the builder but construction failed:
+    /// - `Ok(None)`: user did not call `ServiceBuilder::quic_config(...)` —
+    ///   dialing / listening on `/quic-v1` returns `NotSupported`.
+    /// - `Ok(Some(_))`: QUIC requested and ready.
+    /// - `Err(_)`: QUIC requested but [`QuicEndpoint::new`] failed at
+    ///   build time; surfaced as `TransportErrorKind::QuicError` on use.
     #[cfg(feature = "quic")]
-    quic_endpoint: Option<Arc<dyn QuicEndpointHandle>>,
+    quic_endpoint: std::result::Result<Option<Arc<dyn QuicEndpointHandle>>, String>,
 
     handshake_type: HandshakeType<K>,
 
@@ -176,20 +183,23 @@ where
 
         // QUIC endpoint is built up-front (binding nothing) so that listen /
         // dial calls can clone it. Requires `HandshakeType::Secio(K)` since
-        // QUIC reuses the secio key for its TLS identity.
+        // QUIC reuses the secio key for its TLS identity. Failures are
+        // stored so that subsequent `listen`/`dial` calls can surface a
+        // precise `QuicError` instead of a misleading `NotSupported`.
         #[cfg(feature = "quic")]
-        let quic_endpoint: Option<Arc<dyn QuicEndpointHandle>> =
+        let quic_endpoint: std::result::Result<Option<Arc<dyn QuicEndpointHandle>>, String> =
             match (&handshake_type, config.quic_config.as_ref()) {
                 (HandshakeType::Secio(key), Some(cfg)) => {
                     match QuicEndpoint::new(key.clone(), cfg.clone()) {
-                        Ok(ep) => Some(Arc::new(ep) as Arc<dyn QuicEndpointHandle>),
+                        Ok(ep) => Ok(Some(Arc::new(ep) as Arc<dyn QuicEndpointHandle>)),
                         Err(e) => {
-                            log::error!("failed to build quic endpoint: {:?}", e);
-                            None
+                            let msg = format!("failed to build quic endpoint: {:?}", e);
+                            log::error!("{}", msg);
+                            Err(msg)
                         }
                     }
                 }
-                _ => None,
+                _ => Ok(None),
             };
 
         Service {
@@ -502,17 +512,33 @@ where
         Ok(())
     }
 
+    /// Resolve the QUIC endpoint slot for an operation on `address`,
+    /// translating each of the three states into the appropriate caller
+    /// error:
+    /// - `Ok(None)` (QUIC not configured) → `TransportErrorKind::NotSupported`
+    /// - `Err(msg)` (configured but `QuicEndpoint::new` failed)  →
+    ///   `TransportErrorKind::QuicError(QuicErrorKind::TlsConfig(msg))`
+    #[cfg(feature = "quic")]
+    fn resolve_quic_endpoint(
+        &self,
+        address: &Multiaddr,
+    ) -> Result<Arc<dyn QuicEndpointHandle>> {
+        match self.quic_endpoint.as_ref() {
+            Ok(Some(ep)) => Ok(ep.clone()),
+            Ok(None) => Err(TransportErrorKind::NotSupported(address.clone())),
+            Err(msg) => Err(TransportErrorKind::QuicError(
+                crate::quic::error::QuicErrorKind::TlsConfig(msg.clone()),
+            )),
+        }
+    }
+
     /// QUIC dial path: bypass `MultiTransport` (which only handles byte
     /// streams) and drive [`crate::quic::endpoint::QuicEndpoint::dial`]
     /// asynchronously, surfacing the result via
     /// [`SessionEvent::QuicListenAccepted`] for unified registration.
     #[cfg(feature = "quic")]
     fn dial_inner_quic(&mut self, address: Multiaddr, target: TargetProtocol) -> Result<()> {
-        let endpoint = self
-            .quic_endpoint
-            .as_ref()
-            .ok_or_else(|| TransportErrorKind::NotSupported(address.clone()))?
-            .clone();
+        let endpoint = self.resolve_quic_endpoint(&address)?;
 
         self.dial_protocols.insert(address.clone(), target);
 
@@ -558,11 +584,7 @@ where
     /// in [`Service::listen`].
     #[cfg(feature = "quic")]
     async fn listen_quic(&mut self, address: Multiaddr) -> Result<Multiaddr> {
-        let endpoint = self
-            .quic_endpoint
-            .as_ref()
-            .ok_or_else(|| TransportErrorKind::NotSupported(address.clone()))?
-            .clone();
+        let endpoint = self.resolve_quic_endpoint(&address)?;
 
         let listener = endpoint
             .listen_dyn(address.clone())
@@ -627,11 +649,7 @@ where
     /// successfully-handshaken inbound connection.
     #[cfg(feature = "quic")]
     fn listen_inner_quic(&mut self, address: Multiaddr) -> Result<()> {
-        let endpoint = self
-            .quic_endpoint
-            .as_ref()
-            .ok_or_else(|| TransportErrorKind::NotSupported(address.clone()))?
-            .clone();
+        let endpoint = self.resolve_quic_endpoint(&address)?;
 
         let listener = match endpoint.listen_dyn(address.clone()) {
             Ok(l) => l,
