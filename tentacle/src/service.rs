@@ -187,20 +187,22 @@ where
         // stored so that subsequent `listen`/`dial` calls can surface a
         // precise `QuicError` instead of a misleading `NotSupported`.
         #[cfg(feature = "quic")]
-        let quic_endpoint: std::result::Result<Option<Arc<dyn QuicEndpointHandle>>, String> =
-            match (&handshake_type, config.quic_config.as_ref()) {
-                (HandshakeType::Secio(key), Some(cfg)) => {
-                    match QuicEndpoint::new(key.clone(), cfg.clone()) {
-                        Ok(ep) => Ok(Some(Arc::new(ep) as Arc<dyn QuicEndpointHandle>)),
-                        Err(e) => {
-                            let msg = format!("failed to build quic endpoint: {:?}", e);
-                            log::error!("{}", msg);
-                            Err(msg)
-                        }
+        let quic_endpoint: std::result::Result<
+            Option<Arc<dyn QuicEndpointHandle>>,
+            String,
+        > = match (&handshake_type, config.quic_config.as_ref()) {
+            (HandshakeType::Secio(key), Some(cfg)) => {
+                match QuicEndpoint::new(key.clone(), cfg.clone()) {
+                    Ok(ep) => Ok(Some(Arc::new(ep) as Arc<dyn QuicEndpointHandle>)),
+                    Err(e) => {
+                        let msg = format!("failed to build quic endpoint: {:?}", e);
+                        log::error!("{}", msg);
+                        Err(msg)
                     }
                 }
-                _ => Ok(None),
-            };
+            }
+            _ => Ok(None),
+        };
 
         Service {
             handle,
@@ -519,10 +521,7 @@ where
     /// - `Err(msg)` (configured but `QuicEndpoint::new` failed)  →
     ///   `TransportErrorKind::QuicError(QuicErrorKind::TlsConfig(msg))`
     #[cfg(feature = "quic")]
-    fn resolve_quic_endpoint(
-        &self,
-        address: &Multiaddr,
-    ) -> Result<Arc<dyn QuicEndpointHandle>> {
+    fn resolve_quic_endpoint(&self, address: &Multiaddr) -> Result<Arc<dyn QuicEndpointHandle>> {
         match self.quic_endpoint.as_ref() {
             Ok(Some(ep)) => Ok(ep.clone()),
             Ok(None) => Err(TransportErrorKind::NotSupported(address.clone())),
