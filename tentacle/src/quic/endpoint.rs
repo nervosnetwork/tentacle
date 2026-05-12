@@ -103,6 +103,7 @@ impl<K: KeyProvider> QuicEndpoint<K> {
             &self.cert_der,
             &self.key_der,
             expected_peer_id,
+            &self.config,
         )?;
 
         // One-shot client-only endpoint per dial. Pooling/reuse is deferred
@@ -306,11 +307,16 @@ fn build_quinn_server_config<K: KeyProvider>(
 /// `expected_peer_id` is the `/p2p/<peer_id>` from the dial target multiaddr,
 /// if any. The resulting client config is single-use because the verifier
 /// captures `expected_peer_id`.
+///
+/// The same [`QuicConfig`]-derived transport parameters used by the listen
+/// side are applied here, so idle timeout, keep-alive interval, and stream
+/// limits behave symmetrically on dials.
 fn build_quinn_client_config<K: KeyProvider>(
     local_key: K,
     cert_der: &[u8],
     key_der: &[u8],
     expected_peer_id: Option<PeerId>,
+    config: &QuicConfig,
 ) -> Result<quinn::ClientConfig, QuicErrorKind> {
     let cert = CertificateDer::from(cert_der.to_vec());
     let key: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from(key_der.to_vec());
@@ -326,7 +332,9 @@ fn build_quinn_client_config<K: KeyProvider>(
 
     let quic_crypto = QuicClientConfig::try_from(rustls_cfg)
         .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    client_cfg.transport_config(Arc::new(build_transport_config(config)?));
+    Ok(client_cfg)
 }
 
 /// Convert a [`QuicConfig`] into a `quinn::TransportConfig`.
