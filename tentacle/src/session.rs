@@ -854,7 +854,7 @@ mod tests {
 
 /// Carrier for a successfully-handshaken QUIC session that needs to be
 /// registered with `InnerService`. Used by the listen task and by
-/// `dial_inner` to hand a [`crate::quic::QuicHandshake`] back to
+/// `dial_inner` to hand a [`crate::quic::session::QuicHandshake`] back to
 /// `InnerService` without coupling the `SessionEvent` enum to quinn types.
 #[cfg(feature = "quic")]
 pub(crate) struct QuicListenAccepted {
