@@ -601,7 +601,11 @@ where
                     // mismatch, dropped client, …). The endpoint is still
                     // alive — log and keep accepting.
                     Err(error) => {
-                        log::debug!("quic accept handshake failed: {:?}", error);
+                        log::debug!(
+                            "quic accept handshake failed: {:?} for address {:?}",
+                            error,
+                            listen_addr_for_loop
+                        );
                     }
                 }
             }
@@ -654,7 +658,7 @@ where
             // Tell the service main loop the listen completed.
             if let Err(err) = sender
                 .send(SessionEvent::ListenStart {
-                    listen_address: listen_address_for_start,
+                    listen_address: listen_address_for_start.clone(),
                     incoming: MultiIncoming::TcpUpgrade,
                 })
                 .await
@@ -683,7 +687,11 @@ where
                     // Per-connection handshake failure; endpoint is still
                     // alive — log and keep accepting.
                     Err(error) => {
-                        log::debug!("quic accept handshake failed: {:?}", error);
+                        log::debug!(
+                            "quic accept handshake failed: {:?} for address {:?}",
+                            error,
+                            listen_address_for_start
+                        );
                     }
                 }
             }
