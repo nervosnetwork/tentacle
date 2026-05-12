@@ -82,7 +82,7 @@ pub(crate) enum ProtocolEvent {
     Open {
         /// Protocol name
         proto_name: String,
-        /// Yamux sub stream handle handshake framed
+        /// Framed substream handle for the negotiated protocol
         substream: Box<Framed<SubstreamInner, LengthDelimitedCodec>>,
         /// Protocol version
         version: String,
