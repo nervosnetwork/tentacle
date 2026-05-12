@@ -1,0 +1,7 @@
+vector Bytes <byte>;
+array Uint8 [byte; 1];
+table TentacleQuicIdentityV1 {
+    version:      Uint8,
+    secio_pubkey: Bytes,
+    binding_sig:  Bytes,
+}

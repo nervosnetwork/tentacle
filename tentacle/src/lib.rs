@@ -142,6 +142,10 @@ pub(crate) mod transports;
 /// Some useful functions
 pub mod utils;
 
+/// Things related to QUIC
+#[cfg(feature = "quic")]
+pub mod quic;
+
 mod channel;
 #[cfg_attr(not(feature = "unstable"), doc(hidden))]
 #[cfg_attr(docsrs, doc(cfg(feature = "unstable")))]
