@@ -25,7 +25,7 @@ tentacle = { path = "../tentacle", default-features = false, features = [
     "wasm-timer",
 ] }
 wasm-bindgen-futures = "0.4"
-futures = "0.3"
+futures = "0.3.32"
 log = "0.4"
 wasm-logger = "0.2"
 

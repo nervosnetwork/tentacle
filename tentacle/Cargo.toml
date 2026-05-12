@@ -21,7 +21,7 @@ rustc-args = ["--cfg", "docsrs"]
 yamux = { path = "../yamux", version = "0.3.14", default-features = false, package = "tokio-yamux" }
 secio = { path = "../secio", version = "0.6.6", package = "tentacle-secio" }
 
-futures = { version = "0.3.0" }
+futures = { version = "0.3.32" }
 tokio = { version = "1.0.0", features = ["macros"] }
 tokio-util = { version = "0.7.0", features = ["codec"] }
 async-trait = "0.1"

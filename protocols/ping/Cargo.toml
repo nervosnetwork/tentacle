@@ -17,7 +17,7 @@ no-default-features = true
 [dependencies]
 p2p = { path = "../../tentacle", version = "0.3.0", package = "tentacle" }
 log = "0.4"
-futures = { version = "0.3.0" }
+futures = { version = "0.3.32" }
 bytes = "1.0.0"
 molecule = { version = "0.7.0" }
 
