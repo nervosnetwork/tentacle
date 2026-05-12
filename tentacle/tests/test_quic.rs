@@ -11,9 +11,11 @@
 //!    callback;
 //! 4. dialing with a mismatched `/p2p/<peer_id>` is rejected at
 //!    handshake time;
-//! 5. cross-transport calls are rejected with `NotSupported`
-//!    (TCP node dialing a QUIC address with no QUIC config, and a QUIC
-//!    node dialing a TCP address).
+//! 5. enabling QUIC does not regress the classic TCP path — a
+//!    QUIC-enabled service still routes plain `/tcp/` addresses through
+//!    the secio + yamux pipeline and can dial / listen on TCP normally;
+//! 6. a service **without** `quic_config(...)` dialing a `/quic-v1`
+//!    address is rejected with `TransportErrorKind::NotSupported`.
 //!
 //! Each test runs the server and client on dedicated tokio runtimes in
 //! their own threads, communicating over crossbeam / oneshot channels.
