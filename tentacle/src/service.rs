@@ -209,15 +209,10 @@ where
         // subsequent listen / dial calls can report a precise error
         // instead of collapsing into `NotSupported`.
         #[cfg(feature = "quic")]
-        let quic_endpoint: QuicEndpointSlot = match (
-            &handshake_type,
-            config.quic_config.as_ref(),
-        ) {
+        let quic_endpoint: QuicEndpointSlot = match (&handshake_type, config.quic_config.as_ref()) {
             (HandshakeType::Secio(key), Some(cfg)) => {
                 match QuicEndpoint::new(key.clone(), cfg.clone()) {
-                    Ok(ep) => {
-                        QuicEndpointSlot::Ready(Arc::new(ep) as Arc<dyn QuicEndpointHandle>)
-                    }
+                    Ok(ep) => QuicEndpointSlot::Ready(Arc::new(ep) as Arc<dyn QuicEndpointHandle>),
                     Err(e) => {
                         let msg = format!("failed to build quic endpoint: {:?}", e);
                         log::error!("{}", msg);

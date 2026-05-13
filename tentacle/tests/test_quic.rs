@@ -564,7 +564,9 @@ fn test_quic_not_enabled_rejected() {
             Err(TransportErrorKind::QuicError(QuicErrorKind::NotConfigured)) => (),
             other => panic!(
                 "expected TransportErrorKind::QuicError(NotConfigured), got {:?}",
-                other.map(|_| "Ok".to_string()).unwrap_or_else(|e| format!("{:?}", e))
+                other
+                    .map(|_| "Ok".to_string())
+                    .unwrap_or_else(|e| format!("{:?}", e))
             ),
         }
     });
