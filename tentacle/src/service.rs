@@ -78,6 +78,31 @@ struct SessionOpenContext {
     service_event_receiver: priority_mpsc::Receiver<SessionEvent>,
 }
 
+/// Outcome of resolving `(HandshakeType, quic_config)` at service
+/// construction time. Each variant is dispatched to a different user-
+/// visible error by [`InnerService::resolve_quic_endpoint`], so the
+/// caller can distinguish "user didn't enable QUIC" from "user enabled
+/// it incorrectly" from "user enabled it correctly but build failed".
+#[cfg(feature = "quic")]
+enum QuicEndpointSlot {
+    /// `(HandshakeType::Noop, None)` — neither secio nor QUIC was
+    /// requested. Dial / listen of `/quic-v1` surfaces as
+    /// [`TransportErrorKind::NotSupported`].
+    NotRequested,
+    /// `(HandshakeType::Secio, None)` — service has a secio identity
+    /// but `ServiceBuilder::quic_config(...)` was not called. Surfaces
+    /// as [`QuicErrorKind::NotConfigured`] so the user gets an
+    /// actionable hint instead of the generic `NotSupported`.
+    NotConfigured,
+    /// `(HandshakeType::Noop, Some)` — user enabled QUIC but the
+    /// service has no secio identity to bind into the TLS cert, or
+    /// `QuicEndpoint::new` failed at build time. Surfaces as
+    /// [`QuicErrorKind::Misconfigured`].
+    Misconfigured(String),
+    /// `(HandshakeType::Secio, Some)` and `QuicEndpoint::new` succeeded.
+    Ready(Arc<dyn QuicEndpointHandle>),
+}
+
 struct InnerService<K> {
     protocol_configs: IntMap<ProtocolId, ProtocolMeta>,
 
@@ -85,15 +110,12 @@ struct InnerService<K> {
 
     multi_transport: MultiTransport,
 
-    /// Three-state QUIC endpoint slot, surfaces a precise error to the
-    /// user when QUIC was requested in the builder but construction failed:
-    /// - `Ok(None)`: user did not call `ServiceBuilder::quic_config(...)` —
-    ///   dialing / listening on `/quic-v1` returns `NotSupported`.
-    /// - `Ok(Some(_))`: QUIC requested and ready.
-    /// - `Err(_)`: QUIC requested but [`QuicEndpoint::new`] failed at
-    ///   build time; surfaced as `TransportErrorKind::QuicError` on use.
+    /// Five-state QUIC endpoint slot capturing every distinct outcome of
+    /// `(HandshakeType, quic_config)` so each can be reported with a
+    /// precise error instead of collapsing into `NotSupported`.
+    /// See [`QuicEndpointSlot`] for the per-state user-visible error.
     #[cfg(feature = "quic")]
-    quic_endpoint: std::result::Result<Option<Arc<dyn QuicEndpointHandle>>, String>,
+    quic_endpoint: QuicEndpointSlot,
 
     handshake_type: HandshakeType<K>,
 
@@ -182,26 +204,37 @@ where
         let service_context = ServiceContext::new(task_sender, shutdown.clone());
 
         // QUIC endpoint is built up-front (binding nothing) so that listen /
-        // dial calls can clone it. Requires `HandshakeType::Secio(K)` since
-        // QUIC reuses the secio key for its TLS identity. Failures are
-        // stored so that subsequent `listen`/`dial` calls can surface a
-        // precise `QuicError` instead of a misleading `NotSupported`.
+        // dial calls can clone it. Each `(HandshakeType, quic_config)`
+        // combination is recorded as a distinct `QuicEndpointSlot` so
+        // subsequent listen / dial calls can report a precise error
+        // instead of collapsing into `NotSupported`.
         #[cfg(feature = "quic")]
-        let quic_endpoint: std::result::Result<
-            Option<Arc<dyn QuicEndpointHandle>>,
-            String,
-        > = match (&handshake_type, config.quic_config.as_ref()) {
+        let quic_endpoint: QuicEndpointSlot = match (
+            &handshake_type,
+            config.quic_config.as_ref(),
+        ) {
             (HandshakeType::Secio(key), Some(cfg)) => {
                 match QuicEndpoint::new(key.clone(), cfg.clone()) {
-                    Ok(ep) => Ok(Some(Arc::new(ep) as Arc<dyn QuicEndpointHandle>)),
+                    Ok(ep) => {
+                        QuicEndpointSlot::Ready(Arc::new(ep) as Arc<dyn QuicEndpointHandle>)
+                    }
                     Err(e) => {
                         let msg = format!("failed to build quic endpoint: {:?}", e);
                         log::error!("{}", msg);
-                        Err(msg)
+                        QuicEndpointSlot::Misconfigured(msg)
                     }
                 }
             }
-            _ => Ok(None),
+            (HandshakeType::Noop, Some(_)) => {
+                let msg = "ServiceBuilder::quic_config(...) was set but \
+                           HandshakeType::Noop has no secio identity to bind \
+                           into the QUIC TLS certificate"
+                    .to_string();
+                log::error!("{}", msg);
+                QuicEndpointSlot::Misconfigured(msg)
+            }
+            (HandshakeType::Secio(_), None) => QuicEndpointSlot::NotConfigured,
+            (HandshakeType::Noop, None) => QuicEndpointSlot::NotRequested,
         };
 
         Service {
@@ -515,18 +548,27 @@ where
     }
 
     /// Resolve the QUIC endpoint slot for an operation on `address`,
-    /// translating each of the three states into the appropriate caller
-    /// error:
-    /// - `Ok(None)` (QUIC not configured) → `TransportErrorKind::NotSupported`
-    /// - `Err(msg)` (configured but `QuicEndpoint::new` failed)  →
-    ///   `TransportErrorKind::QuicError(QuicErrorKind::TlsConfig(msg))`
+    /// translating each [`QuicEndpointSlot`] state into a distinct
+    /// user-visible error:
+    ///
+    /// | Slot                         | Surfaced error                                |
+    /// |------------------------------|-----------------------------------------------|
+    /// | `Ready(ep)`                  | `Ok(ep)`                                      |
+    /// | `NotRequested`               | `TransportErrorKind::NotSupported(addr)`      |
+    /// | `NotConfigured`              | `QuicError(QuicErrorKind::NotConfigured)`     |
+    /// | `Misconfigured(msg)`         | `QuicError(QuicErrorKind::Misconfigured(_))`  |
     #[cfg(feature = "quic")]
     fn resolve_quic_endpoint(&self, address: &Multiaddr) -> Result<Arc<dyn QuicEndpointHandle>> {
-        match self.quic_endpoint.as_ref() {
-            Ok(Some(ep)) => Ok(ep.clone()),
-            Ok(None) => Err(TransportErrorKind::NotSupported(address.clone())),
-            Err(msg) => Err(TransportErrorKind::QuicError(
-                crate::quic::error::QuicErrorKind::TlsConfig(msg.clone()),
+        match &self.quic_endpoint {
+            QuicEndpointSlot::Ready(ep) => Ok(ep.clone()),
+            QuicEndpointSlot::NotRequested => {
+                Err(TransportErrorKind::NotSupported(address.clone()))
+            }
+            QuicEndpointSlot::NotConfigured => Err(TransportErrorKind::QuicError(
+                crate::quic::error::QuicErrorKind::NotConfigured,
+            )),
+            QuicEndpointSlot::Misconfigured(msg) => Err(TransportErrorKind::QuicError(
+                crate::quic::error::QuicErrorKind::Misconfigured(msg.clone()),
             )),
         }
     }

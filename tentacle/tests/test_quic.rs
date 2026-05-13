@@ -14,8 +14,10 @@
 //! 5. enabling QUIC does not regress the classic TCP path — a
 //!    QUIC-enabled service still routes plain `/tcp/` addresses through
 //!    the secio + yamux pipeline and can dial / listen on TCP normally;
-//! 6. a service **without** `quic_config(...)` dialing a `/quic-v1`
-//!    address is rejected with `TransportErrorKind::NotSupported`.
+//! 6. a `HandshakeType::Secio` service that did **not** call
+//!    `quic_config(...)` dialing a `/quic-v1` address surfaces
+//!    `QuicError(NotConfigured)` — a precise, actionable hint instead
+//!    of the generic `NotSupported`.
 //!
 //! Each test runs the server and client on dedicated tokio runtimes in
 //! their own threads, communicating over crossbeam / oneshot channels.
@@ -533,16 +535,22 @@ fn test_quic_cross_transport_tcp_still_works() {
     assert!(collect(&client_rx, 3) >= 3, "client tcp echo");
 }
 
-/// Test 5b: a service WITHOUT QUIC enabled dialing a `/quic-v1` address
-/// must surface `TransportErrorKind::NotSupported`.
+/// Test 6: a `HandshakeType::Secio` service that did NOT call
+/// `ServiceBuilder::quic_config(...)` dialing a `/quic-v1` address must
+/// surface `QuicError(NotConfigured)` (not the misleading generic
+/// `NotSupported`). The user has a valid tentacle identity and the
+/// address shape is fine — they just forgot to opt into QUIC, and the
+/// error should hint exactly that.
 #[test]
 fn test_quic_not_enabled_rejected() {
+    use tentacle::quic::error::QuicErrorKind;
+
     let (c_meta, _) = make_echo_meta(1.into(), 1);
     let mut service = build_service(
         SecioKeyPair::secp256k1_generated(),
         vec![c_meta],
         (),
-        false, // no quic
+        false, // no quic_config(...)
     );
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async move {
@@ -553,10 +561,10 @@ fn test_quic_not_enabled_rejected() {
             )
             .await;
         match res {
-            Err(TransportErrorKind::NotSupported(_)) => (),
+            Err(TransportErrorKind::QuicError(QuicErrorKind::NotConfigured)) => (),
             other => panic!(
-                "expected TransportErrorKind::NotSupported, got {:?}",
-                other.map(|_| "Ok").unwrap_or("Err(other)")
+                "expected TransportErrorKind::QuicError(NotConfigured), got {:?}",
+                other.map(|_| "Ok".to_string()).unwrap_or_else(|e| format!("{:?}", e))
             ),
         }
     });

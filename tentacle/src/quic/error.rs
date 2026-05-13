@@ -44,4 +44,18 @@ pub enum QuicErrorKind {
     /// Peer did not present a TLS certificate during the QUIC handshake.
     #[error("Peer did not present a certificate")]
     NoPeerCert,
+
+    /// `ServiceBuilder::quic_config(...)` was not called, so the QUIC
+    /// transport is unavailable. Distinct from
+    /// [`crate::error::TransportErrorKind::NotSupported`]: the address
+    /// shape is fine, the service just hasn't opted into QUIC.
+    #[error("QUIC transport is not configured; call ServiceBuilder::quic_config(...) to enable")]
+    NotConfigured,
+
+    /// QUIC was requested via `ServiceBuilder::quic_config(...)` but the
+    /// service is internally inconsistent — e.g. `HandshakeType::Noop`
+    /// (QUIC's TLS identity binding requires a secio key), or
+    /// `QuicEndpoint::new` failed at build time.
+    #[error("QUIC misconfigured: {0}")]
+    Misconfigured(String),
 }
