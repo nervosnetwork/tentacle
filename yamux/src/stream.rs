@@ -600,14 +600,20 @@ impl Drop for StreamHandle {
             match self.state {
                 // LocalClosing means that local have sent Fin to the remote and waiting for a response.
                 StreamState::LocalClosing | StreamState::Reset => (),
-                // if not, we should send Rst first
+                // if not, we should send Rst (of Fin) first
                 StreamState::Established
                 | StreamState::Init
                 | StreamState::RemoteClosing
                 | StreamState::SynReceived
                 | StreamState::SynSent => {
                     let mut flags = self.get_flags();
-                    flags.add(Flag::Rst);
+                    // if the remote have sent Fin, we should send Fin to remote
+                    let flag = if self.state == StreamState::RemoteClosing {
+                        Flag::Fin
+                    } else {
+                        Flag::Rst
+                    };
+                    flags.add(flag);
                     let frame = Frame::new_window_update(flags, self.id, 0);
                     let rst_event = StreamEvent::Frame(frame);
 
