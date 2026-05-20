@@ -116,7 +116,11 @@ impl ServiceProtocol for PHandle {
             loop {
                 interval.tick().await;
                 let _ = interval_sender
-                    .send_message_to(session_id, 1.into(), Bytes::from("I am an interval message"))
+                    .send_message_to(
+                        session_id,
+                        1.into(),
+                        Bytes::from("I am an interval message"),
+                    )
                     .await;
             }
         };
@@ -317,8 +321,8 @@ fn client(pinned_dial_addr: Option<Multiaddr>) {
     // accepts any well-formed tentacle identity. With a pin, the verifier
     // additionally requires the derived PeerId to match `/p2p/<id>`; mismatch
     // aborts the TLS handshake.
-    let dial_addr: Multiaddr = pinned_dial_addr
-        .unwrap_or_else(|| "/ip4/127.0.0.1/udp/4433/quic-v1".parse().unwrap());
+    let dial_addr: Multiaddr =
+        pinned_dial_addr.unwrap_or_else(|| "/ip4/127.0.0.1/udp/4433/quic-v1".parse().unwrap());
 
     rt.block_on(async {
         let mut service = create_client();
