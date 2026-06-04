@@ -29,3 +29,15 @@ fn compatibility_test() {
         e => panic!("not expect protocol: {:?}", e),
     }
 }
+
+#[test]
+fn empty_test() {
+    let address = "/".parse::<Multiaddr>().unwrap_err();
+    assert_eq!(address.to_string(), "unknown protocol string");
+
+    let address = " ".parse::<Multiaddr>().unwrap_err();
+    assert_eq!(address.to_string(), "invalid multiaddr");
+
+    let address = "".parse::<Multiaddr>().unwrap_err();
+    assert_eq!(address.to_string(), "invalid multiaddr");
+}

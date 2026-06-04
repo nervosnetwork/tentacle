@@ -219,6 +219,9 @@ impl FromStr for Multiaddr {
             let p = Protocol::from_str_peek(&mut parts)?;
             p.write_to_bytes(&mut writer);
         }
+        if writer.is_empty() {
+            return Err(Error::InvalidMultiaddr);
+        }
 
         Ok(Multiaddr {
             bytes: writer.freeze(),
