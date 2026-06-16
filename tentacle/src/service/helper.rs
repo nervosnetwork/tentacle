@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::OwnedSemaphorePermit;
 use yamux::session::SessionType as YamuxType;
 
 use crate::{
@@ -80,6 +81,7 @@ pub(crate) struct HandshakeContext<K> {
     pub(crate) ty: SessionType,
     pub(crate) remote_address: Multiaddr,
     pub(crate) listen_address: Option<Multiaddr>,
+    pub(crate) connection_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<K> HandshakeContext<K>
@@ -111,6 +113,7 @@ where
                             ty: self.ty,
                             error: HandshakeErrorKind::Timeout(error.to_string()),
                             address: self.remote_address,
+                            connection_permit: self.connection_permit.take(),
                         }
                     }
                     Ok(res) => match res {
@@ -120,6 +123,7 @@ where
                             address: self.remote_address,
                             ty: self.ty,
                             listen_address: self.listen_address,
+                            connection_permit: self.connection_permit.take(),
                         },
                         Err(error) => {
                             debug!(
@@ -130,6 +134,7 @@ where
                                 ty: self.ty,
                                 error: HandshakeErrorKind::SecioError(error),
                                 address: self.remote_address,
+                                connection_permit: self.connection_permit.take(),
                             }
                         }
                     },
@@ -145,6 +150,7 @@ where
                     address: self.remote_address,
                     ty: self.ty,
                     listen_address: self.listen_address,
+                    connection_permit: self.connection_permit.take(),
                 };
                 if let Err(err) = self.event_sender.send(event).await {
                     error!("handshake result send back error: {:?}", err);
@@ -178,6 +184,27 @@ impl<K> Listener<K>
 where
     K: KeyProvider,
 {
+    fn is_retryable_accept_error(io_err: &io::Error) -> bool {
+        matches!(
+            io_err.kind(),
+            io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+        ) || {
+            #[cfg(unix)]
+            {
+                matches!(
+                    io_err.raw_os_error(),
+                    Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ECONNABORTED)
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
+    }
+
     fn close(&self, io_err: io::Error) {
         let mut event_sender = self.event_sender.clone();
         let mut future_sender = self.future_task_sender.clone();
@@ -383,8 +410,12 @@ where
         });
     }
 
-    fn handshake<H>(&self, socket: H, remote_address: Multiaddr)
-    where
+    fn handshake<H>(
+        &self,
+        socket: H,
+        remote_address: Multiaddr,
+        connection_permit: Option<OwnedSemaphorePermit>,
+    ) where
         H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
     {
         let handshake_task = HandshakeContext {
@@ -395,6 +426,7 @@ where
             event_sender: self.event_sender.clone(),
             max_frame_length: self.max_frame_length,
             timeout: self.timeout,
+            connection_permit,
         }
         .handshake(socket);
 
@@ -424,8 +456,8 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok((remote_address, socket)))) => {
-                self.handshake(socket, remote_address);
+            Poll::Ready(Some(Ok((remote_address, socket, connection_permit)))) => {
+                self.handshake(socket, remote_address, connection_permit);
                 Poll::Ready(Some(()))
             }
             Poll::Ready(None) => {
@@ -434,6 +466,15 @@ where
             }
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Err(err))) => {
+                if Self::is_retryable_accept_error(&err) {
+                    debug!("retryable listen accept error: {:?}", err);
+                    let waker = cx.waker().clone();
+                    crate::runtime::spawn(async move {
+                        crate::runtime::delay_for(Duration::from_millis(100)).await;
+                        waker.wake();
+                    });
+                    return Poll::Pending;
+                }
                 self.close(err);
                 Poll::Ready(None)
             }

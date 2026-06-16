@@ -40,6 +40,7 @@ use crate::{
     transports::{MultiStream, Result, TcpListenMode, TransportErrorKind, tcp_listen},
     utils::{multiaddr_to_socketaddr, socketaddr_to_multiaddr},
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub enum TcpBaseListenerEnum {
     Upgrade,
@@ -55,6 +56,7 @@ pub async fn bind(
     global: Arc<crate::lock::Mutex<HashMap<SocketAddr, UpgradeMode>>>,
     timeout: Duration,
     trusted_proxies: Arc<Vec<IpAddr>>,
+    connection_limiter: Option<Arc<Semaphore>>,
 ) -> Result<(Multiaddr, TcpBaseListenerEnum)> {
     let addr = address.await?;
     let upgrade_mode: UpgradeMode = listen_mode.into();
@@ -141,6 +143,7 @@ pub async fn bind(
                         upgrade_mode,
                         global,
                         trusted_proxies,
+                        connection_limiter,
                     );
                     #[cfg(feature = "tls")]
                     let tcp_listen = tcp_listen.tls_config(tls_server_config);
@@ -240,13 +243,14 @@ pub struct TcpBaseListener {
     upgrade_mode: UpgradeMode,
     timeout: Duration,
     local_addr: SocketAddr,
-    sender: Sender<(Multiaddr, MultiStream)>,
-    pending_stream: Receiver<(Multiaddr, MultiStream)>,
+    sender: Sender<(Multiaddr, MultiStream, Option<OwnedSemaphorePermit>)>,
+    pending_stream: Receiver<(Multiaddr, MultiStream, Option<OwnedSemaphorePermit>)>,
     global: Arc<crate::lock::Mutex<HashMap<SocketAddr, UpgradeMode>>>,
     #[cfg(feature = "tls")]
     tls_config: Arc<ServerConfig>,
     /// Trusted proxy addresses for HAProxy PROXY protocol and X-Forwarded-For header parsing.
     trusted_proxies: Arc<Vec<IpAddr>>,
+    connection_limiter: Option<Arc<Semaphore>>,
 }
 
 impl Drop for TcpBaseListener {
@@ -263,6 +267,7 @@ impl TcpBaseListener {
         upgrade_mode: UpgradeMode,
         global: Arc<crate::lock::Mutex<HashMap<SocketAddr, UpgradeMode>>>,
         trusted_proxies: Arc<Vec<IpAddr>>,
+        connection_limiter: Option<Arc<Semaphore>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(128);
 
@@ -281,6 +286,7 @@ impl TcpBaseListener {
                     .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new())),
             ),
             trusted_proxies,
+            connection_limiter,
         }
     }
 
@@ -290,7 +296,10 @@ impl TcpBaseListener {
         self
     }
 
-    fn poll_pending(&mut self, cx: &mut Context) -> Poll<(Multiaddr, MultiStream)> {
+    fn poll_pending(
+        &mut self,
+        cx: &mut Context,
+    ) -> Poll<(Multiaddr, MultiStream, Option<OwnedSemaphorePermit>)> {
         match Pin::new(&mut self.pending_stream).as_mut().poll_next(cx) {
             Poll::Ready(Some(res)) => Poll::Ready(res),
             Poll::Ready(None) | Poll::Pending => Poll::Pending,
@@ -309,6 +318,18 @@ impl TcpBaseListener {
                         let sender = self.sender.clone();
                         let upgrade_mode = self.upgrade_mode.to_enum();
                         let trusted_proxies = Arc::clone(&self.trusted_proxies);
+                        let connection_permit =
+                            if let Some(limiter) = self.connection_limiter.as_ref() {
+                                match limiter.clone().try_acquire_owned() {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => {
+                                        debug!("connection limit reached, dropping inbound stream");
+                                        return Poll::Ready(Ok(()));
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                         #[cfg(feature = "tls")]
                         let acceptor = TlsAcceptor::from(Arc::clone(&self.tls_config));
                         crate::runtime::spawn(protocol_select(
@@ -318,6 +339,7 @@ impl TcpBaseListener {
                             sender,
                             remote_address,
                             trusted_proxies,
+                            connection_permit,
                             #[cfg(feature = "tls")]
                             acceptor,
                         ));
@@ -334,7 +356,8 @@ impl TcpBaseListener {
 }
 
 impl Stream for TcpBaseListener {
-    type Item = std::result::Result<(Multiaddr, MultiStream), io::Error>;
+    type Item =
+        std::result::Result<(Multiaddr, MultiStream, Option<OwnedSemaphorePermit>), io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Poll::Ready(res) = self.poll_pending(cx) {
@@ -360,9 +383,10 @@ async fn protocol_select(
     mut stream: TcpStream,
     timeout: Duration,
     #[allow(unused_mut)] mut upgrade_mode: UpgradeModeEnum,
-    mut sender: Sender<(Multiaddr, MultiStream)>,
+    mut sender: Sender<(Multiaddr, MultiStream, Option<OwnedSemaphorePermit>)>,
     #[allow(unused_mut)] mut remote_address: SocketAddr,
     trusted_proxies: Arc<Vec<IpAddr>>,
+    connection_permit: Option<OwnedSemaphorePermit>,
     #[cfg(feature = "tls")] acceptor: TlsAcceptor,
 ) {
     let mut peek_buf = [0u8; 16];
@@ -413,6 +437,7 @@ async fn protocol_select(
                     .send((
                         socketaddr_to_multiaddr(remote_address),
                         MultiStream::Tcp(stream),
+                        connection_permit,
                     ))
                     .await
                     .is_err()
@@ -438,7 +463,11 @@ async fn protocol_select(
                             let mut addr = socketaddr_to_multiaddr(remote_address);
                             addr.push(Protocol::Ws);
                             if sender
-                                .send((addr, MultiStream::Ws(Box::new(WsStream::new(stream)))))
+                                .send((
+                                    addr,
+                                    MultiStream::Ws(Box::new(WsStream::new(stream))),
+                                    connection_permit,
+                                ))
                                 .await
                                 .is_err()
                             {
@@ -471,7 +500,7 @@ async fn protocol_select(
                             let mut addr = socketaddr_to_multiaddr(remote_address);
                             addr.push(Protocol::Tls(Cow::Borrowed("")));
                             if sender
-                                .send((addr, MultiStream::Tls(Box::new(stream))))
+                                .send((addr, MultiStream::Tls(Box::new(stream)), connection_permit))
                                 .await
                                 .is_err()
                             {
