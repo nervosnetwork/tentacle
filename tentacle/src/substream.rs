@@ -199,22 +199,24 @@ where
     }
 
     /// Send data to the lower `yamux` sub stream
-    fn send_data(&mut self, cx: &mut Context) -> Result<(), io::Error> {
+    fn send_data(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
         while let Some(frame) = self.high_write_buf.pop_front() {
             if self.send_inner(cx, frame, Priority::High)? {
-                return Ok(());
+                return Ok(true);
             }
         }
 
         while let Some(frame) = self.write_buf.pop_front() {
             if self.send_inner(cx, frame, Priority::Normal)? {
-                return Ok(());
+                return Ok(true);
             }
         }
 
-        self.poll_complete(cx)?;
+        self.poll_complete(cx)
+    }
 
-        Ok(())
+    fn has_write_backpressure(&self) -> bool {
+        self.high_write_buf.len() + self.write_buf.len() > self.config.send_event_size()
     }
 
     /// https://docs.rs/tokio/0.1.19/tokio/prelude/trait.Sink.html
@@ -303,27 +305,35 @@ where
     }
 
     /// Handling commands send by session
-    fn handle_proto_event(&mut self, cx: &mut Context, event: ProtocolEvent, priority: Priority) {
+    fn handle_proto_event(
+        &mut self,
+        cx: &mut Context,
+        event: ProtocolEvent,
+        priority: Priority,
+    ) -> bool {
         match event {
             ProtocolEvent::Message { data } => {
                 self.push_back(priority, data);
 
-                if let Err(err) = self.send_data(cx) {
-                    // Whether it is a read send error or a flush error,
-                    // the most essential problem is that there is a problem with the external network.
-                    // Close the protocol stream directly.
-                    debug!(
-                        "protocol [{}] close because of extern network",
-                        self.proto_id
-                    );
-                    self.output_event(
-                        cx,
-                        ProtocolEvent::Error {
-                            proto_id: self.proto_id,
-                            error: err,
-                        },
-                    );
-                    self.dead = true;
+                match self.send_data(cx) {
+                    Ok(is_pending) => return is_pending,
+                    Err(err) => {
+                        // Whether it is a read send error or a flush error,
+                        // the most essential problem is that there is a problem with the external network.
+                        // Close the protocol stream directly.
+                        debug!(
+                            "protocol [{}] close because of extern network",
+                            self.proto_id
+                        );
+                        self.output_event(
+                            cx,
+                            ProtocolEvent::Error {
+                                proto_id: self.proto_id,
+                                error: err,
+                            },
+                        );
+                        self.dead = true;
+                    }
                 }
             }
             ProtocolEvent::Close { .. } => {
@@ -332,6 +342,7 @@ where
             }
             _ => (),
         }
+        false
     }
 
     fn distribute_to_user_level(&mut self, cx: &mut Context) {
@@ -375,14 +386,17 @@ where
             return Poll::Ready(None);
         }
 
-        if self.write_buf.len() > self.config.send_event_size() {
+        if self.has_write_backpressure() {
             return Poll::Pending;
         }
 
         match Pin::new(&mut self.event_receiver).as_mut().poll_next(cx) {
             Poll::Ready(Some((priority, event))) => {
-                self.handle_proto_event(cx, event, priority);
-                Poll::Ready(Some(()))
+                if self.handle_proto_event(cx, event, priority) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Some(()))
+                }
             }
             Poll::Ready(None) => {
                 // Must be session close
@@ -460,8 +474,8 @@ where
     }
 
     #[inline]
-    fn flush(&mut self, cx: &mut Context) -> Result<(), io::Error> {
-        self.poll_complete(cx)?;
+    fn flush(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
+        let mut is_pending = self.poll_complete(cx)?;
         if !self
             .service_proto_sender
             .as_ref()
@@ -483,12 +497,11 @@ where
             self.output(cx);
 
             match self.send_data(cx) {
-                Ok(()) => Ok(()),
-                Err(err) => Err(err),
+                Ok(pending) => is_pending |= pending,
+                Err(err) => return Err(err),
             }
-        } else {
-            Ok(())
         }
+        Ok(is_pending)
     }
 }
 
@@ -509,14 +522,17 @@ where
             return Poll::Ready(None);
         }
 
-        if let Err(err) = self.flush(cx) {
-            debug!(
-                "Substream({}) finished with flush error: {:?}",
-                self.id, err
-            );
-            self.error_close(cx, err);
-            return Poll::Ready(None);
-        }
+        let write_pending = match self.flush(cx) {
+            Ok(pending) => pending,
+            Err(err) => {
+                debug!(
+                    "Substream({}) finished with flush error: {:?}",
+                    self.id, err
+                );
+                self.error_close(cx, err);
+                return Poll::Ready(None);
+            }
+        };
 
         debug!(
             "Substream({}) write buf: {}, read buf: {}",
@@ -529,7 +545,11 @@ where
 
         let mut is_pending = self.recv_frame(cx).is_pending();
 
-        is_pending &= self.recv_event(cx).is_pending();
+        is_pending &= if write_pending {
+            true
+        } else {
+            self.recv_event(cx).is_pending()
+        };
 
         if is_pending {
             Poll::Pending
@@ -716,27 +736,29 @@ where
     }
 
     /// Send data to the lower `yamux` sub stream
-    fn send_data(&mut self, cx: &mut Context) -> Result<(), io::Error> {
+    fn send_data(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
         while let Some(frame) = self.high_write_buf.pop_front() {
             if self.send_inner(cx, frame, Priority::High)? {
-                return Ok(());
+                return Ok(true);
             }
         }
 
         while let Some(frame) = self.write_buf.pop_front() {
             if self.send_inner(cx, frame, Priority::Normal)? {
-                return Ok(());
+                return Ok(true);
             }
         }
 
-        self.poll_complete(cx)?;
+        self.poll_complete(cx)
+    }
 
-        Ok(())
+    fn has_write_backpressure(&self) -> bool {
+        self.high_write_buf.len() + self.write_buf.len() > self.config.send_event_size()
     }
 
     #[inline]
-    fn flush(&mut self, cx: &mut Context) -> Result<(), io::Error> {
-        self.poll_complete(cx)?;
+    fn flush(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
+        let mut is_pending = self.poll_complete(cx)?;
         if !self.event_sender.is_empty()
             || !self.write_buf.is_empty()
             || !self.high_write_buf.is_empty()
@@ -744,36 +766,43 @@ where
             self.output(cx);
 
             match self.send_data(cx) {
-                Ok(()) => Ok(()),
-                Err(err) => Err(err),
+                Ok(pending) => is_pending |= pending,
+                Err(err) => return Err(err),
             }
-        } else {
-            Ok(())
         }
+        Ok(is_pending)
     }
 
     /// Handling commands send by session
-    fn handle_proto_event(&mut self, cx: &mut Context, event: ProtocolEvent, priority: Priority) {
+    fn handle_proto_event(
+        &mut self,
+        cx: &mut Context,
+        event: ProtocolEvent,
+        priority: Priority,
+    ) -> bool {
         match event {
             ProtocolEvent::Message { data } => {
                 self.push_back(priority, data);
 
-                if let Err(err) = self.send_data(cx) {
-                    // Whether it is a read send error or a flush error,
-                    // the most essential problem is that there is a problem with the external network.
-                    // Close the protocol stream directly.
-                    debug!(
-                        "protocol [{}] close because of extern network",
-                        self.proto_id
-                    );
-                    self.output_event(
-                        cx,
-                        ProtocolEvent::Error {
-                            proto_id: self.proto_id,
-                            error: err,
-                        },
-                    );
-                    self.dead = true;
+                match self.send_data(cx) {
+                    Ok(is_pending) => return is_pending,
+                    Err(err) => {
+                        // Whether it is a read send error or a flush error,
+                        // the most essential problem is that there is a problem with the external network.
+                        // Close the protocol stream directly.
+                        debug!(
+                            "protocol [{}] close because of extern network",
+                            self.proto_id
+                        );
+                        self.output_event(
+                            cx,
+                            ProtocolEvent::Error {
+                                proto_id: self.proto_id,
+                                error: err,
+                            },
+                        );
+                        self.dead = true;
+                    }
                 }
             }
             ProtocolEvent::Close { .. } => {
@@ -782,6 +811,7 @@ where
             }
             _ => (),
         }
+        false
     }
 
     fn recv_event(&mut self, cx: &mut Context) -> Poll<Option<()>> {
@@ -789,14 +819,17 @@ where
             return Poll::Ready(None);
         }
 
-        if self.write_buf.len() > self.config.send_event_size() {
+        if self.has_write_backpressure() {
             return Poll::Pending;
         }
 
         match Pin::new(&mut self.event_receiver).as_mut().poll_next(cx) {
             Poll::Ready(Some((priority, event))) => {
-                self.handle_proto_event(cx, event, priority);
-                Poll::Ready(Some(()))
+                if self.handle_proto_event(cx, event, priority) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Some(()))
+                }
             }
             Poll::Ready(None) => {
                 // Must be session close
@@ -883,14 +916,17 @@ where
             return Poll::Ready(None);
         }
 
-        if let Err(err) = self.flush(cx) {
-            debug!(
-                "Substream({}) finished with flush error: {:?}",
-                self.id, err
-            );
-            self.error_close(cx, err);
-            return Poll::Ready(None);
-        }
+        let write_pending = match self.flush(cx) {
+            Ok(pending) => pending,
+            Err(err) => {
+                debug!(
+                    "Substream({}) finished with flush error: {:?}",
+                    self.id, err
+                );
+                self.error_close(cx, err);
+                return Poll::Ready(None);
+            }
+        };
 
         debug!(
             "Substream({}) write buf: {}, read buf: {}",
@@ -901,7 +937,7 @@ where
 
         futures::ready!(crate::runtime::poll_proceed(cx));
 
-        let is_pending = self.recv_event(cx).is_pending();
+        let is_pending = write_pending || self.recv_event(cx).is_pending();
 
         if is_pending {
             Poll::Pending
