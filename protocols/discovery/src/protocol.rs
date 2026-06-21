@@ -122,19 +122,18 @@ impl DiscoveryMessage {
             .as_bytes()
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
     pub fn decode(data: &[u8]) -> Option<Self> {
         let reader = protocol_mol::DiscoveryMessageReader::from_compatible_slice(data).ok()?;
         match reader.payload().to_enum() {
             protocol_mol::DiscoveryPayloadUnionReader::GetNodes(reader) => {
-                let le = reader.version().raw_data().as_ptr() as *const u32;
-                let version = u32::from_le(unsafe { *le });
-                let le = reader.count().raw_data().as_ptr() as *const u32;
-                let count = u32::from_le(unsafe { *le });
-                let listen_port = reader.listen_port().to_opt().map(|port_reader| {
-                    let le = port_reader.raw_data().as_ptr() as *const u16;
-                    u16::from_le(unsafe { *le })
-                });
+                let version = u32::from_le_bytes(reader.version().raw_data().try_into().ok()?);
+                let count = u32::from_le_bytes(reader.count().raw_data().try_into().ok()?);
+                let listen_port = match reader.listen_port().to_opt() {
+                    Some(port_reader) => {
+                        Some(u16::from_le_bytes(port_reader.raw_data().try_into().ok()?))
+                    }
+                    None => None,
+                };
                 Some(DiscoveryMessage::GetNodes {
                     version,
                     count,
