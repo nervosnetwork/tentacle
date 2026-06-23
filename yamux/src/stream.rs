@@ -25,6 +25,8 @@ use crate::{
     frame::{Flag, Flags, Frame, Type},
 };
 
+const MAX_FRAMES_PER_POLL: usize = 64;
+
 /// The substream
 #[derive(Debug)]
 pub struct StreamHandle {
@@ -270,7 +272,7 @@ impl StreamHandle {
     fn recv_frames(&mut self, cx: &mut Context) -> Result<bool, Error> {
         trace!("stream-handle({}) recv_frames", self.id);
         let mut has_new_frame = false;
-        loop {
+        for _ in 0..MAX_FRAMES_PER_POLL {
             match self.state {
                 StreamState::RemoteClosing => {
                     return Err(Error::SubStreamRemoteClosing);
@@ -295,15 +297,16 @@ impl StreamHandle {
                     self.state = StreamState::RemoteClosing;
                     return Err(Error::SubStreamRemoteClosing);
                 }
-                Poll::Pending => break,
+                Poll::Pending => return Ok(has_new_frame),
             }
         }
+        cx.waker().wake_by_ref();
         Ok(has_new_frame)
     }
 
-    fn try_recv_frames(&mut self) -> Result<bool, Error> {
+    fn try_recv_frames(&mut self) -> Result<(bool, bool), Error> {
         let mut has_new_frame = false;
-        loop {
+        for _ in 0..MAX_FRAMES_PER_POLL {
             match self.state {
                 StreamState::RemoteClosing => {
                     return Err(Error::SubStreamRemoteClosing);
@@ -328,17 +331,19 @@ impl StreamHandle {
                     self.state = StreamState::RemoteClosing;
                     return Err(Error::SubStreamRemoteClosing);
                 }
-                Err(futures::channel::mpsc::TryRecvError::Empty) => break,
+                Err(futures::channel::mpsc::TryRecvError::Empty) => {
+                    return Ok((has_new_frame, false));
+                }
             }
         }
-        Ok(has_new_frame)
+        Ok((has_new_frame, true))
     }
 
-    fn recv_frames_wake(&mut self) -> Result<(), Error> {
+    fn recv_frames_wake(&mut self, cx: &mut Context) -> Result<(), Error> {
         let buf_len = self.read_buf.len();
         let state = self.state;
         match self.try_recv_frames() {
-            Ok(should_wake_read) => {
+            Ok((should_wake_read, budget_exhausted)) => {
                 // if state change to RemoteClosing, wake read
                 // if read buf len change, wake read
                 if (self.state == StreamState::RemoteClosing && state != StreamState::RemoteClosing)
@@ -347,6 +352,9 @@ impl StreamHandle {
                     if let Some(waker) = self.readable_wake.take() {
                         waker.wake();
                     }
+                }
+                if budget_exhausted {
+                    cx.waker().wake_by_ref();
                 }
 
                 Ok(())
@@ -537,7 +545,7 @@ impl AsyncWrite for StreamHandle {
         // When the session receives a window update frame, it can update the state of the stream.
         // In the implementation here, we try not to share state between the session and the stream.
         if let Err(Error::UnexpectedFlag | Error::RecvWindowExceeded | Error::InvalidMsgType) =
-            self.recv_frames_wake()
+            self.recv_frames_wake(cx)
         {
             // read flag error or read data error
             self.send_go_away();
@@ -655,7 +663,7 @@ pub enum StreamState {
 
 #[cfg(test)]
 mod test {
-    use super::{StreamEvent, StreamHandle, StreamState};
+    use super::{MAX_FRAMES_PER_POLL, StreamEvent, StreamHandle, StreamState};
     use crate::{
         config::INITIAL_STREAM_WINDOW,
         frame::{Flag, Flags, Frame, Type},
@@ -993,6 +1001,41 @@ mod test {
             assert_eq!(&b[..2], b"23");
             assert_eq!(stream.read_buf.len(), 1);
             assert_eq!(stream.read_buf.capacity(), 4);
+        });
+    }
+
+    #[test]
+    fn test_read_frames_respects_per_poll_budget() {
+        let rt = rt();
+        rt.block_on(async {
+            let (mut frame_sender, frame_receiver) = channel(128);
+            let (unbound_sender, _unbound_receiver) = unbounded();
+            let mut stream = StreamHandle::new(
+                0,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                INITIAL_STREAM_WINDOW,
+            );
+
+            for _ in 0..MAX_FRAMES_PER_POLL + 1 {
+                let frame = Frame::new_data(Flags::from(Flag::Syn), 0, BytesMut::from(&[1][..]));
+                frame_sender.send(frame).await.unwrap();
+            }
+
+            let waker = Arc::new(FlagWaker::default());
+            let waker_ref = waker_ref(&waker);
+            let mut cx = Context::from_waker(&waker_ref);
+            let mut output = [0; 128];
+            let mut read_buf = ReadBuf::new(&mut output);
+
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_read(&mut cx, &mut read_buf)
+                    .is_ready()
+            );
+            assert_eq!(read_buf.filled().len(), MAX_FRAMES_PER_POLL);
+            assert!(waker.woken());
         });
     }
 
