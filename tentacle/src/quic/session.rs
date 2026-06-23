@@ -299,6 +299,16 @@ impl QuicSession {
     }
 
     #[inline]
+    fn pending_substream_events(&self) -> usize {
+        self.substreams.values().map(PriorityBuffer::len).sum()
+    }
+
+    #[inline]
+    fn substream_events_full(&self) -> bool {
+        self.pending_substream_events() > self.config.send_event_size()
+    }
+
+    #[inline]
     fn distribute_to_substream(&mut self, cx: &mut Context) {
         for buffer in self
             .substreams
@@ -594,6 +604,10 @@ impl QuicSession {
     }
 
     fn recv_service(&mut self, cx: &mut Context) -> Poll<Option<()>> {
+        if self.substream_events_full() {
+            return Poll::Pending;
+        }
+
         match Pin::new(&mut self.service_receiver).as_mut().poll_next(cx) {
             Poll::Ready(Some((priority, event))) => {
                 if !self.state.is_normal() {
