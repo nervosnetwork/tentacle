@@ -75,6 +75,16 @@ impl AsyncWrite for SubstreamInner {
     }
 }
 
+/// Roll back the session pending byte counter for a dropped outbound protocol
+/// message. No-op for non-`Message` variants since only `Message` carries
+/// bytes accounted in `SessionContext::pending_data_size`.
+#[inline]
+pub(crate) fn decr_pending_protocol_message(context: &SessionContext, event: ProtocolEvent) {
+    if let ProtocolEvent::Message { data } = event {
+        context.decr_pending_data_size(data.len());
+    }
+}
+
 /// Event generated/received by the protocol stream
 #[derive(Debug)]
 pub(crate) enum ProtocolEvent {
@@ -249,6 +259,16 @@ where
     /// Close protocol sub stream
     fn close_proto_stream(&mut self, cx: &mut Context) {
         self.event_receiver.close();
+        // Drain any in-flight messages that the session pushed into our event
+        // channel but have not yet been polled. Their bytes were counted into
+        // `pending_data_size` when the service enqueued them; if we drop them
+        // silently the counter would leak.
+        while let Ok(Some((_, event))) = self.event_receiver.try_next() {
+            decr_pending_protocol_message(&self.context, event);
+        }
+        // Any frames still queued here will be dropped together with this
+        // substream, roll back their pending byte accounting before dropping.
+        self.clear_write_buffers();
         if let Poll::Ready(Err(e)) = Pin::new(self.substream.get_mut()).poll_shutdown(cx) {
             log::trace!("sub stream poll shutdown err {}", e)
         }
@@ -304,6 +324,9 @@ where
     /// When send or receive message error, output error and close stream
     fn error_close(&mut self, cx: &mut Context, error: io::Error) {
         self.dead = true;
+        // Roll back pending bytes for any frames still queued: this substream
+        // is going away and they will not be sent.
+        self.clear_write_buffers();
         match error.kind() {
             ErrorKind::BrokenPipe
             | ErrorKind::ConnectionAborted
@@ -849,6 +872,9 @@ where
     /// When send or receive message error, output error and close stream
     fn error_close(&mut self, cx: &mut Context, error: io::Error) {
         self.dead = true;
+        // Roll back pending bytes for any frames still queued: this substream
+        // is going away and they will not be sent.
+        self.clear_write_buffers();
         match error.kind() {
             ErrorKind::BrokenPipe
             | ErrorKind::ConnectionAborted
@@ -866,6 +892,16 @@ where
 
     fn close_proto_stream(&mut self, cx: &mut Context) {
         self.event_receiver.close();
+        // Drain any in-flight messages that the session pushed into our event
+        // channel but have not yet been polled. Their bytes were counted into
+        // `pending_data_size` when the service enqueued them; if we drop them
+        // silently the counter would leak.
+        while let Ok(Some((_, event))) = self.event_receiver.try_next() {
+            decr_pending_protocol_message(&self.context, event);
+        }
+        // Any frames still queued here will be dropped together with this
+        // substream, roll back their pending byte accounting before dropping.
+        self.clear_write_buffers();
         if let Poll::Ready(Err(e)) = Pin::new(&mut self.substream).poll_close(cx) {
             log::trace!("sub stream poll shutdown err {}", e)
         }
