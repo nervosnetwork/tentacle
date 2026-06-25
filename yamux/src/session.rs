@@ -264,8 +264,7 @@ where
     fn write_stalled(&self) -> bool {
         match self.write_pending_since {
             Some(since) => {
-                self.now().saturating_duration_since(since)
-                    > self.config.connection_write_timeout
+                self.now().saturating_duration_since(since) > self.config.connection_write_timeout
             }
             None => false,
         }
