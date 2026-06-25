@@ -172,6 +172,16 @@ where
         }
     }
 
+    fn clear_write_buffers(&mut self) {
+        let data_size = self
+            .high_write_buf
+            .drain(..)
+            .chain(self.write_buf.drain(..))
+            .map(|frame| frame.len())
+            .sum();
+        self.context.decr_pending_data_size(data_size);
+    }
+
     /// Sink `start_send` Ready -> data send to buffer
     /// Sink `start_send` NotReady -> buffer full need poll complete
     #[inline]
@@ -184,11 +194,18 @@ where
         let data_size = frame.len();
         let mut sink = Pin::new(&mut self.substream);
 
-        match sink.as_mut().poll_ready(cx)? {
-            Poll::Ready(()) => {
-                sink.as_mut().start_send(frame)?;
+        match sink.as_mut().poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                if let Err(err) = sink.as_mut().start_send(frame) {
+                    self.context.decr_pending_data_size(data_size);
+                    return Err(err);
+                }
                 self.context.decr_pending_data_size(data_size);
                 Ok(false)
+            }
+            Poll::Ready(Err(err)) => {
+                self.context.decr_pending_data_size(data_size);
+                Err(err)
             }
             Poll::Pending => {
                 self.push_front(priority, frame);
@@ -323,11 +340,12 @@ where
                             error: err,
                         },
                     );
+                    self.clear_write_buffers();
                     self.dead = true;
                 }
             }
             ProtocolEvent::Close { .. } => {
-                self.write_buf.clear();
+                self.clear_write_buffers();
                 self.dead = true;
             }
             _ => (),
@@ -682,6 +700,16 @@ where
         }
     }
 
+    fn clear_write_buffers(&mut self) {
+        let data_size = self
+            .high_write_buf
+            .drain(..)
+            .chain(self.write_buf.drain(..))
+            .map(|frame| frame.len())
+            .sum();
+        self.context.decr_pending_data_size(data_size);
+    }
+
     /// Sink `start_send` Ready -> data send to buffer
     /// Sink `start_send` NotReady -> buffer full need poll complete
     #[inline]
@@ -694,11 +722,18 @@ where
         let data_size = frame.len();
         let mut sink = Pin::new(&mut self.substream);
 
-        match sink.as_mut().poll_ready(cx)? {
-            Poll::Ready(()) => {
-                sink.as_mut().start_send(frame)?;
+        match sink.as_mut().poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                if let Err(err) = sink.as_mut().start_send(frame) {
+                    self.context.decr_pending_data_size(data_size);
+                    return Err(err);
+                }
                 self.context.decr_pending_data_size(data_size);
                 Ok(false)
+            }
+            Poll::Ready(Err(err)) => {
+                self.context.decr_pending_data_size(data_size);
+                Err(err)
             }
             Poll::Pending => {
                 self.push_front(priority, frame);
@@ -773,11 +808,12 @@ where
                             error: err,
                         },
                     );
+                    self.clear_write_buffers();
                     self.dead = true;
                 }
             }
             ProtocolEvent::Close { .. } => {
-                self.write_buf.clear();
+                self.clear_write_buffers();
                 self.dead = true;
             }
             _ => (),

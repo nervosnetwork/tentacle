@@ -35,6 +35,12 @@ use crate::{
     transports::MultiIncoming,
 };
 
+fn decr_pending_protocol_message(context: &SessionContext, event: ProtocolEvent) {
+    if let ProtocolEvent::Message { data } = event {
+        context.decr_pending_data_size(data.len());
+    }
+}
+
 pub trait AsyncRw: AsyncWrite + AsyncRead {}
 
 impl<T: AsyncRead + AsyncWrite> AsyncRw for T {}
@@ -362,12 +368,15 @@ impl Session {
 
     #[inline]
     fn distribute_to_substream(&mut self, cx: &mut Context) {
+        let context = self.context.clone();
         for buffer in self
             .substreams
             .values_mut()
             .filter(|buffer| !buffer.is_empty())
         {
-            if let SendResult::Pending = buffer.try_send(cx) {
+            if let SendResult::Pending = buffer
+                .try_send_with_drop(cx, |event| decr_pending_protocol_message(&context, event))
+            {
                 if self.context.pending_data_size() > self.config.send_buffer_size {
                     self.state = SessionState::Abnormal;
                     warn!(
@@ -378,7 +387,7 @@ impl Session {
                         self.config.send_buffer_size,
                         self.context.pending_data_size()
                     );
-                    buffer.clear();
+                    buffer.clear_with(|event| decr_pending_protocol_message(&context, event));
                     self.event_output(
                         cx,
                         SessionEvent::ChangeState {
@@ -567,17 +576,23 @@ impl Session {
     fn handle_session_event(&mut self, cx: &mut Context, event: SessionEvent, priority: Priority) {
         match event {
             SessionEvent::ProtocolMessage { proto_id, data, .. } => {
-                if let Some(stream_id) = self.proto_streams.get(&proto_id) {
-                    if let Some(buffer) = self.substreams.get_mut(stream_id) {
-                        let event = ProtocolEvent::Message { data };
-                        if priority.is_high() {
-                            buffer.push_high(event)
-                        } else {
-                            buffer.push_normal(event)
-                        }
-                        buffer.try_send(cx);
+                if let Some(buffer) = self
+                    .proto_streams
+                    .get(&proto_id)
+                    .and_then(|stream_id| self.substreams.get_mut(stream_id))
+                {
+                    let context = self.context.clone();
+                    let event = ProtocolEvent::Message { data };
+                    if priority.is_high() {
+                        buffer.push_high(event)
+                    } else {
+                        buffer.push_normal(event)
                     }
+                    buffer.try_send_with_drop(cx, |event| {
+                        decr_pending_protocol_message(&context, event)
+                    });
                 } else {
+                    self.context.decr_pending_data_size(data.len());
                     trace!("protocol {} not ready", proto_id);
                 }
             }
