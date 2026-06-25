@@ -17,7 +17,7 @@ use crate::{
     ProtocolId, StreamId,
     buffer::{Buffer, SendResult},
     builder::BeforeReceive,
-    channel::{mpsc as priority_mpsc, mpsc::Priority},
+    channel::{QuickSinkExt, mpsc as priority_mpsc, mpsc::Priority},
     context::SessionContext,
     protocol_handle_stream::{ServiceProtocolEvent, SessionProtocolEvent},
     service::config::SessionConfig,
@@ -133,6 +133,7 @@ pub(crate) struct Substream<U> {
     event_sender: Buffer<ProtocolEvent>,
     /// Receive events from session
     event_receiver: priority_mpsc::Receiver<ProtocolEvent>,
+    pending_event: Option<(Priority, ProtocolEvent)>,
 
     service_proto_sender: Option<Buffer<ServiceProtocolEvent>>,
     session_proto_sender: Option<Buffer<SessionProtocolEvent>>,
@@ -337,6 +338,7 @@ where
                 }
             }
             ProtocolEvent::Close { .. } => {
+                self.high_write_buf.clear();
                 self.write_buf.clear();
                 self.dead = true;
             }
@@ -381,17 +383,33 @@ where
         }
     }
 
-    fn recv_event(&mut self, cx: &mut Context) -> Poll<Option<()>> {
+    fn recv_event(&mut self, cx: &mut Context, allow_data: bool) -> Poll<Option<()>> {
         if self.dead {
             return Poll::Ready(None);
         }
 
-        if self.has_write_backpressure() {
+        if self.has_write_backpressure() && allow_data {
             return Poll::Pending;
         }
 
-        match Pin::new(&mut self.event_receiver).as_mut().poll_next(cx) {
+        let next_event = if let Some(event) = self.pending_event.take() {
+            Poll::Ready(Some(event))
+        } else if allow_data {
+            Pin::new(&mut self.event_receiver).as_mut().poll_next(cx)
+        } else {
+            match self.event_receiver.try_next_high() {
+                Ok(Some(event)) => Poll::Ready(Some((Priority::High, event))),
+                Ok(None) => Poll::Ready(None),
+                Err(_) => Poll::Pending,
+            }
+        };
+
+        match next_event {
             Poll::Ready(Some((priority, event))) => {
+                if !allow_data && matches!(event, ProtocolEvent::Message { .. }) {
+                    self.pending_event = Some((priority, event));
+                    return Poll::Pending;
+                }
                 if self.handle_proto_event(cx, event, priority) {
                     Poll::Pending
                 } else {
@@ -546,9 +564,9 @@ where
         let mut is_pending = self.recv_frame(cx).is_pending();
 
         is_pending &= if write_pending {
-            true
+            self.recv_event(cx, false).is_pending()
         } else {
-            self.recv_event(cx).is_pending()
+            self.recv_event(cx, true).is_pending()
         };
 
         if is_pending {
@@ -651,6 +669,7 @@ impl SubstreamBuilder {
 
             event_sender: Buffer::new(self.event_sender),
             event_receiver: self.event_receiver,
+            pending_event: None,
 
             service_proto_sender: self.service_proto_sender,
             session_proto_sender: self.session_proto_sender,
@@ -678,6 +697,7 @@ pub(crate) struct SubstreamWritePart<U> {
     event_sender: Buffer<ProtocolEvent>,
     /// Receive events from session
     event_receiver: priority_mpsc::Receiver<ProtocolEvent>,
+    pending_event: Option<(Priority, ProtocolEvent)>,
 
     context: Arc<SessionContext>,
 }
@@ -806,6 +826,7 @@ where
                 }
             }
             ProtocolEvent::Close { .. } => {
+                self.high_write_buf.clear();
                 self.write_buf.clear();
                 self.dead = true;
             }
@@ -814,17 +835,33 @@ where
         false
     }
 
-    fn recv_event(&mut self, cx: &mut Context) -> Poll<Option<()>> {
+    fn recv_event(&mut self, cx: &mut Context, allow_data: bool) -> Poll<Option<()>> {
         if self.dead {
             return Poll::Ready(None);
         }
 
-        if self.has_write_backpressure() {
+        if self.has_write_backpressure() && allow_data {
             return Poll::Pending;
         }
 
-        match Pin::new(&mut self.event_receiver).as_mut().poll_next(cx) {
+        let next_event = if let Some(event) = self.pending_event.take() {
+            Poll::Ready(Some(event))
+        } else if allow_data {
+            Pin::new(&mut self.event_receiver).as_mut().poll_next(cx)
+        } else {
+            match self.event_receiver.try_next_high() {
+                Ok(Some(event)) => Poll::Ready(Some((Priority::High, event))),
+                Ok(None) => Poll::Ready(None),
+                Err(_) => Poll::Pending,
+            }
+        };
+
+        match next_event {
             Poll::Ready(Some((priority, event))) => {
+                if !allow_data && matches!(event, ProtocolEvent::Message { .. }) {
+                    self.pending_event = Some((priority, event));
+                    return Poll::Pending;
+                }
                 if self.handle_proto_event(cx, event, priority) {
                     Poll::Pending
                 } else {
@@ -937,7 +974,11 @@ where
 
         futures::ready!(crate::runtime::poll_proceed(cx));
 
-        let is_pending = write_pending || self.recv_event(cx).is_pending();
+        let is_pending = if write_pending {
+            self.recv_event(cx, false).is_pending()
+        } else {
+            self.recv_event(cx, true).is_pending()
+        };
 
         if is_pending {
             Poll::Pending
@@ -975,7 +1016,7 @@ impl Drop for SubstreamReadPart {
         let pid = self.proto_id;
         crate::runtime::spawn(async move {
             let _ignore = sender
-                .send(ProtocolEvent::Close { id, proto_id: pid })
+                .quick_send(ProtocolEvent::Close { id, proto_id: pid })
                 .await;
         });
     }
@@ -1071,6 +1112,98 @@ impl SubstreamWritePartBuilder {
 
             event_sender: Buffer::new(self.event_sender),
             event_receiver: self.event_receiver,
+            pending_event: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SessionId;
+    use crate::service::SessionType;
+    use bytes::Bytes;
+    use futures::task::noop_waker_ref;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    };
+    use yamux::{
+        Config as YamuxConfig, Session as YamuxSession, session::SessionType as YamuxSessionType,
+    };
+
+    fn session_context() -> Arc<SessionContext> {
+        Arc::new(SessionContext::new(
+            SessionId(1),
+            "/ip4/127.0.0.1/tcp/1337".parse().unwrap(),
+            SessionType::Outbound,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        ))
+    }
+
+    #[test]
+    fn write_pending_still_handles_high_priority_close() {
+        let (raw, _peer) = tokio::io::duplex(64);
+        let mut config = YamuxConfig::default();
+        config.enable_keepalive = false;
+        let mut yamux = YamuxSession::new(raw, config, YamuxSessionType::Client);
+        let stream = yamux.open_stream().unwrap();
+        let substream = Framed::new(SubstreamInner::Yamux(stream), LengthDelimitedCodec::new());
+        let (sink, _read) = substream.split();
+
+        let (session_event_tx, _session_event_rx) = mpsc::channel(16);
+        let (proto_event_tx, proto_event_rx) = priority_mpsc::channel(16);
+        let context = session_context();
+        let mut write_part =
+            SubstreamWritePartBuilder::new(session_event_tx, proto_event_rx, context.clone())
+                .build(sink);
+
+        let frame = Bytes::from(vec![
+            7;
+            yamux::config::INITIAL_STREAM_WINDOW as usize + 1024
+        ]);
+        context.incr_pending_data_size(frame.len());
+        write_part.write_buf.push_back(frame);
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        assert!(Pin::new(&mut write_part).poll_next(&mut cx).is_pending());
+
+        proto_event_tx
+            .try_quick_send(ProtocolEvent::Close {
+                id: write_part.id,
+                proto_id: write_part.proto_id,
+            })
+            .unwrap();
+
+        assert!(Pin::new(&mut write_part).poll_next(&mut cx).is_ready());
+        assert!(write_part.dead);
+        assert!(write_part.high_write_buf.is_empty());
+        assert!(write_part.write_buf.is_empty());
+    }
+
+    #[test]
+    fn try_next_high_does_not_drain_normal_messages() {
+        let (tx, mut rx) = priority_mpsc::channel(16);
+        tx.try_send(ProtocolEvent::Message {
+            data: Bytes::from_static(b"data"),
+        })
+        .unwrap();
+        tx.try_quick_send(ProtocolEvent::Close {
+            id: 1,
+            proto_id: 1.into(),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_next_high().unwrap(),
+            Some(ProtocolEvent::Close { .. })
+        ));
+        assert!(matches!(
+            rx.try_next().unwrap(),
+            Some((Priority::Normal, ProtocolEvent::Message { .. }))
+        ));
     }
 }
