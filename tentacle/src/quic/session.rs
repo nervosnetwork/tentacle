@@ -48,7 +48,9 @@ use crate::{
         config::{Meta, SessionConfig},
         future_task::BoxedFutureTask,
     },
-    session::{SessionEvent, SessionMeta, SessionState, split_spawn_framed},
+    session::{
+        SessionEvent, SessionMeta, SessionState, poll_next_service_event, split_spawn_framed,
+    },
     substream::{ProtocolEvent, SubstreamBuilder, SubstreamInner, SubstreamWritePartBuilder},
 };
 
@@ -124,6 +126,7 @@ pub(crate) struct QuicSession {
     service_sender: Buffer<SessionEvent>,
     /// InnerService → session.
     service_receiver: priority_mpsc::Receiver<SessionEvent>,
+    pending_service_event: Option<(Priority, SessionEvent)>,
 
     service_proto_senders: IntMap<ProtocolId, Buffer<ServiceProtocolEvent>>,
     session_proto_senders: IntMap<ProtocolId, Buffer<SessionProtocolEvent>>,
@@ -189,6 +192,7 @@ impl QuicSession {
             proto_event_receiver,
             service_sender: Buffer::new(service_sender),
             service_receiver,
+            pending_service_event: None,
             service_proto_senders: meta.service_proto_senders,
             session_proto_senders: meta.session_proto_senders,
             state: SessionState::Normal,
@@ -604,11 +608,14 @@ impl QuicSession {
     }
 
     fn recv_service(&mut self, cx: &mut Context) -> Poll<Option<()>> {
-        if self.substream_events_full() {
-            return Poll::Pending;
-        }
+        let allow_protocol_message = !self.substream_events_full();
 
-        match Pin::new(&mut self.service_receiver).as_mut().poll_next(cx) {
+        match poll_next_service_event(
+            &mut self.service_receiver,
+            &mut self.pending_service_event,
+            allow_protocol_message,
+            cx,
+        ) {
             Poll::Ready(Some((priority, event))) => {
                 if !self.state.is_normal() {
                     Poll::Ready(None)
