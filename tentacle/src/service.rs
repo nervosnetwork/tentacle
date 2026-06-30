@@ -130,7 +130,8 @@ struct InnerService<K> {
     config: ServiceConfig,
     /// service state
     state: State,
-    connection_limiter: Arc<Semaphore>,
+    inbound_connection_limiter: Arc<Semaphore>,
+    outbound_connection_limiter: Arc<Semaphore>,
 
     next_session: SessionId,
 
@@ -235,7 +236,10 @@ where
             (HandshakeType::Noop, None) => QuicEndpointSlot::NotRequested,
         };
 
-        let connection_limiter = Arc::new(Semaphore::new(config.max_connection_number));
+        let inbound_connection_limiter =
+            Arc::new(Semaphore::new(config.max_inbound_connection_number));
+        let outbound_connection_limiter =
+            Arc::new(Semaphore::new(config.max_outbound_connection_number));
 
         Service {
             handle,
@@ -264,7 +268,7 @@ where
                         config.timeout,
                         config.tcp_config.clone(),
                         config.trusted_proxies.clone(),
-                        Some(connection_limiter.clone()),
+                        Some(inbound_connection_limiter.clone()),
                     );
                     #[cfg(feature = "tls")]
                     let transport = transport.tls_config(config.tls_config.clone());
@@ -278,7 +282,8 @@ where
                 igd_client,
                 dial_protocols: HashMap::default(),
                 state: State::new(forever),
-                connection_limiter,
+                inbound_connection_limiter,
+                outbound_connection_limiter,
                 next_session: SessionId::default(),
                 session_event_sender,
                 session_event_receiver,
@@ -378,7 +383,7 @@ where
             return Ok(self);
         }
 
-        let connection_permit = inner.acquire_connection_permit()?;
+        let connection_permit = inner.acquire_outbound_connection_permit()?;
         let dial_future = inner.multi_transport.clone().dial(address.clone())?;
 
         match dial_future.await {
@@ -445,14 +450,26 @@ impl<K> InnerService<K>
 where
     K: KeyProvider,
 {
-    fn acquire_connection_permit(&self) -> Result<OwnedSemaphorePermit> {
-        self.connection_limiter
+    fn acquire_inbound_connection_permit(&self) -> Result<OwnedSemaphorePermit> {
+        self.inbound_connection_limiter
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
                 TransportErrorKind::Io(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
-                    "connection limit reached",
+                    "inbound connection limit reached",
+                ))
+            })
+    }
+
+    fn acquire_outbound_connection_permit(&self) -> Result<OwnedSemaphorePermit> {
+        self.outbound_connection_limiter
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TransportErrorKind::Io(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "outbound connection limit reached",
                 ))
             })
     }
@@ -524,7 +541,7 @@ where
             return self.dial_inner_quic(address, target);
         }
 
-        let connection_permit = self.acquire_connection_permit()?;
+        let connection_permit = self.acquire_outbound_connection_permit()?;
         let dial_future = self.multi_transport.clone().dial(address.clone())?;
         self.dial_protocols.insert(address.clone(), target);
 
@@ -603,7 +620,7 @@ where
     #[cfg(feature = "quic")]
     fn dial_inner_quic(&mut self, address: Multiaddr, target: TargetProtocol) -> Result<()> {
         let endpoint = self.resolve_quic_endpoint(&address)?;
-        let connection_permit = self.acquire_connection_permit()?;
+        let connection_permit = self.acquire_outbound_connection_permit()?;
 
         self.dial_protocols.insert(address.clone(), target);
 
@@ -671,13 +688,14 @@ where
         self.listens.insert(listen_address.clone());
 
         let mut sender = self.session_event_sender.clone();
-        let connection_limiter = self.connection_limiter.clone();
+        let inbound_connection_limiter = self.inbound_connection_limiter.clone();
         let listen_addr_for_loop = listen_address.clone();
         let task = async move {
             loop {
                 match listener.accept().await {
                     Ok(Some((remote_addr, handshake))) => {
-                        let Ok(connection_permit) = connection_limiter.clone().try_acquire_owned()
+                        let Ok(connection_permit) =
+                            inbound_connection_limiter.clone().try_acquire_owned()
                         else {
                             handshake.connection().close(0u32.into(), b"capacity");
                             continue;
@@ -747,7 +765,7 @@ where
 
         let listen_address = listener.listen_addr().clone();
         let mut sender = self.session_event_sender.clone();
-        let connection_limiter = self.connection_limiter.clone();
+        let inbound_connection_limiter = self.inbound_connection_limiter.clone();
 
         let listen_address_for_start = listen_address.clone();
         let task = async move {
@@ -767,7 +785,8 @@ where
             loop {
                 match listener.accept().await {
                     Ok(Some((remote_addr, handshake))) => {
-                        let Ok(connection_permit) = connection_limiter.clone().try_acquire_owned()
+                        let Ok(connection_permit) =
+                            inbound_connection_limiter.clone().try_acquire_owned()
                         else {
                             handshake.connection().close(0u32.into(), b"capacity");
                             continue;
@@ -973,14 +992,6 @@ where
                 break;
             }
         }
-    }
-
-    fn reached_max_connection_limit(&self) -> bool {
-        self.sessions
-            .len()
-            .checked_add(self.state.into_inner().unwrap_or_default())
-            .map(|count| count >= self.config.max_connection_number)
-            .unwrap_or_default()
     }
 
     /// Common session-registration steps shared by yamux and QUIC paths
@@ -1448,7 +1459,7 @@ where
                 if ty.is_outbound() {
                     self.state.decrease();
                 }
-                if !self.reached_max_connection_limit() {
+                if ty.is_outbound() || connection_permit.is_some() {
                     self.session_open(
                         handle,
                         public_key,
@@ -1465,7 +1476,7 @@ where
                 if accepted.ty.is_outbound() {
                     self.state.decrease();
                 }
-                if !self.reached_max_connection_limit() {
+                if accepted.ty.is_outbound() || accepted.connection_permit.is_some() {
                     self.quic_session_open(
                         accepted.session,
                         accepted.public_key,
@@ -1736,32 +1747,38 @@ where
                 raw_session,
                 session_info,
             } => {
-                let connection_permit = match self.acquire_connection_permit() {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        if let RawSessionInfo::Outbound { .. } = session_info {
-                            let _ignore = self
-                                .handle_sender
-                                .send(
-                                    ServiceError::DialerError {
-                                        address: remote_address,
-                                        error: DialerErrorKind::TransportError(error),
-                                    }
-                                    .into(),
-                                )
-                                .await;
-                        }
-                        return;
-                    }
-                };
-                let (ty, listen_addr) = match session_info {
+                let (ty, listen_addr, connection_permit) = match session_info {
                     RawSessionInfo::Inbound { listen_addr } => {
-                        (SessionType::Inbound, Some(listen_addr))
+                        let connection_permit = match self.acquire_inbound_connection_permit() {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        };
+                        (
+                            SessionType::Inbound,
+                            Some(listen_addr),
+                            Some(connection_permit),
+                        )
                     }
                     RawSessionInfo::Outbound { target } => {
+                        let connection_permit = match self.acquire_outbound_connection_permit() {
+                            Ok(permit) => permit,
+                            Err(error) => {
+                                let _ignore = self
+                                    .handle_sender
+                                    .send(
+                                        ServiceError::DialerError {
+                                            address: remote_address,
+                                            error: DialerErrorKind::TransportError(error),
+                                        }
+                                        .into(),
+                                    )
+                                    .await;
+                                return;
+                            }
+                        };
                         self.dial_protocols.insert(remote_address.clone(), target);
                         self.state.increase();
-                        (SessionType::Outbound, None)
+                        (SessionType::Outbound, None, Some(connection_permit))
                     }
                 };
                 self.handshake(
@@ -1769,7 +1786,7 @@ where
                     ty,
                     remote_address,
                     listen_addr,
-                    Some(connection_permit),
+                    connection_permit,
                 );
             }
             ServiceTask::Disconnect { session_id } => {
