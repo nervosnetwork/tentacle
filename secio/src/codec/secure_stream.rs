@@ -14,15 +14,22 @@ use std::{
 use crate::{crypto::BoxStreamCipher, error::SecioError};
 
 enum RecvBuf {
-    Vec(Vec<u8>),
+    Vec { data: Vec<u8>, offset: usize },
     Byte(BytesMut),
 }
 
 impl RecvBuf {
     fn drain_to(&mut self, buf: &mut ReadBuf, size: usize) {
         match self {
-            RecvBuf::Vec(b) => {
-                buf.put_slice(b.drain(..size).as_slice());
+            RecvBuf::Vec { data, offset } => {
+                let end = *offset + size;
+                buf.put_slice(&data[*offset..end]);
+                *offset = end;
+
+                if *offset == data.len() {
+                    data.clear();
+                    *offset = 0;
+                }
             }
             RecvBuf::Byte(b) => {
                 buf.put_slice(&b[..size]);
@@ -33,7 +40,7 @@ impl RecvBuf {
 
     fn len(&self) -> usize {
         match self {
-            RecvBuf::Vec(b) => b.len(),
+            RecvBuf::Vec { data, offset } => data.len() - *offset,
             RecvBuf::Byte(b) => b.len(),
         }
     }
@@ -46,7 +53,7 @@ impl RecvBuf {
 impl AsRef<[u8]> for RecvBuf {
     fn as_ref(&self) -> &[u8] {
         match self {
-            RecvBuf::Vec(b) => b.as_ref(),
+            RecvBuf::Vec { data, offset } => &data[*offset..],
             RecvBuf::Byte(b) => b.as_ref(),
         }
     }
@@ -84,7 +91,10 @@ where
         let recv_buf = if decode_cipher.is_in_place() {
             RecvBuf::Byte(BytesMut::new())
         } else {
-            RecvBuf::Vec(Vec::default())
+            RecvBuf::Vec {
+                data: Vec::default(),
+                offset: 0,
+            }
         };
         SecureStream {
             socket,
@@ -102,7 +112,10 @@ where
             self.decode_cipher.decrypt_in_place(&mut frame)?;
             Ok(RecvBuf::Byte(frame))
         } else {
-            Ok(RecvBuf::Vec(self.decode_cipher.decrypt(&frame)?))
+            Ok(RecvBuf::Vec {
+                data: self.decode_cipher.decrypt(&frame)?,
+                offset: 0,
+            })
         }
     }
 
@@ -230,12 +243,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::SecureStream;
+    use super::{RecvBuf, SecureStream};
     use crate::crypto::{CryptoMode, cipher::CipherType, new_stream};
     use bytes::BytesMut;
     use futures::channel;
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
         net::{TcpListener, TcpStream},
     };
     use tokio_util::codec::{Framed, length_delimited::LengthDelimitedCodec};
@@ -243,6 +256,54 @@ mod tests {
     fn rt() -> &'static tokio::runtime::Runtime {
         static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+    }
+
+    #[test]
+    fn recv_buf_vec_partial_drain_keeps_backing_data_without_front_removal() {
+        let mut recv_buf = RecvBuf::Vec {
+            data: b"hello world".to_vec(),
+            offset: 0,
+        };
+        let mut out = [0u8; 5];
+        let mut read_buf = ReadBuf::new(&mut out);
+
+        recv_buf.drain_to(&mut read_buf, 5);
+
+        assert_eq!(read_buf.filled(), b"hello");
+        assert_eq!(recv_buf.len(), 6);
+        assert_eq!(recv_buf.as_ref(), b" world");
+        match recv_buf {
+            RecvBuf::Vec { ref data, offset } => {
+                assert_eq!(
+                    data, b"hello world",
+                    "partial drain should advance a logical offset without front-removing Vec data"
+                );
+                assert_eq!(offset, 5);
+            }
+            RecvBuf::Byte(_) => unreachable!("expected Vec receive buffer"),
+        }
+    }
+
+    #[test]
+    fn recv_buf_vec_drain_resets_after_consuming_all_bytes() {
+        let mut recv_buf = RecvBuf::Vec {
+            data: b"hello".to_vec(),
+            offset: 0,
+        };
+        let mut out = [0u8; 5];
+        let mut read_buf = ReadBuf::new(&mut out);
+
+        recv_buf.drain_to(&mut read_buf, 5);
+
+        assert_eq!(read_buf.filled(), b"hello");
+        assert!(recv_buf.is_empty());
+        match recv_buf {
+            RecvBuf::Vec { ref data, offset } => {
+                assert!(data.is_empty());
+                assert_eq!(offset, 0);
+            }
+            RecvBuf::Byte(_) => unreachable!("expected Vec receive buffer"),
+        }
     }
 
     fn test_decode_encode(cipher1: CipherType, cipher2: CipherType) {
