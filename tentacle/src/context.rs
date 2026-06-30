@@ -17,8 +17,8 @@ use crate::{
     multiaddr::Multiaddr,
     secio::PublicKey,
     service::{
-        ServiceAsyncControl, ServiceControl, SessionType, TargetProtocol, TargetSession,
-        event::ServiceTask,
+        ServiceAsyncControl, ServiceControl, ServiceTaskBudget, SessionType, TargetProtocol,
+        TargetSession, event::ServiceTask,
     },
     session::SessionEvent,
 };
@@ -123,9 +123,13 @@ pub struct ServiceContext {
 
 impl ServiceContext {
     /// New
-    pub(crate) fn new(task_sender: mpsc::Sender<ServiceTask>, closed: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        task_sender: mpsc::Sender<ServiceTask>,
+        closed: Arc<AtomicBool>,
+        task_budget: ServiceTaskBudget,
+    ) -> Self {
         ServiceContext {
-            inner: ServiceControl::new(task_sender, closed).into(),
+            inner: ServiceControl::new(task_sender, closed, task_budget).into(),
             listens: Vec::new(),
         }
     }
