@@ -875,7 +875,10 @@ mod tests {
 
         // Simulate one service-loop iteration: pull a task and release if it
         // counts against the budget (mirrors service.rs:1829-1833).
-        let (_priority, task) = receiver.try_next().expect("queued task").expect("some task");
+        let (_priority, task) = receiver
+            .try_next()
+            .expect("queued task")
+            .expect("some task");
         assert!(task.counts_against_budget());
         budget.release();
 
