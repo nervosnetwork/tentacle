@@ -145,6 +145,7 @@ mod os {
         pub(crate) tls_config: Option<TlsConfig>,
         /// Trusted proxy addresses for HAProxy PROXY protocol and X-Forwarded-For header parsing.
         pub(crate) trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+        pub(crate) max_frame_length: usize,
     }
 
     impl MultiTransport {
@@ -152,6 +153,7 @@ mod os {
             timeout: ServiceTimeout,
             tcp_config: TcpConfig,
             trusted_proxies: Vec<std::net::IpAddr>,
+            max_frame_length: usize,
         ) -> Self {
             MultiTransport {
                 timeout,
@@ -160,6 +162,7 @@ mod os {
                 #[cfg(feature = "tls")]
                 tls_config: None,
                 trusted_proxies: Arc::new(trusted_proxies),
+                max_frame_length,
             }
         }
 
@@ -246,7 +249,13 @@ mod os {
                 }
                 #[cfg(feature = "ws")]
                 TransportType::Ws => {
-                    match WsTransport::new(self.timeout.timeout, self.tcp_config.ws).dial(address) {
+                    match WsTransport::new(
+                        self.timeout.timeout,
+                        self.tcp_config.ws,
+                        self.max_frame_length,
+                    )
+                    .dial(address)
+                    {
                         Ok(future) => Ok(MultiDialFuture::Ws(future)),
                         Err(e) => Err(e),
                     }

@@ -21,7 +21,10 @@ use log::debug;
 #[cfg(any(feature = "ws", feature = "tls"))]
 use crate::multiaddr::Protocol;
 #[cfg(feature = "ws")]
-use {crate::transports::ws::WsStream, tokio_tungstenite::accept_async};
+use {
+    crate::transports::ws::{WsStream, websocket_config},
+    tokio_tungstenite::accept_async_with_config,
+};
 #[cfg(feature = "tls")]
 use {
     crate::{service::TlsConfig, transports::parse_tls_domain_name},
@@ -55,6 +58,7 @@ pub async fn bind(
     global: Arc<crate::lock::Mutex<HashMap<SocketAddr, UpgradeMode>>>,
     timeout: Duration,
     trusted_proxies: Arc<Vec<IpAddr>>,
+    max_frame_length: usize,
 ) -> Result<(Multiaddr, TcpBaseListenerEnum)> {
     let addr = address.await?;
     let upgrade_mode: UpgradeMode = listen_mode.into();
@@ -141,6 +145,7 @@ pub async fn bind(
                         upgrade_mode,
                         global,
                         trusted_proxies,
+                        max_frame_length,
                     );
                     #[cfg(feature = "tls")]
                     let tcp_listen = tcp_listen.tls_config(tls_server_config);
@@ -247,6 +252,7 @@ pub struct TcpBaseListener {
     tls_config: Arc<ServerConfig>,
     /// Trusted proxy addresses for HAProxy PROXY protocol and X-Forwarded-For header parsing.
     trusted_proxies: Arc<Vec<IpAddr>>,
+    max_frame_length: usize,
 }
 
 impl Drop for TcpBaseListener {
@@ -263,6 +269,7 @@ impl TcpBaseListener {
         upgrade_mode: UpgradeMode,
         global: Arc<crate::lock::Mutex<HashMap<SocketAddr, UpgradeMode>>>,
         trusted_proxies: Arc<Vec<IpAddr>>,
+        max_frame_length: usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel(128);
 
@@ -281,6 +288,7 @@ impl TcpBaseListener {
                     .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new())),
             ),
             trusted_proxies,
+            max_frame_length,
         }
     }
 
@@ -309,6 +317,7 @@ impl TcpBaseListener {
                         let sender = self.sender.clone();
                         let upgrade_mode = self.upgrade_mode.to_enum();
                         let trusted_proxies = Arc::clone(&self.trusted_proxies);
+                        let max_frame_length = self.max_frame_length;
                         #[cfg(feature = "tls")]
                         let acceptor = TlsAcceptor::from(Arc::clone(&self.tls_config));
                         crate::runtime::spawn(protocol_select(
@@ -318,6 +327,7 @@ impl TcpBaseListener {
                             sender,
                             remote_address,
                             trusted_proxies,
+                            max_frame_length,
                             #[cfg(feature = "tls")]
                             acceptor,
                         ));
@@ -363,6 +373,7 @@ async fn protocol_select(
     mut sender: Sender<(Multiaddr, MultiStream)>,
     #[allow(unused_mut)] mut remote_address: SocketAddr,
     trusted_proxies: Arc<Vec<IpAddr>>,
+    #[allow(unused_variables)] max_frame_length: usize,
     #[cfg(feature = "tls")] acceptor: TlsAcceptor,
 ) {
     let mut peek_buf = [0u8; 16];
@@ -429,7 +440,12 @@ async fn protocol_select(
                         extract_forwarded_for_from_ws_handshake(&stream, remote_address).await;
                 }
 
-                match crate::runtime::timeout(timeout, accept_async(stream)).await {
+                match crate::runtime::timeout(
+                    timeout,
+                    accept_async_with_config(stream, Some(websocket_config(max_frame_length))),
+                )
+                .await
+                {
                     Err(_) => {
                         debug!("accept websocket stream timeout");
                     }
@@ -752,5 +768,105 @@ async fn extract_forwarded_for_from_ws_handshake(
             SocketAddr::new(ip, port)
         }
         None => fallback_address,
+    }
+}
+
+#[cfg(all(test, feature = "ws"))]
+mod tests {
+    use super::*;
+    use futures::{SinkExt, StreamExt, future::poll_fn};
+    use std::pin::Pin;
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio_tungstenite::{client_async_with_config, tungstenite::Message};
+
+    const LENGTH_DELIMITED_PREFIX_LEN: usize = 4;
+
+    #[test]
+    fn websocket_accept_allows_message_at_configured_frame_limit_with_prefix() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let max_frame_length = 1024;
+            let message_len = max_frame_length + LENGTH_DELIMITED_PREFIX_LEN;
+
+            let data = read_websocket_message(max_frame_length, message_len)
+                .await
+                .expect("message at configured frame limit plus prefix must be accepted");
+
+            assert_eq!(data.len(), message_len);
+        });
+    }
+
+    #[test]
+    fn websocket_accept_rejects_messages_over_configured_frame_limit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let max_frame_length = 1024;
+            let message_len = max_frame_length + LENGTH_DELIMITED_PREFIX_LEN + 1;
+
+            let err = read_websocket_message(max_frame_length, message_len)
+                .await
+                .expect_err("oversized websocket message must be rejected");
+
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        });
+    }
+
+    async fn read_websocket_message(
+        max_frame_length: usize,
+        message_len: usize,
+    ) -> io::Result<Vec<u8>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let url = format!("ws://{}", addr);
+            let (mut ws, _) = client_async_with_config(url, tcp, None).await.unwrap();
+            ws.send(Message::Binary(vec![0; message_len].into()))
+                .await
+                .unwrap();
+        });
+
+        let (server, remote_address) = listener.accept().await.unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        #[cfg(feature = "tls")]
+        let acceptor = TlsAcceptor::from(Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new())),
+        ));
+
+        let selector = tokio::spawn(protocol_select(
+            server,
+            Duration::from_secs(1),
+            UpgradeModeEnum::OnlyWs,
+            sender,
+            remote_address,
+            Arc::new(Vec::new()),
+            max_frame_length,
+            #[cfg(feature = "tls")]
+            acceptor,
+        ));
+
+        let (_addr, mut stream) = receiver.next().await.expect("websocket accepted");
+        let mut buf = vec![0u8; message_len];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        let result = poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut read_buf)).await;
+        let filled = read_buf.filled().to_vec();
+
+        client.await.unwrap();
+        selector.await.unwrap();
+
+        result.map(|_| filled)
     }
 }
