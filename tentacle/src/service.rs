@@ -69,6 +69,17 @@ pub use crate::service::config::TlsConfig;
 
 type Result<T> = std::result::Result<T, TransportErrorKind>;
 
+fn has_reached_max_connection_limit(
+    max_connection_number: usize,
+    active_sessions: usize,
+    pending_sessions: usize,
+) -> bool {
+    active_sessions
+        .checked_add(pending_sessions)
+        .map(|count| count >= max_connection_number)
+        .unwrap_or(true)
+}
+
 /// Output of the transport-agnostic session-registration steps. The caller
 /// uses these fields to build a per-multiplexer session loop (`Session` for
 /// yamux, `QuicSession` for QUIC).
@@ -424,6 +435,23 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_reached_max_connection_limit;
+
+    #[test]
+    fn connection_limit_treats_equal_count_as_reached() {
+        assert!(!has_reached_max_connection_limit(2, 1, 0));
+        assert!(has_reached_max_connection_limit(2, 2, 0));
+        assert!(has_reached_max_connection_limit(2, 1, 1));
+    }
+
+    #[test]
+    fn connection_limit_fails_closed_on_count_overflow() {
+        assert!(has_reached_max_connection_limit(usize::MAX, usize::MAX, 1));
     }
 }
 
@@ -930,11 +958,11 @@ where
     }
 
     fn reached_max_connection_limit(&self) -> bool {
-        self.sessions
-            .len()
-            .checked_add(self.state.into_inner().unwrap_or_default())
-            .map(|count| self.config.max_connection_number < count)
-            .unwrap_or_default()
+        has_reached_max_connection_limit(
+            self.config.max_connection_number,
+            self.sessions.len(),
+            self.state.into_inner().unwrap_or_default(),
+        )
     }
 
     /// Common session-registration steps shared by yamux and QUIC paths
