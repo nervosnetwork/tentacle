@@ -474,6 +474,31 @@ mod os {
         }
     }
 
+    /// TCP dial through a SOCKS proxy with proxy-side hostname resolution.
+    #[inline(always)]
+    pub async fn tcp_proxy_dial(
+        target_addr: String,
+        target_port: u16,
+        tcp_config: TcpSocketConfig,
+        timeout: Duration,
+    ) -> Result<TcpStream> {
+        match crate::runtime::timeout(
+            timeout,
+            crate::runtime::connect_proxy(target_addr, target_port, tcp_config),
+        )
+        .await
+        {
+            Err(_) => Err(TransportErrorKind::Io(io::ErrorKind::TimedOut.into())),
+            Ok(res) => res.map_err(|err| {
+                if err.to_string().contains("connect_by_proxy") {
+                    TransportErrorKind::ProxyError(err)
+                } else {
+                    err.into()
+                }
+            }),
+        }
+    }
+
     /// onion common dial realization
     #[inline(always)]
     pub async fn onion_dial(
