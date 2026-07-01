@@ -432,6 +432,7 @@ impl StreamHandle {
             total_read,
         );
 
+        self.readable_wake = None;
         Poll::Ready(Ok(total_read))
     }
 
@@ -512,6 +513,7 @@ impl AsyncRead for StreamHandle {
             }
         }
 
+        self.readable_wake = None;
         Poll::Ready(Ok(()))
     }
 }
@@ -558,7 +560,21 @@ impl AsyncWrite for StreamHandle {
             // register writer context waker
             // when write buf become empty, it can wake the upper layer to write the message again
             self.writeable_wake = Some(cx.waker().clone());
-            return Poll::Pending;
+            // If no read task is currently waiting on frame_receiver, a write-only stream must
+            // register the writer waker there so a future WindowUpdate can wake this task.
+            // If a read task is already waiting, leave its channel waker intact; the read path
+            // will process WindowUpdate and then wake writeable_wake.
+            if self.readable_wake.is_none() {
+                if let Err(
+                    Error::UnexpectedFlag | Error::RecvWindowExceeded | Error::InvalidMsgType,
+                ) = self.recv_frames(cx)
+                {
+                    self.send_go_away();
+                }
+            }
+            if self.send_window == 0 {
+                return Poll::Pending;
+            }
         }
         // Allow n = 0, send an empty frame to remote
         let n = ::std::cmp::min(self.send_window as usize, buf.len());
@@ -1183,6 +1199,115 @@ mod test {
             assert!(
                 matches!(r, Poll::Ready(Ok(4))),
                 "poll_write must now succeed after window was restored"
+            );
+        });
+    }
+
+    // Regression test for write-only streams: when there is no read task parked on
+    // frame_receiver, poll_write must register the writer there while it waits for
+    // WindowUpdate frames. Otherwise a legitimate WindowUpdate can sit queued without
+    // waking the write task, leaving send_window at zero forever.
+    #[test]
+    fn test_window_update_wakes_write_without_read_polling() {
+        let rt = rt();
+        rt.block_on(async {
+            let (mut frame_sender, frame_receiver) = channel(128);
+            let (unbound_sender, _unbound_receiver) = unbounded();
+            let mut stream = StreamHandle::new(
+                1,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                INITIAL_STREAM_WINDOW,
+            );
+
+            stream.send_window = 0;
+
+            let write_fw = Arc::new(FlagWaker::default());
+            let write_waker_ref = waker_ref(&write_fw);
+            let mut write_cx = Context::from_waker(&write_waker_ref);
+
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_write(&mut write_cx, b"ping")
+                    .is_pending()
+            );
+
+            let wu = Frame::new_window_update(Flags::default(), 1, 65535);
+            frame_sender.send(wu).await.unwrap();
+
+            assert!(
+                write_fw.woken(),
+                "write-only stream must be woken when WindowUpdate arrives"
+            );
+
+            let r = Pin::new(&mut stream).poll_write(&mut write_cx, b"ping");
+            assert!(
+                matches!(r, Poll::Ready(Ok(4))),
+                "poll_write must succeed after draining the queued WindowUpdate"
+            );
+        });
+    }
+
+    // Regression test for stale readable_wake state: after a read task successfully
+    // consumes data and returns Ready, there is no longer an active reader parked on
+    // frame_receiver. A later write-only WindowUpdate wait must therefore be allowed
+    // to register the writer waker.
+    #[test]
+    fn test_write_only_window_update_after_successful_read() {
+        let rt = rt();
+        rt.block_on(async {
+            let (mut frame_sender, frame_receiver) = channel(128);
+            let (unbound_sender, _unbound_receiver) = unbounded();
+            let mut stream = StreamHandle::new(
+                1,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                INITIAL_STREAM_WINDOW,
+            );
+
+            let read_fw = Arc::new(FlagWaker::default());
+            let read_waker_ref = waker_ref(&read_fw);
+            let mut read_cx = Context::from_waker(&read_waker_ref);
+            let mut read_buf = [0u8; 8];
+            let mut rbuf = ReadBuf::new(&mut read_buf);
+
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_read(&mut read_cx, &mut rbuf)
+                    .is_pending()
+            );
+
+            let frame = Frame::new_data(Flags::from(Flag::Syn), 1, BytesMut::from("data"));
+            frame_sender.send(frame).await.unwrap();
+            assert!(read_fw.woken());
+
+            let mut rbuf = ReadBuf::new(&mut read_buf);
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_read(&mut read_cx, &mut rbuf)
+                    .is_ready()
+            );
+            assert_eq!(rbuf.filled(), b"data");
+
+            stream.send_window = 0;
+            let write_fw = Arc::new(FlagWaker::default());
+            let write_waker_ref = waker_ref(&write_fw);
+            let mut write_cx = Context::from_waker(&write_waker_ref);
+
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_write(&mut write_cx, b"ping")
+                    .is_pending()
+            );
+
+            let wu = Frame::new_window_update(Flags::default(), 1, 65535);
+            frame_sender.send(wu).await.unwrap();
+
+            assert!(
+                write_fw.woken(),
+                "stale readable_wake must not prevent write-only WindowUpdate wakeup"
             );
         });
     }
