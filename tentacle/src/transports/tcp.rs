@@ -17,6 +17,7 @@ use crate::{
     },
     utils::{dns::DnsResolver, multiaddr_to_socketaddr},
 };
+use tokio::sync::Semaphore;
 
 /// Tcp connect
 async fn connect(
@@ -45,6 +46,7 @@ pub struct TcpTransport {
     tls_config: TlsConfig,
     /// Trusted proxy addresses for HAProxy PROXY protocol and X-Forwarded-For header parsing.
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    connection_limiter: Option<Arc<Semaphore>>,
 }
 
 impl TcpTransport {
@@ -57,6 +59,7 @@ impl TcpTransport {
             #[cfg(feature = "tls")]
             tls_config: Default::default(),
             trusted_proxies: Arc::new(Vec::new()),
+            connection_limiter: None,
         }
     }
 
@@ -78,6 +81,7 @@ impl TcpTransport {
             #[cfg(feature = "tls")]
             tls_config: multi_transport.tls_config.unwrap_or_default(),
             trusted_proxies: multi_transport.trusted_proxies,
+            connection_limiter: multi_transport.connection_limiter,
         }
     }
 }
@@ -105,6 +109,7 @@ impl TransportListen for TcpTransport {
                     self.global,
                     self.timeout,
                     self.trusted_proxies,
+                    self.connection_limiter,
                 );
                 Ok(TransportFuture::new(Box::pin(task)))
             }
@@ -118,6 +123,7 @@ impl TransportListen for TcpTransport {
                     self.global,
                     self.timeout,
                     self.trusted_proxies,
+                    self.connection_limiter,
                 );
                 Ok(TransportFuture::new(Box::pin(task)))
             }
