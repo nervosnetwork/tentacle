@@ -1,6 +1,6 @@
 use std::{
     io::{self, Read},
-    net::{IpAddr, Shutdown, SocketAddr, TcpStream as StdTcpStream},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream as StdTcpStream},
     thread,
     time::Duration,
 };
@@ -10,9 +10,13 @@ use tentacle::{
     ProtocolId, async_trait,
     builder::{MetaBuilder, ServiceBuilder},
     context::ServiceContext,
+    error::DialerErrorKind,
     multiaddr::{Multiaddr, Protocol},
     secio::SecioKeyPair,
-    service::{ProtocolHandle, ProtocolMeta, Service, ServiceEvent},
+    service::{
+        ProtocolHandle, ProtocolMeta, Service, ServiceControl, ServiceError, ServiceEvent,
+        TargetProtocol,
+    },
     traits::ServiceHandle,
 };
 
@@ -20,6 +24,7 @@ const MAX_CONNECTIONS: usize = 2;
 
 struct ServerHandle {
     session_open_sender: crossbeam_channel::Sender<()>,
+    dial_error_sender: crossbeam_channel::Sender<DialerErrorKind>,
 }
 
 #[async_trait]
@@ -27,6 +32,12 @@ impl ServiceHandle for ServerHandle {
     async fn handle_event(&mut self, _env: &mut ServiceContext, event: ServiceEvent) {
         if let ServiceEvent::SessionOpen { .. } = event {
             self.session_open_sender.send(()).unwrap();
+        }
+    }
+
+    async fn handle_error(&mut self, _env: &mut ServiceContext, error: ServiceError) {
+        if let ServiceError::DialerError { error, .. } = error {
+            let _ignore = self.dial_error_sender.send(error);
         }
     }
 }
@@ -46,7 +57,9 @@ where
         .insert_protocol(create_meta(1.into()))
         .handshake_type(SecioKeyPair::secp256k1_generated().into())
         .max_connection_number(MAX_CONNECTIONS)
+        .max_outbound_connection_number(MAX_CONNECTIONS)
         .timeout(Duration::from_secs(1))
+        .forever(true)
         .build(handle)
 }
 
@@ -70,6 +83,26 @@ fn connect_stalled(addr: SocketAddr) -> StdTcpStream {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     stream
+}
+
+fn multiaddr_from_socket_addr(addr: SocketAddr) -> Multiaddr {
+    format!("/ip4/{}/tcp/{}", addr.ip(), addr.port())
+        .parse()
+        .unwrap()
+}
+
+fn spawn_stalled_acceptor() -> (Multiaddr, crossbeam_channel::Receiver<StdTcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            if sender.send(stream).is_err() {
+                break;
+            }
+        }
+    });
+    (multiaddr_from_socket_addr(addr), receiver)
 }
 
 fn assert_stream_closed(mut stream: StdTcpStream) {
@@ -97,11 +130,13 @@ fn assert_stream_stays_open(mut stream: StdTcpStream) {
 fn stalled_inbound_connections_count_toward_connection_limit() {
     let (addr_sender, addr_receiver) = channel::oneshot::channel::<Multiaddr>();
     let (session_open_sender, session_open_receiver) = crossbeam_channel::unbounded();
+    let (dial_error_sender, _dial_error_receiver) = crossbeam_channel::unbounded();
 
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut service = create_service(ServerHandle {
             session_open_sender,
+            dial_error_sender,
         });
         rt.block_on(async move {
             let listen_addr = service
@@ -146,5 +181,72 @@ fn stalled_inbound_connections_count_toward_connection_limit() {
             .recv_timeout(Duration::from_millis(300))
             .is_err(),
         "accepted stalled inbound socket must not create a session before handshake"
+    );
+}
+
+#[test]
+fn stalled_outbound_connections_count_toward_connection_limit() {
+    let (control_sender, control_receiver) = channel::oneshot::channel::<ServiceControl>();
+    let (session_open_sender, session_open_receiver) = crossbeam_channel::unbounded();
+    let (dial_error_sender, dial_error_receiver) = crossbeam_channel::unbounded();
+
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = create_service(ServerHandle {
+            session_open_sender,
+            dial_error_sender,
+        });
+        let control = service.control().clone().into();
+        control_sender.send(control).unwrap();
+        rt.block_on(async move { service.run().await });
+    });
+
+    let control = futures::executor::block_on(control_receiver).unwrap();
+
+    let mut accepted = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        let (addr, receiver) = spawn_stalled_acceptor();
+        control.dial(addr, TargetProtocol::All).unwrap();
+        accepted.push(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+
+    let (rejected_addr, rejected_receiver) = spawn_stalled_acceptor();
+    control.dial(rejected_addr, TargetProtocol::All).unwrap();
+    assert!(
+        rejected_receiver
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "rejected outbound dial must not open a TCP connection"
+    );
+    assert!(
+        dial_error_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .is_ok(),
+        "outbound dial over capacity must report a dial error"
+    );
+
+    assert!(
+        session_open_receiver
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "stalled or rejected outbound sockets must not create sessions"
+    );
+
+    let released = accepted.pop().unwrap();
+    released.shutdown(Shutdown::Both).unwrap();
+    drop(released);
+    thread::sleep(Duration::from_millis(500));
+
+    let (accepted_addr, accepted_receiver) = spawn_stalled_acceptor();
+    control.dial(accepted_addr, TargetProtocol::All).unwrap();
+    accepted_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capacity released for a new outbound connection");
+
+    assert!(
+        session_open_receiver
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "accepted stalled outbound socket must not create a session before handshake"
     );
 }
