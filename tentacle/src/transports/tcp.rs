@@ -7,13 +7,13 @@ use std::{
 use crate::service::TlsConfig;
 use crate::{
     error::TransportErrorKind,
-    multiaddr::Multiaddr,
+    multiaddr::{Multiaddr, Protocol},
     runtime::TcpStream,
     service::config::TcpSocketConfig,
     transports::{
         Result, TcpListenMode, TransportDial, TransportFuture, TransportListen,
         tcp_base_listen::{TcpBaseListenerEnum, UpgradeMode, bind},
-        tcp_dial,
+        tcp_dial, tcp_proxy_dial,
     },
     utils::{dns::DnsResolver, multiaddr_to_socketaddr},
 };
@@ -33,6 +33,33 @@ async fn connect(
         }
         None => Err(TransportErrorKind::NotSupported(original.unwrap_or(addr))),
     }
+}
+
+fn dns_tcp_target(address: &Multiaddr) -> Option<(String, u16)> {
+    let mut iter = address.iter().peekable();
+
+    while iter.peek().is_some() {
+        match iter.peek() {
+            Some(Protocol::Dns4(_)) | Some(Protocol::Dns6(_)) => {}
+            _ => {
+                let _ignore = iter.next();
+                continue;
+            }
+        }
+
+        let proto1 = iter.next()?;
+        let proto2 = iter.next()?;
+
+        match (proto1, proto2) {
+            (Protocol::Dns4(domain), Protocol::Tcp(port))
+            | (Protocol::Dns6(domain), Protocol::Tcp(port)) => {
+                return Some((domain.into_owned(), port));
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Tcp transport
@@ -129,6 +156,18 @@ impl TransportDial for TcpTransport {
     type DialFuture = TcpDialFuture;
 
     fn dial(self, address: Multiaddr) -> Result<Self::DialFuture> {
+        if self.tcp_config.proxy_url.is_some() {
+            if let Some((target_addr, target_port)) = dns_tcp_target(&address) {
+                let task = async move {
+                    let stream =
+                        tcp_proxy_dial(target_addr, target_port, self.tcp_config, self.timeout)
+                            .await?;
+                    Ok((address, stream))
+                };
+                return Ok(TransportFuture::new(Box::pin(task)));
+            }
+        }
+
         match DnsResolver::new(address.clone()) {
             Some(dns) => {
                 // Why do this?
@@ -148,5 +187,70 @@ impl TransportDial for TcpTransport {
                 Ok(TransportFuture::new(Box::pin(dial)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::channel::oneshot;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn proxy_dns_dial_sends_hostname_to_socks_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (target_sender, target_receiver) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut greeting = [0; 2];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0; greeting[1] as usize];
+            socket.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0));
+            socket.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0; 4];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[..3], [5, 1, 0]);
+            assert_eq!(request[3], 3);
+
+            let mut domain_len = [0; 1];
+            socket.read_exact(&mut domain_len).await.unwrap();
+            let mut domain = vec![0; domain_len[0] as usize];
+            socket.read_exact(&mut domain).await.unwrap();
+            let mut port = [0; 2];
+            socket.read_exact(&mut port).await.unwrap();
+            let target = (String::from_utf8(domain).unwrap(), u16::from_be_bytes(port));
+            target_sender.send(target).unwrap();
+
+            socket
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+
+        let address: Multiaddr = "/dns4/tentacle-proxy-leak.invalid/tcp/4242"
+            .parse()
+            .unwrap();
+        let tcp_config = TcpSocketConfig {
+            proxy_url: Some(format!("socks5://{}", proxy_addr).parse().unwrap()),
+            proxy_random_auth: false,
+            ..Default::default()
+        };
+        let transport = TcpTransport::new(Duration::from_secs(5), tcp_config);
+
+        let (dialed_addr, _stream) = transport.dial(address.clone()).unwrap().await.unwrap();
+        assert_eq!(dialed_addr, address);
+        assert_eq!(
+            target_receiver.await.unwrap(),
+            ("tentacle-proxy-leak.invalid".to_string(), 4242)
+        );
     }
 }

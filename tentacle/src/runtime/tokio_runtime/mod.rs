@@ -202,6 +202,29 @@ pub(crate) async fn connect(
     }
 }
 
+pub(crate) async fn connect_proxy(
+    target_addr: String,
+    target_port: u16,
+    tcp_config: TcpSocketConfig,
+) -> io::Result<TcpStream> {
+    let TcpSocketConfig {
+        socket_transformer: _,
+        proxy_url,
+        onion_url: _,
+        proxy_random_auth,
+    } = tcp_config;
+
+    let proxy_url = proxy_url.ok_or_else(|| io::Error::other("missing socks proxy config"))?;
+    connect_by_proxy(
+        target_addr,
+        target_port,
+        proxy_url.clone(),
+        proxy_random_auth,
+    )
+    .await
+    .map_err(|err| io::Error::other(format!("connect_by_proxy: {}, error: {}", proxy_url, err)))
+}
+
 pub(crate) async fn connect_onion(
     onion_addr: MultiAddr,
     tcp_config: TcpSocketConfig,
