@@ -4,7 +4,7 @@ use log::debug;
 use p2p::{
     context::{ProtocolContext, ProtocolContextMutRef},
     multiaddr::{Multiaddr, Protocol},
-    utils::multiaddr_to_socketaddr,
+    utils::{is_reachable, multiaddr_to_socketaddr},
     SessionId,
 };
 
@@ -33,12 +33,7 @@ impl SessionState {
     pub(crate) fn new(context: ProtocolContextMutRef) -> SessionState {
         let mut addr_known = AddrKnown::default();
         let remote_addr = if context.session.ty.is_outbound() {
-            let port = context
-                .listens()
-                .iter()
-                .filter_map(|address| multiaddr_to_socketaddr(address))
-                .map(|addr| addr.port())
-                .next();
+            let port = reachable_or_unspecified_listen_port(context.listens());
 
             let msg = encode(DiscoveryMessage::GetNodes {
                 version: VERSION,
@@ -105,6 +100,14 @@ impl SessionState {
     }
 }
 
+fn reachable_or_unspecified_listen_port(listens: &[Multiaddr]) -> Option<u16> {
+    listens
+        .iter()
+        .filter_map(|address| multiaddr_to_socketaddr(address))
+        .find(|addr| is_reachable(addr.ip()) || addr.ip().is_unspecified())
+        .map(|addr| addr.port())
+}
+
 #[derive(Eq, PartialEq, Hash, Debug, Clone)]
 pub(crate) enum RemoteAddress {
     /// Inbound init remote address
@@ -134,5 +137,45 @@ impl RemoteAddress {
                 .collect();
             *self = RemoteAddress::Listen(addr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reachable_or_unspecified_listen_port;
+    use p2p::multiaddr::Multiaddr;
+
+    fn addr(address: &str) -> Multiaddr {
+        address.parse().unwrap()
+    }
+
+    #[test]
+    fn listen_port_skips_loopback_and_private_addresses() {
+        let listens = vec![
+            addr("/ip4/127.0.0.1/tcp/30333"),
+            addr("/ip4/192.168.1.10/tcp/30334"),
+        ];
+
+        assert_eq!(reachable_or_unspecified_listen_port(&listens), None);
+    }
+
+    #[test]
+    fn listen_port_allows_unspecified_address() {
+        let listens = vec![
+            addr("/ip4/127.0.0.1/tcp/30333"),
+            addr("/ip4/0.0.0.0/tcp/30334"),
+        ];
+
+        assert_eq!(reachable_or_unspecified_listen_port(&listens), Some(30334));
+    }
+
+    #[test]
+    fn listen_port_allows_reachable_address() {
+        let listens = vec![
+            addr("/ip4/127.0.0.1/tcp/30333"),
+            addr("/ip4/8.8.8.8/tcp/30334"),
+        ];
+
+        assert_eq!(reachable_or_unspecified_listen_port(&listens), Some(30334));
     }
 }
