@@ -75,6 +75,16 @@ impl AsyncWrite for SubstreamInner {
     }
 }
 
+/// Roll back the session pending byte counter for a dropped outbound protocol
+/// message. No-op for non-`Message` variants since only `Message` carries
+/// bytes accounted in `SessionContext::pending_data_size`.
+#[inline]
+pub(crate) fn decr_pending_protocol_message(context: &SessionContext, event: ProtocolEvent) {
+    if let ProtocolEvent::Message { data } = event {
+        context.decr_pending_data_size(data.len());
+    }
+}
+
 /// Event generated/received by the protocol stream
 #[derive(Debug)]
 pub(crate) enum ProtocolEvent {
@@ -172,6 +182,16 @@ where
         }
     }
 
+    fn clear_write_buffers(&mut self) {
+        let data_size = self
+            .high_write_buf
+            .drain(..)
+            .chain(self.write_buf.drain(..))
+            .map(|frame| frame.len())
+            .sum();
+        self.context.decr_pending_data_size(data_size);
+    }
+
     /// Sink `start_send` Ready -> data send to buffer
     /// Sink `start_send` NotReady -> buffer full need poll complete
     #[inline]
@@ -184,11 +204,18 @@ where
         let data_size = frame.len();
         let mut sink = Pin::new(&mut self.substream);
 
-        match sink.as_mut().poll_ready(cx)? {
-            Poll::Ready(()) => {
-                sink.as_mut().start_send(frame)?;
+        match sink.as_mut().poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                if let Err(err) = sink.as_mut().start_send(frame) {
+                    self.context.decr_pending_data_size(data_size);
+                    return Err(err);
+                }
                 self.context.decr_pending_data_size(data_size);
                 Ok(false)
+            }
+            Poll::Ready(Err(err)) => {
+                self.context.decr_pending_data_size(data_size);
+                Err(err)
             }
             Poll::Pending => {
                 self.push_front(priority, frame);
@@ -232,6 +259,16 @@ where
     /// Close protocol sub stream
     fn close_proto_stream(&mut self, cx: &mut Context) {
         self.event_receiver.close();
+        // Drain any in-flight messages that the session pushed into our event
+        // channel but have not yet been polled. Their bytes were counted into
+        // `pending_data_size` when the service enqueued them; if we drop them
+        // silently the counter would leak.
+        while let Ok(Some((_, event))) = self.event_receiver.try_next() {
+            decr_pending_protocol_message(&self.context, event);
+        }
+        // Any frames still queued here will be dropped together with this
+        // substream, roll back their pending byte accounting before dropping.
+        self.clear_write_buffers();
         if let Poll::Ready(Err(e)) = Pin::new(self.substream.get_mut()).poll_shutdown(cx) {
             log::trace!("sub stream poll shutdown err {}", e)
         }
@@ -287,6 +324,9 @@ where
     /// When send or receive message error, output error and close stream
     fn error_close(&mut self, cx: &mut Context, error: io::Error) {
         self.dead = true;
+        // Roll back pending bytes for any frames still queued: this substream
+        // is going away and they will not be sent.
+        self.clear_write_buffers();
         match error.kind() {
             ErrorKind::BrokenPipe
             | ErrorKind::ConnectionAborted
@@ -323,11 +363,12 @@ where
                             error: err,
                         },
                     );
+                    self.clear_write_buffers();
                     self.dead = true;
                 }
             }
             ProtocolEvent::Close { .. } => {
-                self.write_buf.clear();
+                self.clear_write_buffers();
                 self.dead = true;
             }
             _ => (),
@@ -682,6 +723,16 @@ where
         }
     }
 
+    fn clear_write_buffers(&mut self) {
+        let data_size = self
+            .high_write_buf
+            .drain(..)
+            .chain(self.write_buf.drain(..))
+            .map(|frame| frame.len())
+            .sum();
+        self.context.decr_pending_data_size(data_size);
+    }
+
     /// Sink `start_send` Ready -> data send to buffer
     /// Sink `start_send` NotReady -> buffer full need poll complete
     #[inline]
@@ -694,11 +745,18 @@ where
         let data_size = frame.len();
         let mut sink = Pin::new(&mut self.substream);
 
-        match sink.as_mut().poll_ready(cx)? {
-            Poll::Ready(()) => {
-                sink.as_mut().start_send(frame)?;
+        match sink.as_mut().poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                if let Err(err) = sink.as_mut().start_send(frame) {
+                    self.context.decr_pending_data_size(data_size);
+                    return Err(err);
+                }
                 self.context.decr_pending_data_size(data_size);
                 Ok(false)
+            }
+            Poll::Ready(Err(err)) => {
+                self.context.decr_pending_data_size(data_size);
+                Err(err)
             }
             Poll::Pending => {
                 self.push_front(priority, frame);
@@ -773,11 +831,12 @@ where
                             error: err,
                         },
                     );
+                    self.clear_write_buffers();
                     self.dead = true;
                 }
             }
             ProtocolEvent::Close { .. } => {
-                self.write_buf.clear();
+                self.clear_write_buffers();
                 self.dead = true;
             }
             _ => (),
@@ -813,6 +872,9 @@ where
     /// When send or receive message error, output error and close stream
     fn error_close(&mut self, cx: &mut Context, error: io::Error) {
         self.dead = true;
+        // Roll back pending bytes for any frames still queued: this substream
+        // is going away and they will not be sent.
+        self.clear_write_buffers();
         match error.kind() {
             ErrorKind::BrokenPipe
             | ErrorKind::ConnectionAborted
@@ -830,6 +892,16 @@ where
 
     fn close_proto_stream(&mut self, cx: &mut Context) {
         self.event_receiver.close();
+        // Drain any in-flight messages that the session pushed into our event
+        // channel but have not yet been polled. Their bytes were counted into
+        // `pending_data_size` when the service enqueued them; if we drop them
+        // silently the counter would leak.
+        while let Ok(Some((_, event))) = self.event_receiver.try_next() {
+            decr_pending_protocol_message(&self.context, event);
+        }
+        // Any frames still queued here will be dropped together with this
+        // substream, roll back their pending byte accounting before dropping.
+        self.clear_write_buffers();
         if let Poll::Ready(Err(e)) = Pin::new(&mut self.substream).poll_close(cx) {
             log::trace!("sub stream poll shutdown err {}", e)
         }
