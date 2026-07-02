@@ -218,9 +218,7 @@ fn pending_dial_peer_id_does_not_suppress_different_address() {
     //         the TCP connect (proving `dial_protocols` is now populated).
     //    This is a strict post-condition of the pending-state we need to
     //    exercise the (previously vulnerable) dedup path.
-    control
-        .dial(spoofed_addr, TargetProtocol::All)
-        .unwrap();
+    control.dial(spoofed_addr, TargetProtocol::All).unwrap();
     accepted_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("attacker listener must accept the spoofed dial");
