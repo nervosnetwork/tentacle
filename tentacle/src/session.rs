@@ -52,6 +52,37 @@ where
     Framed::from_parts(part).split()
 }
 
+pub(crate) fn poll_next_service_event(
+    receiver: &mut priority_mpsc::Receiver<SessionEvent>,
+    pending_event: &mut Option<(Priority, SessionEvent)>,
+    allow_protocol_message: bool,
+    cx: &mut Context,
+) -> Poll<Option<(Priority, SessionEvent)>> {
+    let next_event = if let Some(event) = pending_event.take() {
+        Poll::Ready(Some(event))
+    } else if allow_protocol_message {
+        Pin::new(receiver).as_mut().poll_next(cx)
+    } else {
+        match receiver.try_next_high() {
+            Ok(Some(event)) => Poll::Ready(Some((Priority::High, event))),
+            Ok(None) => Poll::Ready(None),
+            Err(_) => Poll::Pending,
+        }
+    };
+
+    match next_event {
+        Poll::Ready(Some((priority, event))) => {
+            if !allow_protocol_message && matches!(event, SessionEvent::ProtocolMessage { .. }) {
+                *pending_event = Some((priority, event));
+                Poll::Pending
+            } else {
+                Poll::Ready(Some((priority, event)))
+            }
+        }
+        other => other,
+    }
+}
+
 /// Event generated/received by the Session
 pub(crate) enum SessionEvent {
     /// Session close event
@@ -191,6 +222,7 @@ pub(crate) struct Session {
     service_sender: Buffer<SessionEvent>,
     /// Receive event from service
     service_receiver: priority_mpsc::Receiver<SessionEvent>,
+    pending_service_event: Option<(Priority, SessionEvent)>,
 
     service_proto_senders: IntMap<ProtocolId, Buffer<ServiceProtocolEvent>>,
     session_proto_senders: IntMap<ProtocolId, Buffer<SessionProtocolEvent>>,
@@ -253,6 +285,7 @@ impl Session {
             proto_event_receiver,
             service_sender: Buffer::new(service_sender),
             service_receiver,
+            pending_service_event: None,
             service_proto_senders: meta.service_proto_senders,
             session_proto_senders: meta.session_proto_senders,
             state: SessionState::Normal,
@@ -358,6 +391,16 @@ impl Session {
             self.service_sender.clear();
             self.state = SessionState::Abnormal;
         }
+    }
+
+    #[inline]
+    fn pending_substream_events(&self) -> usize {
+        self.substreams.values().map(PriorityBuffer::len).sum()
+    }
+
+    #[inline]
+    fn substream_events_full(&self) -> bool {
+        self.pending_substream_events() > self.config.send_event_size()
     }
 
     #[inline]
@@ -657,7 +700,14 @@ impl Session {
     }
 
     fn recv_service(&mut self, cx: &mut Context) -> Poll<Option<()>> {
-        match Pin::new(&mut self.service_receiver).as_mut().poll_next(cx) {
+        let allow_protocol_message = !self.substream_events_full();
+
+        match poll_next_service_event(
+            &mut self.service_receiver,
+            &mut self.pending_service_event,
+            allow_protocol_message,
+            cx,
+        ) {
             Poll::Ready(Some((priority, event))) => {
                 if !self.state.is_normal() {
                     Poll::Ready(None)
@@ -823,11 +873,17 @@ impl Stream for Session {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::split_spawn_framed;
+    use super::{SessionEvent, poll_next_service_event, split_spawn_framed};
     use bytes::{Bytes, BytesMut};
-    use futures::StreamExt;
+    use futures::{StreamExt, task::noop_waker_ref};
+    use std::task::{Context, Poll};
     use tokio::io::duplex;
     use tokio_util::codec::{Encoder, FramedParts, LengthDelimitedCodec};
+
+    use crate::{
+        SessionId,
+        channel::mpsc::{self as priority_mpsc, Priority},
+    };
 
     #[tokio::test]
     async fn split_spawn_framed_reads_buffered_first_frame() {
@@ -849,6 +905,64 @@ mod tests {
             .expect("buffered frame should decode");
 
         assert_eq!(first.freeze(), Bytes::from_static(b"init"));
+    }
+
+    #[test]
+    fn service_backpressure_still_allows_high_priority_close() {
+        let (tx, mut rx) = priority_mpsc::channel(16);
+        tx.try_send(SessionEvent::ProtocolMessage {
+            proto_id: 1.into(),
+            data: Bytes::new(),
+        })
+        .unwrap();
+        tx.try_quick_send(SessionEvent::SessionClose { id: SessionId(1) })
+            .unwrap();
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let mut pending = None;
+
+        assert!(matches!(
+            poll_next_service_event(&mut rx, &mut pending, false, &mut cx),
+            Poll::Ready(Some((Priority::High, SessionEvent::SessionClose { .. })))
+        ));
+        assert!(pending.is_none());
+
+        assert!(matches!(
+            poll_next_service_event(&mut rx, &mut pending, true, &mut cx),
+            Poll::Ready(Some((
+                Priority::Normal,
+                SessionEvent::ProtocolMessage { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn service_backpressure_defers_protocol_messages() {
+        let (tx, mut rx) = priority_mpsc::channel(16);
+        tx.try_quick_send(SessionEvent::ProtocolMessage {
+            proto_id: 1.into(),
+            data: Bytes::new(),
+        })
+        .unwrap();
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let mut pending = None;
+
+        assert!(matches!(
+            poll_next_service_event(&mut rx, &mut pending, false, &mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            pending,
+            Some((Priority::High, SessionEvent::ProtocolMessage { .. }))
+        ));
+
+        assert!(matches!(
+            poll_next_service_event(&mut rx, &mut pending, true, &mut cx),
+            Poll::Ready(Some((Priority::High, SessionEvent::ProtocolMessage { .. })))
+        ));
     }
 }
 
