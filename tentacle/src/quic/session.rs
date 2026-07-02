@@ -836,7 +836,10 @@ mod tests {
         multiaddr::Multiaddr,
         quic::{config::QuicConfig, endpoint::QuicEndpoint},
         secio::SecioKeyPair,
-        service::{ServiceAsyncControl, ServiceControl, SessionType, config::SessionConfig},
+        service::{
+            ServiceAsyncControl, ServiceControl, ServiceTaskBudget, SessionType,
+            config::SessionConfig,
+        },
         session::SessionMeta,
     };
     use futures::channel::mpsc as fmpsc;
@@ -847,8 +850,12 @@ mod tests {
     fn dummy_meta(ctx: Arc<SessionContext>) -> SessionMeta {
         let (event_sender, _event_receiver) = priority_mpsc::channel(8);
         let (task_sender, _task_receiver) = priority_mpsc::channel(8);
-        let service_control: ServiceAsyncControl =
-            ServiceControl::new(task_sender, Arc::new(AtomicBool::new(false))).into();
+        let service_control: ServiceAsyncControl = ServiceControl::new(
+            task_sender,
+            Arc::new(AtomicBool::new(false)),
+            ServiceTaskBudget::new(8),
+        )
+        .into();
         SessionMeta::new(Duration::from_secs(60), ctx, event_sender, service_control)
             .config(SessionConfig::default())
     }
