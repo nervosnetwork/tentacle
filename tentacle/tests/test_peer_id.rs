@@ -181,7 +181,7 @@ fn pending_dial_peer_id_does_not_suppress_different_address() {
         // already executed `dial_inner`, which synchronously inserts
         // `spoofed_addr` into `dial_protocols` before spawning the async
         // dial future that we just observed connecting.
-        let _ = accepted_tx.send(());
+        accepted_tx.send(()).ok();
         // Hold the connection so the pending dial keeps occupying
         // `dial_protocols` (up to the default handshake timeout).
         thread::sleep(Duration::from_secs(30));
