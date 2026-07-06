@@ -200,21 +200,44 @@ mod tests {
     }
 
     #[test]
-    fn bytes_partial_advance_keeps_backing_data_without_head_removal() {
-        let mut buf = Bytes::from(b"hello world".to_vec());
+    fn secure_stream_drain_supports_partial_reads() {
+        use crate::crypto::StreamCipher;
 
-        assert_eq!(&buf[..5], b"hello");
-        buf.advance(5);
-        assert_eq!(&buf[..], b" world");
-        assert_eq!(buf.len(), 6);
-    }
+        struct NoopCipher;
+        impl StreamCipher for NoopCipher {
+            fn encrypt(&mut self, input: &[u8]) -> Result<Vec<u8>, crate::error::SecioError> {
+                Ok(input.to_vec())
+            }
 
-    #[test]
-    fn bytes_advance_empty_after_full_drain() {
-        let mut buf = Bytes::from(b"hello".to_vec());
+            fn decrypt(&mut self, input: &[u8]) -> Result<Vec<u8>, crate::error::SecioError> {
+                Ok(input.to_vec())
+            }
+        }
 
-        buf.advance(5);
-        assert!(buf.is_empty());
+        let (io, _peer) = tokio::io::duplex(64);
+        let mut stream = SecureStream::new(
+            Framed::new(io, LengthDelimitedCodec::new()),
+            Box::new(NoopCipher),
+            Box::new(NoopCipher),
+            Vec::new(),
+        );
+
+        stream.recv_buf = Bytes::from(b"hello world".to_vec());
+
+        let mut out1 = [0u8; 5];
+        let mut rb1 = tokio::io::ReadBuf::new(&mut out1);
+        assert_eq!(stream.drain(&mut rb1), 5);
+        assert_eq!(rb1.filled(), b"hello");
+
+        let mut out2 = [0u8; 16];
+        let mut rb2 = tokio::io::ReadBuf::new(&mut out2);
+        assert_eq!(stream.drain(&mut rb2), 6);
+        assert_eq!(rb2.filled(), b" world");
+        assert!(stream.recv_buf.is_empty());
+
+        let mut out3 = [0u8; 1];
+        let mut rb3 = tokio::io::ReadBuf::new(&mut out3);
+        assert_eq!(stream.drain(&mut rb3), 0);
     }
 
     fn test_decode_encode(cipher1: CipherType, cipher2: CipherType) {
