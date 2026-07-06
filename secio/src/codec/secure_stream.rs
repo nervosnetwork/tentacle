@@ -13,45 +13,6 @@ use std::{
 
 use crate::{crypto::BoxStreamCipher, error::SecioError};
 
-enum RecvBuf {
-    Vec(Vec<u8>),
-    Byte(BytesMut),
-}
-
-impl RecvBuf {
-    fn drain_to(&mut self, buf: &mut ReadBuf, size: usize) {
-        match self {
-            RecvBuf::Vec(b) => {
-                buf.put_slice(b.drain(..size).as_slice());
-            }
-            RecvBuf::Byte(b) => {
-                buf.put_slice(&b[..size]);
-                b.advance(size);
-            }
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            RecvBuf::Vec(b) => b.len(),
-            RecvBuf::Byte(b) => b.len(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl AsRef<[u8]> for RecvBuf {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            RecvBuf::Vec(b) => b.as_ref(),
-            RecvBuf::Byte(b) => b.as_ref(),
-        }
-    }
-}
-
 /// Encrypted stream
 pub struct SecureStream<T> {
     socket: Framed<T, LengthDelimitedCodec>,
@@ -67,7 +28,7 @@ pub struct SecureStream<T> {
     /// frame from the underlying Framed<>, the frame will be filled
     /// into this buffer so that multiple following 'read' will eventually
     /// get the message correctly
-    recv_buf: RecvBuf,
+    recv_buf: Bytes,
 }
 
 impl<T> SecureStream<T>
@@ -81,28 +42,23 @@ where
         encode_cipher: BoxStreamCipher,
         nonce: Vec<u8>,
     ) -> Self {
-        let recv_buf = if decode_cipher.is_in_place() {
-            RecvBuf::Byte(BytesMut::new())
-        } else {
-            RecvBuf::Vec(Vec::default())
-        };
         SecureStream {
             socket,
             decode_cipher,
             encode_cipher,
             nonce,
-            recv_buf,
+            recv_buf: Bytes::new(),
         }
     }
 
     /// Decoding data
     #[inline]
-    fn decode_buffer(&mut self, mut frame: BytesMut) -> Result<RecvBuf, SecioError> {
+    fn decode_buffer(&mut self, mut frame: BytesMut) -> Result<Bytes, SecioError> {
         if self.decode_cipher.is_in_place() {
             self.decode_cipher.decrypt_in_place(&mut frame)?;
-            Ok(RecvBuf::Byte(frame))
+            Ok(frame.freeze())
         } else {
-            Ok(RecvBuf::Vec(self.decode_cipher.decrypt(&frame)?))
+            Ok(Bytes::from(self.decode_cipher.decrypt(&frame)?))
         }
     }
 
@@ -130,16 +86,14 @@ where
 
     #[inline]
     fn drain(&mut self, buf: &mut ReadBuf<'_>) -> usize {
-        // Return zero if there is no data remaining in the internal buffer.
         if self.recv_buf.is_empty() {
             return 0;
         }
 
-        // calculate number of bytes that we can copy
         let n = ::std::cmp::min(buf.remaining(), self.recv_buf.len());
 
-        // Copy data to the output buffer
-        self.recv_buf.drain_to(buf, n);
+        buf.put_slice(&self.recv_buf[..n]);
+        self.recv_buf.advance(n);
 
         n
     }
@@ -177,7 +131,7 @@ where
                 let n = decoded.len();
                 trace!("poll_read decoded.len={}", n);
                 if buf.remaining() >= n {
-                    buf.put_slice(decoded.as_ref());
+                    buf.put_slice(&decoded);
                     Poll::Ready(Ok(()))
                 } else {
                     // fill internal recv buffer
@@ -232,7 +186,7 @@ where
 mod tests {
     use super::SecureStream;
     use crate::crypto::{CryptoMode, cipher::CipherType, new_stream};
-    use bytes::BytesMut;
+    use bytes::{Buf, Bytes, BytesMut};
     use futures::channel;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -243,6 +197,47 @@ mod tests {
     fn rt() -> &'static tokio::runtime::Runtime {
         static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+    }
+
+    #[test]
+    fn secure_stream_drain_supports_partial_reads() {
+        use crate::crypto::StreamCipher;
+
+        struct NoopCipher;
+        impl StreamCipher for NoopCipher {
+            fn encrypt(&mut self, input: &[u8]) -> Result<Vec<u8>, crate::error::SecioError> {
+                Ok(input.to_vec())
+            }
+
+            fn decrypt(&mut self, input: &[u8]) -> Result<Vec<u8>, crate::error::SecioError> {
+                Ok(input.to_vec())
+            }
+        }
+
+        let (io, _peer) = tokio::io::duplex(64);
+        let mut stream = SecureStream::new(
+            Framed::new(io, LengthDelimitedCodec::new()),
+            Box::new(NoopCipher),
+            Box::new(NoopCipher),
+            Vec::new(),
+        );
+
+        stream.recv_buf = Bytes::from(b"hello world".to_vec());
+
+        let mut out1 = [0u8; 5];
+        let mut rb1 = tokio::io::ReadBuf::new(&mut out1);
+        assert_eq!(stream.drain(&mut rb1), 5);
+        assert_eq!(rb1.filled(), b"hello");
+
+        let mut out2 = [0u8; 16];
+        let mut rb2 = tokio::io::ReadBuf::new(&mut out2);
+        assert_eq!(stream.drain(&mut rb2), 6);
+        assert_eq!(rb2.filled(), b" world");
+        assert!(stream.recv_buf.is_empty());
+
+        let mut out3 = [0u8; 1];
+        let mut rb3 = tokio::io::ReadBuf::new(&mut out3);
+        assert_eq!(stream.drain(&mut rb3), 0);
     }
 
     fn test_decode_encode(cipher1: CipherType, cipher2: CipherType) {
