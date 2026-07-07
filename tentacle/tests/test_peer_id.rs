@@ -291,20 +291,39 @@ fn dial_deduped_after_authenticated_session_established() {
     // the dial must be short-circuited without touching the network. In
     // particular, no TransportError must surface (which would panic
     // `EmptySHandle::handle_error`), and no phantom SessionOpen must arrive.
-    let unreachable_port = {
-        // Bind and immediately drop to reserve an ephemeral port number that
-        // is highly unlikely to be listening once we release it. Any dial
-        // reaching the network would emit a TransportError and panic the
-        // handler; the fact that we do not observe any event proves the
-        // dial was deduped locally.
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let mut second_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", unreachable_port)
+    let (connect_tx, connect_rx) = channel::<()>();
+    let decoy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    decoy_listener.set_nonblocking(true).unwrap();
+    let decoy_port = decoy_listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let start = std::time::Instant::now();
+        loop {
+            match decoy_listener.accept() {
+                Ok(_) => {
+                    let _ = connect_tx.send(());
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > Duration::from_millis(900) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut second_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", decoy_port)
         .parse()
         .unwrap();
     second_addr.push(MultiProtocol::P2P(Cow::Owned(victim_peer_id.into_bytes())));
     control.dial(second_addr, TargetProtocol::All).unwrap();
+
+    assert!(
+        connect_rx.recv_timeout(Duration::from_millis(900)).is_err(),
+        "dial with a duplicate authenticated /p2p/<peer_id> must be deduped before TCP connect"
+    );
 
     match session_receiver.recv_timeout(Duration::from_millis(800)) {
         Err(_) => (),
