@@ -156,22 +156,11 @@ impl QuicSession {
         // Channel between the session loop and the spawned substream tasks.
         let (proto_event_sender, proto_event_receiver) = mpsc::channel(meta.config.channel_size);
 
-        // Schedule a one-shot timeout-check tick so dangling sessions with no
-        // substream activity get garbage-collected. Mirrors the yamux session.
-        let mut interval = proto_event_sender.clone();
-        let mut future_task_sender_ = future_task_sender.clone();
-        let timeout = meta.timeout;
-        crate::runtime::spawn(async move {
-            crate::runtime::delay_for(timeout).await;
-            let task = Box::pin(async move {
-                if interval.send(ProtocolEvent::TimeoutCheck).await.is_err() {
-                    trace!("timeout check send err")
-                }
-            });
-            if future_task_sender_.send(task).await.is_err() {
-                trace!("timeout check task send err")
-            }
-        });
+        Self::schedule_timeout_check(
+            meta.timeout,
+            proto_event_sender.clone(),
+            future_task_sender.clone(),
+        );
 
         QuicSession {
             conn,
@@ -254,6 +243,30 @@ impl QuicSession {
         crate::runtime::spawn(async move {
             if future_task_sender.send(task).await.is_err() {
                 trace!("select procedure send err")
+            }
+        });
+    }
+
+    fn schedule_timeout_check(
+        timeout: Duration,
+        mut proto_event_sender: mpsc::Sender<ProtocolEvent>,
+        mut future_task_sender: mpsc::Sender<BoxedFutureTask>,
+    ) {
+        // NOTE: A Interval/Delay will block tokio runtime from gracefully shutdown.
+        //       So we spawn it in FutureTaskManager.
+        crate::runtime::spawn(async move {
+            crate::runtime::delay_for(timeout).await;
+            let task = Box::pin(async move {
+                if proto_event_sender
+                    .send(ProtocolEvent::TimeoutCheck)
+                    .await
+                    .is_err()
+                {
+                    trace!("timeout check send err")
+                }
+            });
+            if future_task_sender.send(task).await.is_err() {
+                trace!("timeout check task send err")
             }
         });
     }
@@ -495,6 +508,12 @@ impl QuicSession {
                         },
                     );
                     self.state = SessionState::LocalClose;
+                } else {
+                    Self::schedule_timeout_check(
+                        self.timeout,
+                        self.proto_event_sender.clone(),
+                        self.future_task_sender.clone(),
+                    );
                 }
             }
         }

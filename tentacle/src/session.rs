@@ -214,23 +214,11 @@ impl Session {
         let socket = YamuxSession::new(socket, meta.config.yamux_config, meta.context.ty.into());
         let control = socket.control();
         let (proto_event_sender, proto_event_receiver) = mpsc::channel(meta.config.channel_size);
-        let mut interval = proto_event_sender.clone();
-
-        // NOTE: A Interval/Delay will block tokio runtime from gracefully shutdown.
-        //       So we spawn it in FutureTaskManager
-        let mut future_task_sender_ = future_task_sender.clone();
-        let timeout = meta.timeout;
-        crate::runtime::spawn(async move {
-            crate::runtime::delay_for(timeout).await;
-            let task = Box::pin(async move {
-                if interval.send(ProtocolEvent::TimeoutCheck).await.is_err() {
-                    trace!("timeout check send err")
-                }
-            });
-            if future_task_sender_.send(task).await.is_err() {
-                trace!("timeout check task send err")
-            }
-        });
+        Self::schedule_timeout_check(
+            meta.timeout,
+            proto_event_sender.clone(),
+            future_task_sender.clone(),
+        );
         // background inner socket
         let sid = meta.context.id;
         crate::runtime::spawn(
@@ -558,6 +546,12 @@ impl Session {
                         },
                     );
                     self.state = SessionState::LocalClose;
+                } else {
+                    Self::schedule_timeout_check(
+                        self.timeout,
+                        self.proto_event_sender.clone(),
+                        self.future_task_sender.clone(),
+                    );
                 }
             }
         }
@@ -730,6 +724,30 @@ impl Session {
         } else {
             Poll::Pending
         }
+    }
+
+    fn schedule_timeout_check(
+        timeout: Duration,
+        mut proto_event_sender: mpsc::Sender<ProtocolEvent>,
+        mut future_task_sender: mpsc::Sender<BoxedFutureTask>,
+    ) {
+        // NOTE: A Interval/Delay will block tokio runtime from gracefully shutdown.
+        //       So we spawn it in FutureTaskManager.
+        crate::runtime::spawn(async move {
+            crate::runtime::delay_for(timeout).await;
+            let task = Box::pin(async move {
+                if proto_event_sender
+                    .send(ProtocolEvent::TimeoutCheck)
+                    .await
+                    .is_err()
+                {
+                    trace!("timeout check send err")
+                }
+            });
+            if future_task_sender.send(task).await.is_err() {
+                trace!("timeout check task send err")
+            }
+        });
     }
 
     /// Clean env
