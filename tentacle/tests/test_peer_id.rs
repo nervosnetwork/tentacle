@@ -300,7 +300,7 @@ fn dial_deduped_after_authenticated_session_established() {
         loop {
             match decoy_listener.accept() {
                 Ok(_) => {
-                    let _ = connect_tx.send(());
+                    connect_tx.send(()).ok();
                     break;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
