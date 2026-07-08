@@ -7,13 +7,13 @@ use std::{
 use crate::service::TlsConfig;
 use crate::{
     error::TransportErrorKind,
-    multiaddr::{Multiaddr, Protocol},
-    runtime::TcpStream,
+    multiaddr::Multiaddr,
+    runtime::{self, TcpStream},
     service::config::TcpSocketConfig,
     transports::{
         Result, TcpListenMode, TransportDial, TransportFuture, TransportListen,
         tcp_base_listen::{TcpBaseListenerEnum, UpgradeMode, bind},
-        tcp_dial, tcp_proxy_dial,
+        tcp_dial,
     },
     utils::{dns::DnsResolver, multiaddr_to_socketaddr},
 };
@@ -33,33 +33,6 @@ async fn connect(
         }
         None => Err(TransportErrorKind::NotSupported(original.unwrap_or(addr))),
     }
-}
-
-fn dns_tcp_target(address: &Multiaddr) -> Option<(String, u16)> {
-    let mut iter = address.iter().peekable();
-
-    while iter.peek().is_some() {
-        match iter.peek() {
-            Some(Protocol::Dns4(_)) | Some(Protocol::Dns6(_)) => {}
-            _ => {
-                let _ignore = iter.next();
-                continue;
-            }
-        }
-
-        let proto1 = iter.next()?;
-        let proto2 = iter.next()?;
-
-        match (proto1, proto2) {
-            (Protocol::Dns4(domain), Protocol::Tcp(port))
-            | (Protocol::Dns6(domain), Protocol::Tcp(port)) => {
-                return Some((domain.into_owned(), port));
-            }
-            _ => {}
-        }
-    }
-
-    None
 }
 
 /// Tcp transport
@@ -156,20 +129,41 @@ impl TransportDial for TcpTransport {
     type DialFuture = TcpDialFuture;
 
     fn dial(self, address: Multiaddr) -> Result<Self::DialFuture> {
-        if self.tcp_config.proxy_url.is_some() {
-            if let Some((target_addr, target_port)) = dns_tcp_target(&address) {
-                let task = async move {
-                    let stream =
-                        tcp_proxy_dial(target_addr, target_port, self.tcp_config, self.timeout)
-                            .await?;
-                    Ok((address, stream))
-                };
-                return Ok(TransportFuture::new(Box::pin(task)));
-            }
-        }
-
         match DnsResolver::new(address.clone()) {
             Some(dns) => {
+                if let Some(proxy_url) = self.tcp_config.proxy_url.clone() {
+                    let (target_addr, target_port) = dns.tcp_target();
+                    let target_addr = target_addr.to_owned();
+                    let proxy_random_auth = self.tcp_config.proxy_random_auth;
+                    let timeout = self.timeout;
+                    let task = async move {
+                        let stream = match runtime::timeout(
+                            timeout,
+                            runtime::connect_by_proxy(
+                                target_addr,
+                                target_port,
+                                proxy_url,
+                                proxy_random_auth,
+                            ),
+                        )
+                        .await
+                        {
+                            Err(_) => {
+                                Err(TransportErrorKind::Io(std::io::ErrorKind::TimedOut.into()))
+                            }
+                            Ok(res) => res.map_err(|err| {
+                                if err.to_string().contains("connect_by_proxy") {
+                                    TransportErrorKind::ProxyError(err)
+                                } else {
+                                    err.into()
+                                }
+                            }),
+                        }?;
+                        Ok((address, stream))
+                    };
+                    return Ok(TransportFuture::new(Box::pin(task)));
+                }
+
                 // Why do this?
                 // Because here need to save the original address as an index to open the specified protocol.
                 let task = connect(
