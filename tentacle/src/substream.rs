@@ -112,17 +112,6 @@ pub(crate) enum ProtocolEvent {
     TimeoutCheck,
 }
 
-fn is_expected_connection_close(error: ErrorKind) -> bool {
-    matches!(
-        error,
-        ErrorKind::BrokenPipe
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::ConnectionReset
-            | ErrorKind::NotConnected
-            | ErrorKind::UnexpectedEof
-    )
-}
-
 /// Each custom protocol in a session corresponds to a sub stream
 /// Can be seen as the route of each protocol
 pub(crate) struct Substream<U> {
@@ -298,12 +287,21 @@ where
     /// When send or receive message error, output error and close stream
     fn error_close(&mut self, cx: &mut Context, error: io::Error) {
         self.dead = true;
-        if !is_expected_connection_close(error.kind()) {
-            self.event_sender.push(ProtocolEvent::Error {
-                proto_id: self.proto_id,
-                error,
-            });
+        match error.kind() {
+            ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof => {
+                self.close_proto_stream(cx);
+                return;
+            }
+            _ => {}
         }
+        self.event_sender.push(ProtocolEvent::Error {
+            proto_id: self.proto_id,
+            error,
+        });
         self.close_proto_stream(cx);
     }
 
@@ -818,12 +816,21 @@ where
     /// When send or receive message error, output error and close stream
     fn error_close(&mut self, cx: &mut Context, error: io::Error) {
         self.dead = true;
-        if !is_expected_connection_close(error.kind()) {
-            self.event_sender.push(ProtocolEvent::Error {
-                proto_id: self.proto_id,
-                error,
-            });
+        match error.kind() {
+            ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof => {
+                self.close_proto_stream(cx);
+                return;
+            }
+            _ => {}
         }
+        self.event_sender.push(ProtocolEvent::Error {
+            proto_id: self.proto_id,
+            error,
+        });
         self.close_proto_stream(cx);
     }
 
