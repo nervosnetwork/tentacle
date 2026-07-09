@@ -113,6 +113,7 @@ mod os {
         time::Duration,
     };
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
     use self::memory::{
         MemoryDialFuture, MemoryListenFuture, MemoryListener, MemorySocket, MemoryTransport,
@@ -145,6 +146,7 @@ mod os {
         pub(crate) tls_config: Option<TlsConfig>,
         /// Trusted proxy addresses for HAProxy PROXY protocol and X-Forwarded-For header parsing.
         pub(crate) trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+        pub(crate) connection_limiter: Option<Arc<Semaphore>>,
     }
 
     impl MultiTransport {
@@ -152,6 +154,7 @@ mod os {
             timeout: ServiceTimeout,
             tcp_config: TcpConfig,
             trusted_proxies: Vec<std::net::IpAddr>,
+            connection_limiter: Option<Arc<Semaphore>>,
         ) -> Self {
             MultiTransport {
                 timeout,
@@ -160,6 +163,7 @@ mod os {
                 #[cfg(feature = "tls")]
                 tls_config: None,
                 trusted_proxies: Arc::new(trusted_proxies),
+                connection_limiter,
             }
         }
 
@@ -423,19 +427,22 @@ mod os {
     }
 
     impl Stream for MultiIncoming {
-        type Item = std::result::Result<(Multiaddr, MultiStream), io::Error>;
+        type Item =
+            std::result::Result<(Multiaddr, MultiStream, Option<OwnedSemaphorePermit>), io::Error>;
 
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
             match self.get_mut() {
                 MultiIncoming::Tcp(inner) => match inner.poll_next_unpin(cx)? {
-                    Poll::Ready(Some((addr, stream))) => Poll::Ready(Some(Ok((addr, stream)))),
+                    Poll::Ready(Some((addr, stream, connection_permit))) => {
+                        Poll::Ready(Some(Ok((addr, stream, connection_permit))))
+                    }
                     Poll::Ready(None) => Poll::Ready(None),
                     Poll::Pending => Poll::Pending,
                 },
                 MultiIncoming::TcpUpgrade => unreachable!(),
                 MultiIncoming::Memory(inner) => match inner.poll_next_unpin(cx)? {
                     Poll::Ready(Some((addr, stream))) => {
-                        Poll::Ready(Some(Ok((addr, MultiStream::Memory(stream)))))
+                        Poll::Ready(Some(Ok((addr, MultiStream::Memory(stream), None))))
                     }
                     Poll::Ready(None) => Poll::Ready(None),
                     Poll::Pending => Poll::Pending,

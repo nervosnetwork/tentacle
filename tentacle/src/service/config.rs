@@ -46,7 +46,8 @@ pub(crate) struct ServiceConfig {
     pub keep_buffer: bool,
     #[cfg(all(not(target_family = "wasm"), feature = "upnp"))]
     pub upnp: bool,
-    pub max_connection_number: usize,
+    pub max_inbound_connection_number: usize,
+    pub max_outbound_connection_number: usize,
     pub tcp_config: TcpConfig,
     #[cfg(feature = "tls")]
     pub tls_config: Option<TlsConfig>,
@@ -68,7 +69,8 @@ impl Default for ServiceConfig {
             keep_buffer: false,
             #[cfg(all(not(target_family = "wasm"), feature = "upnp"))]
             upnp: false,
-            max_connection_number: 65535,
+            max_inbound_connection_number: 65535,
+            max_outbound_connection_number: 65535,
             tcp_config: Default::default(),
             #[cfg(feature = "tls")]
             tls_config: None,
@@ -527,14 +529,6 @@ impl State {
         match self {
             State::Running(num) => *num -= 1,
             State::PreShutdown | State::Forever => (),
-        }
-    }
-
-    #[inline]
-    pub fn into_inner(self) -> Option<usize> {
-        match self {
-            State::Running(num) => Some(num),
-            State::PreShutdown | State::Forever => None,
         }
     }
 }

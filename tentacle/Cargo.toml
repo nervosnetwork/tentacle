@@ -22,7 +22,7 @@ yamux = { path = "../yamux", version = "0.3.19", default-features = false, packa
 secio = { path = "../secio", version = "0.6.8", package = "tentacle-secio" }
 
 futures = { version = "0.3.0" }
-tokio = { version = "1.0.0", features = ["macros"] }
+tokio = { version = "1.0.0", features = ["macros", "sync"] }
 tokio-util = { version = "0.7.0", features = ["codec"] }
 async-trait = "0.1"
 log = "0.4"
