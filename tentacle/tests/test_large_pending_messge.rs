@@ -39,7 +39,7 @@ impl ServiceProtocol for PHandle {
         if context.session.ty.is_inbound() {
             let data = Bytes::from(vec![0; 1024 * 1024 * 8]);
             loop {
-                let _res = context.send_message(data.clone()).await;
+                let _res = context.quick_send_message(data.clone()).await;
             }
         }
     }
