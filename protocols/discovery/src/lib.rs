@@ -14,7 +14,7 @@ use rand::seq::SliceRandom;
 
 pub use addr::{AddressManager, MisbehaveResult, Misbehavior};
 use protocol::{decode, encode, DiscoveryMessage, Node, Nodes};
-use state::{RemoteAddress, SessionState};
+use state::SessionState;
 
 mod addr;
 mod protocol;
@@ -122,11 +122,21 @@ impl<M: AddressManager> ServiceProtocol for DiscoveryProtocol<M> {
                             // change client random outbound port to client listen port
                             debug!("listen port: {:?}", listen_port);
                             if let Some(port) = listen_port {
-                                state.remote_addr.update_port(port);
-                                state.addr_known.insert(state.remote_addr.to_inner());
-                                // add client listen address to manager
-                                if let RemoteAddress::Listen(ref addr) = state.remote_addr {
-                                    self.addr_mgr.add_new_addr(session.id, addr.clone());
+                                // `listen_port` is peer-controlled and
+                                // unauthenticated. `apply_listen_port` rejects
+                                // obviously invalid values (e.g. port 0); the
+                                // rewritten `Listen` address is then validated by
+                                // the address manager, the same gate the announce
+                                // path already applies, before it is stored. This
+                                // prevents a malicious peer from poisoning the
+                                // store with an invalid endpoint for its observed
+                                // source IP.
+                                if let Some(addr) = state.apply_listen_port(port) {
+                                    if self.addr_mgr.is_valid_addr(&addr) {
+                                        state.mark_listen_addr_known(&addr);
+                                        // add client listen address to manager
+                                        self.addr_mgr.add_new_addr(session.id, addr);
+                                    }
                                 }
                             }
 
