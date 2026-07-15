@@ -225,7 +225,25 @@ where
         }
     }
 
-    pub async fn run(&mut self, mut recv: oneshot::Receiver<()>) {
+    pub async fn run(&mut self, recv: oneshot::Receiver<()>) {
+        // Wrap the whole run loop with the cancellation receiver so that a
+        // cancel signal can drop the loop at *any* await point, including while
+        // a user protocol callback inside `handle_event(...)` is still pending.
+        //
+        // The receiver must not live only as a `tokio::select!` branch of the
+        // inner loop: once an event branch wins and `handle_event(...).await`
+        // starts running, that branch would not be polled again until the
+        // callback returns, so a long-lived/pending callback could delay
+        // (or indefinitely block) cancellation-driven cleanup.
+        //
+        // `pin_mut!` keeps this on the stack, avoiding the `Box::pin` that the
+        // previous `future::select(Box::pin(self.run_inner()), recv)` required.
+        let inner = self.run_inner();
+        futures::pin_mut!(inner);
+        futures::future::select(inner, recv).await;
+    }
+
+    async fn run_inner(&mut self) {
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 debug!(
@@ -252,7 +270,6 @@ where
                 res = &mut self.handle.poll(&mut self.handle_context), if self.need_poll => {
                     self.need_poll = res.is_some();
                 },
-                _ = &mut recv => break,
                 else => break
             }
         }
@@ -445,7 +462,16 @@ where
         self.current_task = false;
     }
 
-    pub async fn run(&mut self, mut recv: oneshot::Receiver<()>) {
+    pub async fn run(&mut self, recv: oneshot::Receiver<()>) {
+        // See `ServiceProtocolStream::run`: the cancellation receiver wraps the
+        // whole loop so it can interrupt a pending `handle_event(...)` callback,
+        // rather than only being polled between inner `tokio::select!` rounds.
+        let inner = self.run_inner();
+        futures::pin_mut!(inner);
+        futures::future::select(inner, recv).await;
+    }
+
+    async fn run_inner(&mut self) {
         loop {
             poll_fn(crate::runtime::poll_proceed).await;
             tokio::select! {
@@ -464,7 +490,6 @@ where
                 res = self.handle.poll(self.handle_context.as_mut(&self.context)), if self.need_poll => {
                     self.need_poll = res.is_some();
                 },
-                _ = &mut recv => break,
                 else => break
             }
         }
@@ -485,5 +510,177 @@ impl<T> Drop for SessionProtocolStream<T> {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ProtocolId, SessionId,
+        context::{ProtocolContextMutRef, SessionContext},
+        service::SessionType,
+        traits::{ServiceProtocol, SessionProtocol},
+    };
+    use futures::future::{self, Either};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    /// A protocol handle whose callbacks never complete. Used to keep the
+    /// stream sitting inside `handle_event(...).await` so we can assert that a
+    /// cancellation oneshot can still interrupt it.
+    struct PendingHandle;
+
+    #[async_trait::async_trait]
+    impl ServiceProtocol for PendingHandle {
+        async fn init(&mut self, _context: &mut ProtocolContext) {
+            // Never returns: models a long-lived / stuck user callback.
+            future::pending::<()>().await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionProtocol for PendingHandle {
+        async fn connected(&mut self, _context: ProtocolContextMutRef<'_>, _version: &str) {
+            future::pending::<()>().await;
+        }
+    }
+
+    fn dummy_service_context() -> ServiceContext {
+        // `ServiceContext` uses the crate's internal channel, distinct from the
+        // `futures::channel::mpsc` used for protocol events below.
+        let (task_sender, _task_receiver) = crate::channel::mpsc::channel(1);
+        ServiceContext::new(task_sender, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn dummy_session_context() -> Arc<SessionContext> {
+        Arc::new(SessionContext::new(
+            SessionId::new(1),
+            "/ip4/127.0.0.1/tcp/1337".parse().unwrap(),
+            SessionType::Inbound,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        ))
+    }
+
+    /// Drives `run` to completion, but fails the test (rather than hanging
+    /// forever) if `run` does not finish, so a regression is observable as a
+    /// timeout error instead of a stuck test.
+    async fn assert_completes<F: std::future::Future<Output = ()>>(run: F) {
+        match future::select(
+            Box::pin(run),
+            Box::pin(crate::runtime::delay_for(Duration::from_secs(5))),
+        )
+        .await
+        {
+            Either::Left(_) => {}
+            Either::Right(_) => panic!(
+                "run() did not return after cancellation: a pending callback \
+                 is blocking cancellation-driven cleanup (regression)"
+            ),
+        }
+    }
+
+    // Regression test for the protocol-task cancellation regression: sending the
+    // cancellation oneshot must terminate `ServiceProtocolStream::run` even while
+    // a user callback inside `handle_event(...)` is still pending.
+    #[tokio::test]
+    async fn service_stream_cancel_interrupts_pending_callback() {
+        let (mut event_sender, event_receiver) = mpsc::channel(1);
+        let (panic_report, _panic_receiver) = mpsc::channel(1);
+        let (_future_task_sender, _future_task_receiver) = mpsc::channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut stream = ServiceProtocolStream::new(
+            PendingHandle,
+            dummy_service_context(),
+            event_receiver,
+            ProtocolId::new(1),
+            panic_report,
+            (shutdown, _future_task_sender),
+        );
+
+        let (cancel_sender, cancel_receiver) = oneshot::channel();
+
+        // Queue an event whose callback (`init`) blocks forever.
+        event_sender.send(ServiceProtocolEvent::Init).await.unwrap();
+
+        let run = async move { stream.run(cancel_receiver).await };
+        futures::pin_mut!(run);
+
+        // Let `run` pick up the event and enter the pending `init` callback.
+        assert!(
+            matches!(
+                future::select(
+                    &mut run,
+                    Box::pin(crate::runtime::delay_for(Duration::from_millis(50)))
+                )
+                .await,
+                Either::Right(_)
+            ),
+            "run() should still be pending while the callback is pending"
+        );
+
+        // Fire cancellation; `run` must now return promptly.
+        cancel_sender.send(()).unwrap();
+        assert_completes(run).await;
+    }
+
+    // Same regression test for the session-level protocol stream.
+    #[tokio::test]
+    async fn session_stream_cancel_interrupts_pending_callback() {
+        let (mut event_sender, event_receiver) = mpsc::channel(1);
+        let (panic_report, _panic_receiver) = mpsc::channel(1);
+        let (_future_task_sender, _future_task_receiver) = mpsc::channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut stream = SessionProtocolStream::new(
+            PendingHandle,
+            dummy_service_context(),
+            dummy_session_context(),
+            event_receiver,
+            ProtocolId::new(1),
+            panic_report,
+            // Mark shutdown so the `Drop` impl does not report AbnormallyClosed
+            // for the deliberately-cancelled pending callback in this test.
+            (shutdown, _future_task_sender),
+        );
+
+        let (cancel_sender, cancel_receiver) = oneshot::channel();
+
+        // `Opened` dispatches into the `connected` callback, which blocks forever.
+        event_sender
+            .send(SessionProtocolEvent::Opened {
+                version: "0.0.1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let run = async move {
+            stream.run(cancel_receiver).await;
+            // Keep `stream` alive until run returns, then mark shutdown before
+            // drop so the pending-callback drop path does not emit a panic event.
+            stream.shutdown.store(true, Ordering::SeqCst);
+        };
+        futures::pin_mut!(run);
+
+        assert!(
+            matches!(
+                future::select(
+                    &mut run,
+                    Box::pin(crate::runtime::delay_for(Duration::from_millis(50)))
+                )
+                .await,
+                Either::Right(_)
+            ),
+            "run() should still be pending while the callback is pending"
+        );
+
+        cancel_sender.send(()).unwrap();
+        assert_completes(run).await;
     }
 }
