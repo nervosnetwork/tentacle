@@ -78,21 +78,11 @@ pub(crate) fn listen(addr: SocketAddr, tcp_config: TcpSocketConfig) -> io::Resul
     let domain = Domain::for_address(addr);
     let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
 
-    // reuse addr and reuse port's situation on each platform
-    // https://stackoverflow.com/questions/14388706/how-do-so-reuseaddr-and-so-reuseport-differ
-
     let socket = {
-        // On platforms with Berkeley-derived sockets, this allows to quickly
-        // rebind a socket, without needing to wait for the OS to clean up the
-        // previous one.
-        //
-        // On Windows, this allows rebinding sockets which are actively in use,
-        // which allows “socket hijacking”, so we explicitly don't set it here.
-        // https://docs.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse
-        //
-        // user can disable it on socket_transformer
-        #[cfg(not(windows))]
-        socket.set_reuse_address(true)?;
+        // Do not enable SO_REUSEADDR by default. Some Unix platforms allow a
+        // second, more-specific listener to bind the same port as a wildcard
+        // listener when both sockets use SO_REUSEADDR. Users that need fast
+        // rebinding can opt in through socket_transformer.
         let transformer_context = TransformerContext::new_listen(addr);
         let t = (tcp_config.socket_transformer)(TcpSocket { inner: socket }, transformer_context)?;
         t.inner.set_nonblocking(true)?;
@@ -234,4 +224,31 @@ pub(crate) async fn connect_onion(
     let onion_port = onion_protocol.port();
 
     connect_by_proxy(onion_str, onion_port, tor_server_url, proxy_random_auth).await
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+    use crate::service::config::TcpSocketConfig;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn listen_socket_does_not_enable_reuse_address_by_default() {
+        let observed = Arc::new(AtomicBool::new(true));
+        let observed_clone = observed.clone();
+        let config = TcpSocketConfig {
+            socket_transformer: Arc::new(move |socket, _| {
+                observed_clone.store(socket.inner.reuse_address()?, Ordering::SeqCst);
+                Ok(socket)
+            }),
+            ..Default::default()
+        };
+
+        let _listener = listen("127.0.0.1:0".parse().unwrap(), config).unwrap();
+
+        assert!(!observed.load(Ordering::SeqCst));
+    }
 }
