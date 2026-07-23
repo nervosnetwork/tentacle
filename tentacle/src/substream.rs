@@ -292,8 +292,11 @@ where
             | ErrorKind::ConnectionAborted
             | ErrorKind::ConnectionReset
             | ErrorKind::NotConnected
-            | ErrorKind::UnexpectedEof => return,
-            _ => (),
+            | ErrorKind::UnexpectedEof => {
+                self.close_proto_stream(cx);
+                return;
+            }
+            _ => {}
         }
         self.event_sender.push(ProtocolEvent::Error {
             proto_id: self.proto_id,
@@ -818,8 +821,11 @@ where
             | ErrorKind::ConnectionAborted
             | ErrorKind::ConnectionReset
             | ErrorKind::NotConnected
-            | ErrorKind::UnexpectedEof => return,
-            _ => (),
+            | ErrorKind::UnexpectedEof => {
+                self.close_proto_stream(cx);
+                return;
+            }
+            _ => {}
         }
         self.event_sender.push(ProtocolEvent::Error {
             proto_id: self.proto_id,
@@ -967,6 +973,89 @@ impl Stream for SubstreamReadPart {
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    };
+    use tokio::io::duplex;
+    use tokio_util::codec::LengthDelimitedCodec;
+    use yamux::{Config as YamuxConfig, Session as YamuxSession};
+
+    fn test_context() -> Arc<SessionContext> {
+        Arc::new(SessionContext::new(
+            1.into(),
+            "/memory/0".parse().unwrap(),
+            crate::service::SessionType::Outbound,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        ))
+    }
+
+    fn test_yamux_stream() -> yamux::StreamHandle {
+        let (client_io, _server_io) = duplex(1024);
+        let mut client = YamuxSession::new_client(client_io, YamuxConfig::default());
+        client.open_stream().expect("open yamux stream")
+    }
+
+    async fn expect_close_event(mut receiver: mpsc::Receiver<ProtocolEvent>) {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), receiver.next()).await {
+            Ok(Some(ProtocolEvent::Close { id, proto_id })) => {
+                assert_eq!(id, 7);
+                assert_eq!(proto_id, 42.into());
+            }
+            Ok(Some(event)) => panic!("expected close event, got {event:?}"),
+            Ok(None) => panic!("expected close event, got closed channel"),
+            Err(_) => panic!("timed out waiting for close event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn substream_expected_connection_error_still_sends_close() {
+        let (event_sender, event_receiver) = mpsc::channel(8);
+        let (_command_sender, command_receiver) = priority_mpsc::channel(8);
+        let substream = Framed::new(
+            SubstreamInner::Yamux(test_yamux_stream()),
+            LengthDelimitedCodec::new(),
+        );
+        let mut substream = SubstreamBuilder::new(event_sender, command_receiver, test_context())
+            .stream_id(7)
+            .proto_id(42.into())
+            .build(substream);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        substream.error_close(&mut cx, ErrorKind::BrokenPipe.into());
+
+        expect_close_event(event_receiver).await;
+    }
+
+    #[tokio::test]
+    async fn substream_write_part_expected_connection_error_still_sends_close() {
+        let (event_sender, event_receiver) = mpsc::channel(8);
+        let (_command_sender, command_receiver) = priority_mpsc::channel(8);
+        let substream = Framed::new(
+            SubstreamInner::Yamux(test_yamux_stream()),
+            LengthDelimitedCodec::new(),
+        );
+        let (sink, _stream) = substream.split();
+        let mut write_part =
+            SubstreamWritePartBuilder::new(event_sender, command_receiver, test_context())
+                .stream_id(7)
+                .proto_id(42.into())
+                .build(sink);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        write_part.error_close(&mut cx, ErrorKind::BrokenPipe.into());
+
+        expect_close_event(event_receiver).await;
     }
 }
 
