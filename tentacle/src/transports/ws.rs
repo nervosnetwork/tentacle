@@ -11,7 +11,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
     WebSocketStream, client_async_with_config,
-    tungstenite::{Error, Message},
+    tungstenite::{Error, Message, protocol::WebSocketConfig},
 };
 
 use crate::{
@@ -23,12 +23,24 @@ use crate::{
     utils::{dns::DnsResolver, multiaddr_to_socketaddr},
 };
 
+// LengthDelimitedCodec prefixes each payload with a 4-byte length field.
+const LENGTH_DELIMITED_PREFIX_LEN: usize = 4;
+
+pub(crate) fn websocket_config(max_frame_length: usize) -> WebSocketConfig {
+    let max_message_length = max_frame_length.saturating_add(LENGTH_DELIMITED_PREFIX_LEN);
+
+    WebSocketConfig::default()
+        .max_message_size(Some(max_message_length))
+        .max_frame_size(Some(max_message_length))
+}
+
 /// websocket connect
 async fn connect(
     address: impl Future<Output = Result<Multiaddr>>,
     timeout: Duration,
     original: Option<Multiaddr>,
     tcp_config: TcpSocketConfig,
+    max_frame_length: usize,
 ) -> Result<(Multiaddr, WsStream)> {
     let addr = address.await?;
     match multiaddr_to_socketaddr(&addr) {
@@ -36,7 +48,12 @@ async fn connect(
             let url = format!("ws://{}:{}", socket_address.ip(), socket_address.port());
             let tcp = tcp_dial(socket_address, tcp_config, timeout).await?;
 
-            match crate::runtime::timeout(timeout, client_async_with_config(url, tcp, None)).await {
+            match crate::runtime::timeout(
+                timeout,
+                client_async_with_config(url, tcp, Some(websocket_config(max_frame_length))),
+            )
+            .await
+            {
                 Err(_) => Err(TransportErrorKind::Io(io::ErrorKind::TimedOut.into())),
                 Ok(res) => Ok((original.unwrap_or(addr), {
                     let (stream, _) = res.map_err(|err| {
@@ -57,13 +74,15 @@ async fn connect(
 pub struct WsTransport {
     timeout: Duration,
     tcp_config: TcpSocketConfig,
+    max_frame_length: usize,
 }
 
 impl WsTransport {
-    pub fn new(timeout: Duration, tcp_config: TcpSocketConfig) -> Self {
+    pub fn new(timeout: Duration, tcp_config: TcpSocketConfig, max_frame_length: usize) -> Self {
         WsTransport {
             timeout,
             tcp_config,
+            max_frame_length,
         }
     }
 }
@@ -86,11 +105,18 @@ impl TransportDial for WsTransport {
                     self.timeout,
                     Some(address),
                     self.tcp_config,
+                    self.max_frame_length,
                 );
                 Ok(TransportFuture::new(Box::pin(task)))
             }
             None => {
-                let dial = connect(ok(address), self.timeout, None, self.tcp_config);
+                let dial = connect(
+                    ok(address),
+                    self.timeout,
+                    None,
+                    self.tcp_config,
+                    self.max_frame_length,
+                );
                 Ok(TransportFuture::new(Box::pin(dial)))
             }
         }
@@ -284,5 +310,19 @@ impl AsyncWrite for WsStream {
             .as_mut()
             .poll_close(cx)
             .map_err(|_| io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::config::TcpSocketConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn ws_transport_remembers_configured_frame_limit() {
+        let transport = WsTransport::new(Duration::from_secs(1), TcpSocketConfig::default(), 2048);
+
+        assert_eq!(transport.max_frame_length, 2048);
     }
 }

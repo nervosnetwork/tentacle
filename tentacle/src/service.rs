@@ -259,6 +259,7 @@ where
                         config.timeout,
                         config.tcp_config.clone(),
                         config.trusted_proxies.clone(),
+                        config.max_frame_length,
                     );
                     #[cfg(feature = "tls")]
                     let transport = transport.tls_config(config.tls_config.clone());
