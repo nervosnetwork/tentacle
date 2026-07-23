@@ -329,7 +329,7 @@ impl<T: Callback> ServiceProtocol for IdentifyProtocol<T> {
         }
 
         for (session_id, info) in &self.remote_infos {
-            if info.has_received && (info.connected_at + info.timeout) <= Instant::now() {
+            if !info.has_received && (info.connected_at + info.timeout) <= Instant::now() {
                 debug!("{:?} receive identify message timeout", info.peer_id);
                 if self
                     .callback
