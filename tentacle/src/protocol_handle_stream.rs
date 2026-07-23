@@ -387,6 +387,7 @@ where
                     .await
             }
             Closed => {
+                self.notify.clear();
                 self.handle
                     .disconnected(self.handle_context.as_mut(&self.context))
                     .await
