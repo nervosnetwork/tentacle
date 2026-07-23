@@ -105,6 +105,7 @@ pub(crate) struct QuicSession {
 
     config: SessionConfig,
     timeout: Duration,
+    timeout_generation: u64,
     keep_buffer: bool,
     state: SessionState,
     context: Arc<SessionContext>,
@@ -156,22 +157,13 @@ impl QuicSession {
         // Channel between the session loop and the spawned substream tasks.
         let (proto_event_sender, proto_event_receiver) = mpsc::channel(meta.config.channel_size);
 
-        // Schedule a one-shot timeout-check tick so dangling sessions with no
-        // substream activity get garbage-collected. Mirrors the yamux session.
-        let mut interval = proto_event_sender.clone();
-        let mut future_task_sender_ = future_task_sender.clone();
-        let timeout = meta.timeout;
-        crate::runtime::spawn(async move {
-            crate::runtime::delay_for(timeout).await;
-            let task = Box::pin(async move {
-                if interval.send(ProtocolEvent::TimeoutCheck).await.is_err() {
-                    trace!("timeout check send err")
-                }
-            });
-            if future_task_sender_.send(task).await.is_err() {
-                trace!("timeout check task send err")
-            }
-        });
+        let timeout_generation = 1;
+        Self::schedule_timeout_check(
+            meta.timeout,
+            proto_event_sender.clone(),
+            future_task_sender.clone(),
+            timeout_generation,
+        );
 
         QuicSession {
             conn,
@@ -179,6 +171,7 @@ impl QuicSession {
             protocol_configs_by_id: meta.protocol_configs_by_id,
             config: meta.config,
             timeout: meta.timeout,
+            timeout_generation,
             context: meta.context,
             service_control: meta.service_control,
             keep_buffer: meta.keep_buffer,
@@ -256,6 +249,41 @@ impl QuicSession {
                 trace!("select procedure send err")
             }
         });
+    }
+
+    fn schedule_timeout_check(
+        timeout: Duration,
+        mut proto_event_sender: mpsc::Sender<ProtocolEvent>,
+        mut future_task_sender: mpsc::Sender<BoxedFutureTask>,
+        generation: u64,
+    ) {
+        // NOTE: A Interval/Delay will block tokio runtime from gracefully shutdown.
+        //       So we spawn it in FutureTaskManager.
+        crate::runtime::spawn(async move {
+            crate::runtime::delay_for(timeout).await;
+            let task = Box::pin(async move {
+                if proto_event_sender
+                    .send(ProtocolEvent::TimeoutCheck(generation))
+                    .await
+                    .is_err()
+                {
+                    trace!("timeout check send err")
+                }
+            });
+            if future_task_sender.send(task).await.is_err() {
+                trace!("timeout check task send err")
+            }
+        });
+    }
+
+    fn schedule_next_timeout_check(&mut self) {
+        self.timeout_generation = self.timeout_generation.wrapping_add(1);
+        Self::schedule_timeout_check(
+            self.timeout,
+            self.proto_event_sender.clone(),
+            self.future_task_sender.clone(),
+            self.timeout_generation,
+        );
     }
 
     /// Open a new substream and run client-side protocol negotiation on it.
@@ -463,6 +491,9 @@ impl QuicSession {
                 debug!("session [{}] proto [{}] closed", self.context.id, proto_id);
                 if self.substreams.remove(&id).is_some() {
                     self.proto_streams.remove(&proto_id);
+                    if self.substreams.is_empty() {
+                        self.schedule_next_timeout_check();
+                    }
                 }
             }
             ProtocolEvent::Message { .. } => unreachable!(),
@@ -486,7 +517,11 @@ impl QuicSession {
                     },
                 )
             }
-            ProtocolEvent::TimeoutCheck => {
+            ProtocolEvent::TimeoutCheck(generation) => {
+                if generation != self.timeout_generation {
+                    return;
+                }
+
                 if self.substreams.is_empty() {
                     self.event_output(
                         cx,
