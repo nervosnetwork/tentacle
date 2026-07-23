@@ -356,6 +356,37 @@ impl Stream for TcpBaseListener {
     }
 }
 
+const INITIAL_PEEK_LEN: usize = 16;
+const INITIAL_PEEK_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+async fn wait_for_initial_peek(
+    stream: &TcpStream,
+    peek_buf: &mut [u8; INITIAL_PEEK_LEN],
+    timeout: Duration,
+) -> io::Result<bool> {
+    let started_at = std::time::Instant::now();
+
+    loop {
+        match stream.peek(peek_buf).await {
+            Ok(n) if n == peek_buf.len() => return Ok(true),
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                let elapsed = started_at.elapsed();
+                if elapsed >= timeout {
+                    return Ok(false);
+                }
+
+                crate::runtime::delay_for(std::cmp::min(
+                    INITIAL_PEEK_RETRY_DELAY,
+                    timeout - elapsed,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 async fn protocol_select(
     mut stream: TcpStream,
     timeout: Duration,
@@ -365,28 +396,19 @@ async fn protocol_select(
     trusted_proxies: Arc<Vec<IpAddr>>,
     #[cfg(feature = "tls")] acceptor: TlsAcceptor,
 ) {
-    let mut peek_buf = [0u8; 16];
-    let now = std::time::Instant::now();
-    loop {
-        match stream.peek(&mut peek_buf).await {
-            Ok(n) => {
-                if n != 16 {
-                    if now.elapsed() > timeout {
-                        debug!(
-                            "In the timeout range, stream can't read more than 16 byte data, 
-                        We need to give up this suspected offensive stream"
-                        );
-                        return;
-                    } else {
-                        continue;
-                    }
-                }
-                break;
-            }
-            Err(e) => {
-                debug!("stream encountered err: {}, close unexpectedly", e);
-                return;
-            }
+    let mut peek_buf = [0u8; INITIAL_PEEK_LEN];
+    match wait_for_initial_peek(&stream, &mut peek_buf, timeout).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                "stream did not provide {} initial bytes within {:?}; closing suspected offensive stream",
+                INITIAL_PEEK_LEN, timeout
+            );
+            return;
+        }
+        Err(e) => {
+            debug!("stream encountered err: {}, close unexpectedly", e);
+            return;
         }
     }
 
@@ -499,24 +521,19 @@ async fn protocol_select(
                             proxy_parsed = true;
                             remote_address = addr;
                             // After parsing PROXY protocol, we need to peek fresh data
-                            let mut new_peek_buf = [0u8; 16];
-                            let peek_now = std::time::Instant::now();
-                            loop {
-                                match stream.peek(&mut new_peek_buf).await {
-                                    Ok(n) if n == 16 => break,
-                                    Ok(_) => {
-                                        if peek_now.elapsed() > timeout {
-                                            debug!(
-                                                "Failed to peek 16 bytes after PROXY protocol parsing"
-                                            );
-                                            return;
-                                        }
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        debug!("stream encountered err after PROXY parsing: {}", e);
-                                        return;
-                                    }
+                            let mut new_peek_buf = [0u8; INITIAL_PEEK_LEN];
+                            match wait_for_initial_peek(&stream, &mut new_peek_buf, timeout).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    debug!(
+                                        "failed to peek {} bytes within {:?} after PROXY protocol parsing",
+                                        INITIAL_PEEK_LEN, timeout
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
+                                    debug!("stream encountered err after PROXY parsing: {}", e);
+                                    return;
                                 }
                             }
                             new_peek_buf
@@ -752,5 +769,66 @@ async fn extract_forwarded_for_from_ws_handshake(
             SocketAddr::new(ip, port)
         }
         None => fallback_address,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn short_initial_peek_does_not_starve_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (server, remote_address) = listener.accept().await.unwrap();
+
+            client.write_all(&[0]).await.unwrap();
+
+            let mut peek_buf = [0; INITIAL_PEEK_LEN];
+            assert_eq!(server.peek(&mut peek_buf).await.unwrap(), 1);
+
+            let (sender, _receiver) = mpsc::channel(1);
+            #[cfg(feature = "tls")]
+            let acceptor = TlsAcceptor::from(Arc::new(
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new())),
+            ));
+
+            let selector = tokio::spawn(protocol_select(
+                server,
+                Duration::from_millis(250),
+                UpgradeModeEnum::OnlyTcp,
+                sender,
+                remote_address,
+                Arc::new(Vec::new()),
+                #[cfg(feature = "tls")]
+                acceptor,
+            ));
+
+            let started_at = std::time::Instant::now();
+            crate::runtime::delay_for(Duration::from_millis(20)).await;
+            let elapsed = started_at.elapsed();
+
+            selector.abort();
+            let err = selector
+                .await
+                .expect_err("aborted protocol selector should not complete successfully");
+            assert!(err.is_cancelled(), "unexpected selector task error: {err}");
+
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "short initial TCP input starved the runtime for {elapsed:?}"
+            );
+        });
     }
 }
