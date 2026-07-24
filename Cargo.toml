@@ -8,8 +8,8 @@ members = [
   "bench",
 ]
 exclude = [
-  "protocols/discovery",
-  "protocols/identify",
-  "protocols/ping",
+  "examples/discovery",
+  "examples/identify",
+  "examples/ping",
   "simple_wasm"
 ]

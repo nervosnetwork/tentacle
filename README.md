@@ -30,7 +30,7 @@ Detailed introduction: [中文](./docs/introduction_zh.md)/[English](./docs/intr
 
 The API of this project is basically usable. However we still need more tests. PR is welcome.
 
-The codes in the `protocols/` directory are no longer maintained and only used as reference
+The codes in the `examples/` directory are no longer maintained and only used as reference
 
 ## Usage
 
