@@ -345,22 +345,20 @@ where
     pub async fn dial(&mut self, address: Multiaddr, target: TargetProtocol) -> Result<&mut Self> {
         let inner = self.inner_service.as_mut().unwrap();
 
-        // Skip if the exact address or any other address with the same
-        // /p2p/<peer_id> is already being dialed. Mirrors the check in
-        // `handle_service_task`'s `ServiceTask::Dial` arm so both entry
-        // points behave identically across transports.
+        // Suppress the dial only when:
+        //   1. the exact same address is already being dialed, or
+        //   2. we already have an established session whose *authenticated*
+        //      remote public key matches the /p2p/<peer_id> in `address`.
+        //
+        // The second case is a resource optimization equivalent to what
+        // `session_open_common` would reject as `RepeatedConnection` after
+        // handshake, but performed up-front to avoid a wasted connect +
+        // handshake.  Crucially, we never dedup against unauthenticated
+        // /p2p values sitting in `dial_protocols`, because a remote peer can
+        // supply an arbitrary /p2p component before the handshake verifies
+        // the remote public key.
         if inner.dial_protocols.contains_key(&address)
-            || extract_peer_id(&address)
-                .map(|peer_id| {
-                    inner.dial_protocols.keys().any(|addr| {
-                        if let Some(addr_peer_id) = extract_peer_id(addr) {
-                            addr_peer_id == peer_id
-                        } else {
-                            false
-                        }
-                    })
-                })
-                .unwrap_or_default()
+            || inner.is_peer_id_authenticated_connected(&address)
         {
             return Ok(self);
         }
@@ -927,6 +925,28 @@ where
                 break;
             }
         }
+    }
+
+    /// Returns true iff `address` carries a `/p2p/<peer_id>` component that
+    /// matches an already-established session's *authenticated* remote
+    /// public key. This is deliberately based on `sessions` (populated only
+    /// after handshake success) rather than `dial_protocols` (populated
+    /// with caller-supplied, unauthenticated addresses), so a remote peer
+    /// cannot suppress a legitimate dial by advertising a spoofed
+    /// `/p2p/<victim>` address.
+    fn is_peer_id_authenticated_connected(&self, address: &Multiaddr) -> bool {
+        let peer_id = match extract_peer_id(address) {
+            Some(id) => id,
+            None => return false,
+        };
+        self.sessions.values().any(|controller| {
+            controller
+                .inner
+                .remote_pubkey
+                .as_ref()
+                .map(|key| key.peer_id() == peer_id)
+                .unwrap_or(false)
+        })
     }
 
     fn reached_max_connection_limit(&self) -> bool {
@@ -1608,18 +1628,13 @@ where
                 self.handle_message(target, proto_id, priority, data).await;
             }
             ServiceTask::Dial { address, target } => {
+                // Mirror the check in `Service::dial`: skip if the exact
+                // address is already pending or if we already have an
+                // authenticated session for the /p2p/<peer_id> in the
+                // address. Do NOT dedup against unauthenticated /p2p values
+                // in `dial_protocols`.
                 if !(self.dial_protocols.contains_key(&address)
-                    || extract_peer_id(&address)
-                        .map(|peer_id| {
-                            self.dial_protocols.keys().any(|addr| {
-                                if let Some(addr_peer_id) = extract_peer_id(addr) {
-                                    addr_peer_id == peer_id
-                                } else {
-                                    false
-                                }
-                            })
-                        })
-                        .unwrap_or_default())
+                    || self.is_peer_id_authenticated_connected(&address))
                 {
                     if let Err(e) = self.dial_inner(address.clone(), target) {
                         let _ignore = self

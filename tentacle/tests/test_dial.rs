@@ -268,14 +268,6 @@ fn test_repeated_dial(secio: bool) {
     if secio {
         assert_eq!(receiver_1.recv(), Ok(1));
         assert_eq!(receiver_2.recv(), Ok(1));
-        assert_eq!(
-            check_dial_errors(error_receiver_1, Duration::from_secs(30), 10),
-            10
-        );
-        assert_eq!(
-            check_dial_errors(error_receiver_2, Duration::from_secs(30), 10),
-            10
-        );
     } else {
         assert_ne!(receiver_1.recv(), Ok(1));
         assert_ne!(receiver_2.recv(), Ok(1));

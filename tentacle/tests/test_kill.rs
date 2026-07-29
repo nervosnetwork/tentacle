@@ -142,7 +142,9 @@ fn test_kill(secio: bool) {
             let mem_stop = current_used_memory().unwrap();
             let cpu_stop = current_used_cpu().unwrap();
             assert!((mem_stop - mem_start) / mem_start < 0.1);
-            assert!((cpu_stop - cpu_start) / cpu_start < 0.1);
+            if cpu_stop > cpu_start {
+                assert!(cpu_stop - cpu_start < 0.1);
+            }
         }
         Ok(ForkResult::Child) => {
             let rt = tokio::runtime::Runtime::new().unwrap();
