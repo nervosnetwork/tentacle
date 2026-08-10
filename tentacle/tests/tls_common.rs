@@ -118,7 +118,8 @@ pub fn make_server_config(config: &NetConfig) -> ServerConfig {
         cryp.cipher_suites = lookup_suites(config.cypher_suits.as_ref().unwrap())
     };
 
-    let server_config = ServerConfig::builder_with_provider(Arc::new(cryp));
+    let provider = Arc::new(cryp);
+    let server_config = ServerConfig::builder_with_provider(provider.clone());
 
     let server_config = if config.protocols.is_some() {
         server_config
@@ -134,9 +135,10 @@ pub fn make_server_config(config: &NetConfig) -> ServerConfig {
     for cacert in &cacerts {
         client_auth_roots.add(cacert.clone()).unwrap();
     }
-    let client_auth = WebPkiClientVerifier::builder(client_auth_roots.into())
-        .build()
-        .unwrap();
+    let client_auth =
+        WebPkiClientVerifier::builder_with_provider(client_auth_roots.into(), provider)
+            .build()
+            .unwrap();
 
     let server_config = server_config.with_client_cert_verifier(client_auth);
 

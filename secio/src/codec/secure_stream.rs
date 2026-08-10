@@ -186,7 +186,7 @@ where
 mod tests {
     use super::SecureStream;
     use crate::crypto::{CryptoMode, cipher::CipherType, new_stream};
-    use bytes::{Buf, Bytes, BytesMut};
+    use bytes::{Bytes, BytesMut};
     use futures::channel;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},

@@ -13,10 +13,14 @@ async fn main() {
     let cert_der = CertificateDer::from(cert.cert);
     let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
 
-    let rustls_server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .unwrap();
+    let rustls_server_config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("the aws-lc-rs provider supports rustls default protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key_der.into())
+    .unwrap();
     let quinn_server_config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(rustls_server_config).unwrap(),
     ));
@@ -44,10 +48,14 @@ async fn main() {
         }
     });
 
-    let rustls_client_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
-        .with_no_client_auth();
+    let rustls_client_config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("the aws-lc-rs provider supports rustls default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
+    .with_no_client_auth();
 
     let quinn_client = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
     let quinn_client_conn = quinn_client
