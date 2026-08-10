@@ -530,9 +530,6 @@ where
             }
             #[cfg(not(feature = "metrics"))]
             let _ = sent_ping_at;
-            // If the remote peer does not follow the protocol,
-            // there may be a memory leak, so here need to discard all ping ids below the ack.
-            self.pings = self.pings.split_off(&ping_id);
         } else {
             // TODO: unexpected case, send a GoAwayCode::ProtocolError ?
         }
@@ -937,7 +934,7 @@ pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
 
 #[cfg(test)]
 mod test {
-    use super::{Session, rt};
+    use super::{Session, TIMEOUT, rt};
     use crate::{
         config::Config,
         frame::{Flag, Flags, Frame, FrameCodec, GoAwayCode, Type},
@@ -952,7 +949,7 @@ mod test {
         io,
         pin::Pin,
         task::{Context, Poll},
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio_util::codec::Framed;
@@ -1092,6 +1089,50 @@ mod test {
                 }
             }
         })
+    }
+
+    #[test]
+    fn test_ping_ack_only_removes_matching_ping() {
+        let (remote, local) = MockSocket::new();
+        let config = Config {
+            enable_keepalive: false,
+            ..Default::default()
+        };
+        let mut session = Session::new_server(local, config);
+        let now = Instant::now();
+        session.pings.insert(1, now);
+        session.pings.insert(2, now);
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        session
+            .handle_ping(&mut cx, &Frame::new_ping(Flags::from(Flag::Ack), 2))
+            .unwrap();
+
+        assert!(session.pings.contains_key(&1));
+        assert!(!session.pings.contains_key(&2));
+        drop(remote);
+    }
+
+    #[test]
+    fn test_forged_ping_ack_does_not_clear_pending_pings() {
+        let (remote, local) = MockSocket::new();
+        let config = Config {
+            enable_keepalive: false,
+            ..Default::default()
+        };
+        let mut session = Session::new_server(local, config);
+        let now = Instant::now();
+        session
+            .pings
+            .insert(1, now - TIMEOUT - Duration::from_secs(1));
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        session
+            .handle_ping(&mut cx, &Frame::new_ping(Flags::from(Flag::Ack), u32::MAX))
+            .unwrap();
+
+        assert!(session.keep_alive(&mut cx, now).is_err());
+        drop(remote);
     }
 
     #[test]
