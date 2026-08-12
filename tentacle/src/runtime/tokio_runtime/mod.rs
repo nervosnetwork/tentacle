@@ -143,7 +143,7 @@ async fn connect_direct(
     socket.connect(addr).await
 }
 
-async fn connect_by_proxy(
+pub(crate) async fn connect_by_proxy(
     target_addr: String,
     target_port: u16,
     mut proxy_server_url: url::Url,
@@ -196,7 +196,11 @@ pub(crate) async fn connect(
         )
         .await
         .map_err(|err| {
-            io::Error::other(format!("connect_by_proxy: {}, error: {}", proxy_url, err))
+            io::Error::other(format!(
+                "connect_by_proxy: {}, error: {}",
+                redact_auth_from_url(&proxy_url),
+                err
+            ))
         }),
         None => connect_direct(target_addr, socket_transformer).await,
     }
