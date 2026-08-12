@@ -45,6 +45,7 @@ pub struct TcpTransport {
     tls_config: TlsConfig,
     /// Trusted proxy addresses for HAProxy PROXY protocol and X-Forwarded-For header parsing.
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    max_frame_length: usize,
 }
 
 impl TcpTransport {
@@ -57,6 +58,7 @@ impl TcpTransport {
             #[cfg(feature = "tls")]
             tls_config: Default::default(),
             trusted_proxies: Arc::new(Vec::new()),
+            max_frame_length: crate::service::config::ServiceConfig::default().max_frame_length,
         }
     }
 
@@ -78,6 +80,7 @@ impl TcpTransport {
             #[cfg(feature = "tls")]
             tls_config: multi_transport.tls_config.unwrap_or_default(),
             trusted_proxies: multi_transport.trusted_proxies,
+            max_frame_length: multi_transport.max_frame_length,
         }
     }
 }
@@ -105,6 +108,7 @@ impl TransportListen for TcpTransport {
                     self.global,
                     self.timeout,
                     self.trusted_proxies,
+                    self.max_frame_length,
                 );
                 Ok(TransportFuture::new(Box::pin(task)))
             }
@@ -118,6 +122,7 @@ impl TransportListen for TcpTransport {
                     self.global,
                     self.timeout,
                     self.trusted_proxies,
+                    self.max_frame_length,
                 );
                 Ok(TransportFuture::new(Box::pin(task)))
             }
