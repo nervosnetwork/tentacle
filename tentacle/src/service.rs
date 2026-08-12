@@ -53,6 +53,7 @@ pub(crate) mod event;
 pub(crate) mod future_task;
 mod helper;
 
+pub(crate) use crate::service::control::ServiceTaskBudget;
 pub use crate::service::{
     config::{
         HandshakeType, ProtocolHandle, ProtocolMeta, SocketState, TargetProtocol, TargetSession,
@@ -150,6 +151,7 @@ struct InnerService<K> {
     service_context: ServiceContext,
     /// External event receiver
     service_task_receiver: priority_mpsc::Receiver<ServiceTask>,
+    service_task_budget: ServiceTaskBudget,
 
     shutdown: Arc<AtomicBool>,
 
@@ -189,6 +191,7 @@ where
             mpsc::channel(config.session_config.channel_size);
         let (task_sender, task_receiver) =
             priority_mpsc::channel(config.session_config.channel_size);
+        let service_task_budget = ServiceTaskBudget::new(config.session_config.channel_size);
         let (future_task_sender, future_task_receiver) =
             mpsc::channel(config.session_config.channel_size);
         let (user_handle_sender, user_handle_receiver) =
@@ -201,7 +204,8 @@ where
             None
         };
 
-        let service_context = ServiceContext::new(task_sender, shutdown.clone());
+        let service_context =
+            ServiceContext::new(task_sender, shutdown.clone(), service_task_budget.clone());
 
         // QUIC endpoint is built up-front (binding nothing) so that listen /
         // dial calls can clone it. Each `(HandshakeType, quic_config)`
@@ -278,6 +282,7 @@ where
                 service_context,
                 config,
                 service_task_receiver: task_receiver,
+                service_task_budget,
                 shutdown,
                 wait_handle: Vec::new(),
             }),
@@ -1822,6 +1827,9 @@ where
                     self.handle_session_event(event).await
                 },
                 Some((priority, task)) = self.service_task_receiver.next() => {
+                    if task.counts_against_budget() {
+                        self.service_task_budget.release();
+                    }
                     self.handle_service_task(task, priority).await
                 }
             }
