@@ -31,9 +31,22 @@ use crate::{
         config::{Meta, SessionConfig},
         future_task::BoxedFutureTask,
     },
-    substream::{ProtocolEvent, SubstreamBuilder, SubstreamInner, SubstreamWritePartBuilder},
+    substream::{
+        ProtocolEvent, SubstreamBuilder, SubstreamInner, SubstreamWritePartBuilder,
+        decr_pending_protocol_message,
+    },
     transports::MultiIncoming,
 };
+
+/// Roll back the session pending byte counter for a dropped inbound
+/// `SessionEvent`. Only `ProtocolMessage` is accounted into
+/// `SessionContext::pending_data_size`; all other variants are no-ops.
+#[inline]
+pub(crate) fn decr_pending_session_event(context: &SessionContext, event: &SessionEvent) {
+    if let SessionEvent::ProtocolMessage { data, .. } = event {
+        context.decr_pending_data_size(data.len());
+    }
+}
 
 pub trait AsyncRw: AsyncWrite + AsyncRead {}
 
@@ -362,12 +375,15 @@ impl Session {
 
     #[inline]
     fn distribute_to_substream(&mut self, cx: &mut Context) {
+        let context = self.context.clone();
         for buffer in self
             .substreams
             .values_mut()
             .filter(|buffer| !buffer.is_empty())
         {
-            if let SendResult::Pending = buffer.try_send(cx) {
+            if let SendResult::Pending = buffer
+                .try_send_with_drop(cx, |event| decr_pending_protocol_message(&context, event))
+            {
                 if self.context.pending_data_size() > self.config.send_buffer_size {
                     self.state = SessionState::Abnormal;
                     warn!(
@@ -378,7 +394,7 @@ impl Session {
                         self.config.send_buffer_size,
                         self.context.pending_data_size()
                     );
-                    buffer.clear();
+                    buffer.clear_with(|event| decr_pending_protocol_message(&context, event));
                     self.event_output(
                         cx,
                         SessionEvent::ChangeState {
@@ -524,7 +540,12 @@ impl Session {
             }
             ProtocolEvent::Close { id, proto_id } => {
                 debug!("session [{}] proto [{}] closed", self.context.id, proto_id);
-                if self.substreams.remove(&id).is_some() {
+                if let Some(mut buffer) = self.substreams.remove(&id) {
+                    // Roll back the pending byte counter for any outbound
+                    // messages still queued in this substream's buffer that
+                    // will be dropped along with the substream.
+                    let context = self.context.clone();
+                    buffer.clear_with(|event| decr_pending_protocol_message(&context, event));
                     self.proto_streams.remove(&proto_id);
                 }
             }
@@ -567,17 +588,23 @@ impl Session {
     fn handle_session_event(&mut self, cx: &mut Context, event: SessionEvent, priority: Priority) {
         match event {
             SessionEvent::ProtocolMessage { proto_id, data, .. } => {
-                if let Some(stream_id) = self.proto_streams.get(&proto_id) {
-                    if let Some(buffer) = self.substreams.get_mut(stream_id) {
-                        let event = ProtocolEvent::Message { data };
-                        if priority.is_high() {
-                            buffer.push_high(event)
-                        } else {
-                            buffer.push_normal(event)
-                        }
-                        buffer.try_send(cx);
+                if let Some(buffer) = self
+                    .proto_streams
+                    .get(&proto_id)
+                    .and_then(|stream_id| self.substreams.get_mut(stream_id))
+                {
+                    let context = self.context.clone();
+                    let event = ProtocolEvent::Message { data };
+                    if priority.is_high() {
+                        buffer.push_high(event)
+                    } else {
+                        buffer.push_normal(event)
                     }
+                    buffer.try_send_with_drop(cx, |event| {
+                        decr_pending_protocol_message(&context, event)
+                    });
                 } else {
+                    self.context.decr_pending_data_size(data.len());
                     trace!("protocol {} not ready", proto_id);
                 }
             }
@@ -660,6 +687,11 @@ impl Session {
         match Pin::new(&mut self.service_receiver).as_mut().poll_next(cx) {
             Poll::Ready(Some((priority, event))) => {
                 if !self.state.is_normal() {
+                    // Event will be discarded; roll back pending bytes that
+                    // were incremented in `Service::handle_message` so the
+                    // counter does not stay inflated for the lifetime of this
+                    // `SessionContext`.
+                    decr_pending_session_event(&self.context, &event);
                     Poll::Ready(None)
                 } else {
                     self.handle_session_event(cx, event, priority);
@@ -734,8 +766,23 @@ impl Session {
 
     /// Clean env
     fn clean(&mut self) {
-        self.substreams.clear();
+        // Drain any messages still queued for substreams so that
+        // `SessionContext::pending_data_size` reflects reality after the
+        // session is gone. Otherwise observers (e.g. the service layer
+        // holding an `Arc<SessionContext>`) would see stale, never-decreasing
+        // pending bytes.
+        let context = self.context.clone();
+        for (_, mut buffer) in self.substreams.drain() {
+            buffer.clear_with(|event| decr_pending_protocol_message(&context, event));
+        }
         self.service_receiver.close();
+        // Drain any inbound `SessionEvent`s still buffered in the channel so
+        // that `ProtocolMessage`s queued by the service (which already
+        // incremented `pending_data_size`) get their bytes rolled back before
+        // the receiver is dropped.
+        while let Ok(Some((_, event))) = self.service_receiver.try_next() {
+            decr_pending_session_event(&context, &event);
+        }
         self.proto_event_receiver.close();
 
         let mut control = self.control.clone();
