@@ -109,7 +109,7 @@ pub(crate) enum ProtocolEvent {
         /// Codec error
         error: std::io::Error,
     },
-    TimeoutCheck,
+    TimeoutCheck(u64),
 }
 
 /// Applies backpressure at the substream event-recv path.
