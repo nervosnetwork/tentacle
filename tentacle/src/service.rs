@@ -519,6 +519,7 @@ where
                         event_sender: sender,
                         max_frame_length,
                         timeout,
+                        tracked_state: true,
                     }
                     .handshake(incoming)
                     .await;
@@ -904,6 +905,7 @@ where
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
             timeout: self.config.timeout.timeout,
+            tracked_state: true,
         }
         .handshake(socket);
 
@@ -1387,8 +1389,9 @@ where
                 address,
                 ty,
                 listen_address,
+                tracked_state,
             } => {
-                if ty.is_outbound() {
+                if tracked_state {
                     self.state.decrease();
                 }
                 if !self.reached_max_connection_limit() {
@@ -1417,9 +1420,16 @@ where
                         .close(0u32.into(), b"capacity");
                 }
             }
-            SessionEvent::HandshakeError { ty, error, address } => {
-                if ty.is_outbound() {
+            SessionEvent::HandshakeError {
+                ty,
+                error,
+                address,
+                tracked_state,
+            } => {
+                if tracked_state {
                     self.state.decrease();
+                }
+                if ty.is_outbound() {
                     self.dial_protocols.remove(&address);
                     let _ignore = self
                         .handle_sender
@@ -1668,6 +1678,7 @@ where
             } => {
                 let (ty, listen_addr) = match session_info {
                     RawSessionInfo::Inbound { listen_addr } => {
+                        self.state.increase();
                         (SessionType::Inbound, Some(listen_addr))
                     }
                     RawSessionInfo::Outbound { target } => {
@@ -1826,5 +1837,40 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServiceTask;
+    use crate::{
+        builder::ServiceBuilder,
+        channel::mpsc::Priority,
+        multiaddr::Multiaddr,
+        secio::SecioKeyPair,
+        service::{RawSessionInfo, Service, config::State},
+    };
+
+    #[tokio::test]
+    async fn raw_inbound_session_registers_pending_work() {
+        let mut service: Service<(), SecioKeyPair> = ServiceBuilder::default().build(());
+        let mut inner = service.inner_service.take().expect("inner service");
+        let (raw_session, _peer) = tokio::io::duplex(64);
+        let remote_address: Multiaddr = "/memory/1".parse().unwrap();
+        let listen_addr: Multiaddr = "/memory/2".parse().unwrap();
+
+        inner
+            .handle_service_task(
+                ServiceTask::RawSession {
+                    remote_address,
+                    raw_session: Box::new(raw_session),
+                    session_info: RawSessionInfo::inbound(listen_addr),
+                },
+                Priority::Normal,
+            )
+            .await;
+
+        assert_eq!(inner.state, State::Running(1));
+        assert!(!inner.state.is_shutdown());
     }
 }
