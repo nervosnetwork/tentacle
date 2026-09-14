@@ -571,3 +571,117 @@ fn test_quic_not_enabled_rejected() {
         }
     });
 }
+
+// ──────────────────────────── connection limiting ────────────────────────────
+
+/// Reports `SessionOpen` events and service errors to a channel.
+struct EventReporter {
+    events: crossbeam_channel::Sender<String>,
+}
+
+#[async_trait]
+impl ServiceHandle for EventReporter {
+    async fn handle_error(&mut self, _env: &mut ServiceContext, error: ServiceError) {
+        let _ignore = self.events.send(format!("error: {:?}", error));
+    }
+
+    async fn handle_event(&mut self, _env: &mut ServiceContext, event: ServiceEvent) {
+        if let ServiceEvent::SessionOpen { .. } = event {
+            let _ignore = self.events.send("open".to_string());
+        }
+    }
+}
+
+fn build_limited_quic_service(
+    key: SecioKeyPair,
+    handle: EventReporter,
+    max_connection_number: usize,
+) -> Service<EventReporter, SecioKeyPair> {
+    ServiceBuilder::default()
+        .forever(true)
+        .handshake_type(key.into())
+        .quic_config(QuicConfig::default())
+        .max_connection_number(max_connection_number)
+        .build(handle)
+}
+
+/// Test 7: `max_connection_number` is enforced *before* the QUIC TLS
+/// handshake is driven. Once the limit is reached the listener refuses the
+/// connection attempt outright, so the second peer never completes a
+/// handshake and the server never opens a second session.
+#[test]
+fn test_quic_max_connection_number_refuses_before_handshake() {
+    let server_key = SecioKeyPair::secp256k1_generated();
+    let server_pid = server_key.peer_id();
+
+    let (server_tx, server_rx) = crossbeam_channel::unbounded();
+    let (addr_tx, addr_rx) = crossbeam_channel::bounded(1);
+
+    let _server = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // One slot in total: the first inbound session fills it.
+        let mut service =
+            build_limited_quic_service(server_key, EventReporter { events: server_tx }, 1);
+        rt.block_on(async move {
+            let listen = service
+                .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .await
+                .expect("server listen");
+            let _ignore = addr_tx.send(listen);
+            service.run().await
+        });
+    });
+
+    let listen_addr = addr_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("listen address");
+    let dial_addr: Multiaddr = format!("{}/p2p/{}", listen_addr, server_pid.to_base58())
+        .parse()
+        .unwrap();
+
+    let spawn_client = |dial_addr: Multiaddr, events: crossbeam_channel::Sender<String>| {
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let mut service = build_limited_quic_service(
+                SecioKeyPair::secp256k1_generated(),
+                EventReporter { events },
+                usize::from(u16::MAX),
+            );
+            rt.block_on(async move {
+                let _ignore = service.dial(dial_addr, TargetProtocol::All).await;
+                service.run().await
+            });
+        })
+    };
+
+    // First client takes the only slot.
+    let (first_tx, first_rx) = crossbeam_channel::unbounded();
+    let _first = spawn_client(dial_addr.clone(), first_tx);
+    assert_eq!(
+        first_rx.recv_timeout(Duration::from_secs(15)).ok(),
+        Some("open".to_string()),
+        "first client should establish a quic session"
+    );
+    assert_eq!(
+        server_rx.recv_timeout(Duration::from_secs(15)).ok(),
+        Some("open".to_string()),
+        "server should accept the first quic session"
+    );
+
+    // Second client must be refused by the listener before any handshake.
+    let (second_tx, second_rx) = crossbeam_channel::unbounded();
+    let _second = spawn_client(dial_addr, second_tx);
+    let refusal = second_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("second client should be notified of the refusal");
+    assert!(
+        refusal.starts_with("error: DialerError"),
+        "second client should observe a dial error, got {refusal}"
+    );
+
+    // And the server must not have opened a second session.
+    assert!(
+        server_rx.recv_timeout(Duration::from_secs(2)).is_err(),
+        "server must not open a session beyond max_connection_number"
+    );
+}

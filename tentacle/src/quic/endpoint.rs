@@ -137,10 +137,46 @@ impl<K: KeyProvider> QuicEndpoint<K> {
 
 // ─────────────────────────────────── QuicListener ──────────────────────────────────
 
+/// An inbound connection attempt whose TLS handshake has **not** been driven
+/// yet.
+///
+/// Accepting is split in two phases so that admission control (for example
+/// the service-wide `max_connection_number` limit) can reject a peer with
+/// [`QuicIncoming::refuse`] before any handshake work — key exchange,
+/// certificate verification, per-connection state — is performed on its
+/// behalf. Call [`QuicIncoming::finish`] to complete the handshake.
+pub struct QuicIncoming {
+    inner: quinn::Incoming,
+}
+
+impl QuicIncoming {
+    /// Multiaddr of the peer that initiated this connection attempt.
+    pub fn remote_address(&self) -> Multiaddr {
+        socketaddr_to_quic_multiaddr(self.inner.remote_address())
+    }
+
+    /// Reject the attempt without performing the TLS handshake.
+    pub fn refuse(self) {
+        self.inner.refuse()
+    }
+
+    /// Drive the TLS handshake to completion and verify the tentacle
+    /// identity carried by the peer certificate.
+    ///
+    /// `Err(_)` means **this particular handshake attempt** failed (bad cert,
+    /// peer-id mismatch, dropped client, …); the listener endpoint is still
+    /// alive and the caller is expected to keep accepting.
+    pub async fn finish(self) -> Result<QuicHandshake, QuicErrorKind> {
+        let conn = self.inner.await?;
+        let remote_pubkey = peer_pubkey_from_connection(&conn)?;
+        Ok(QuicHandshake::new(conn, remote_pubkey))
+    }
+}
+
 /// Server-side QUIC listener, wrapping a bound `quinn::Endpoint`.
 ///
-/// Each call to [`QuicListener::accept`] yields a fully-handshaken
-/// [`QuicHandshake`] together with the multiaddr of the remote peer.
+/// Each call to [`QuicListener::accept`] yields a [`QuicIncoming`] that the
+/// caller either refuses or hands off to [`QuicIncoming::finish`].
 pub struct QuicListener {
     endpoint: quinn::Endpoint,
     listen_addr: Multiaddr,
@@ -153,27 +189,16 @@ impl QuicListener {
         &self.listen_addr
     }
 
-    /// Accept the next incoming connection, drive its TLS handshake to
-    /// completion, and return the resulting [`QuicHandshake`] paired with the
-    /// remote peer's multiaddr.
+    /// Accept the next incoming connection attempt.
     ///
-    /// Returns `Ok(None)` when the endpoint has been closed. `Err(_)` means
-    /// **this particular handshake attempt** failed (bad cert, peer-id
-    /// mismatch, dropped client, …); the underlying UDP endpoint is still
-    /// alive and the caller is expected to call `accept()` again to take
-    /// the next connection.
-    pub async fn accept(&self) -> Result<Option<(Multiaddr, QuicHandshake)>, QuicErrorKind> {
-        let incoming = match self.endpoint.accept().await {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        let remote_addr = incoming.remote_address();
-        let conn = incoming.await?;
-        let remote_pubkey = peer_pubkey_from_connection(&conn)?;
-        Ok(Some((
-            socketaddr_to_quic_multiaddr(remote_addr),
-            QuicHandshake::new(conn, remote_pubkey),
-        )))
+    /// Returns `None` when the endpoint has been closed. The returned
+    /// [`QuicIncoming`] has not been handshaken yet, so the caller can apply
+    /// admission control before spending any work on it.
+    pub async fn accept(&self) -> Option<QuicIncoming> {
+        self.endpoint
+            .accept()
+            .await
+            .map(|inner| QuicIncoming { inner })
     }
 
     /// Stop accepting new connections and close the underlying UDP socket.
@@ -575,11 +600,13 @@ mod tests {
 
         // Server task: accept, read up to 64 bytes from a bidi stream, echo back.
         let server_task = tokio::spawn(async move {
-            let (_remote_addr, session) = listener
+            let session = listener
                 .accept()
                 .await
-                .expect("accept ok")
-                .expect("not closed");
+                .expect("not closed")
+                .finish()
+                .await
+                .expect("handshake ok");
             let conn = session.connection().clone();
             let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
             let mut buf = vec![0u8; 64];
@@ -637,7 +664,9 @@ mod tests {
         // Drive the listener so the handshake can progress (the server-side
         // failure is fine; we only need the listener task to keep polling).
         let _server_task = tokio::spawn(async move {
-            let _ = listener.accept().await.unwrap();
+            if let Some(incoming) = listener.accept().await {
+                let _ignore = incoming.finish().await;
+            }
         });
 
         let client_key = SecioKeyPair::secp256k1_generated();

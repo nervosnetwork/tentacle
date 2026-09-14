@@ -193,8 +193,29 @@ where
     }
 
     /// The limit of max open connection(file descriptors)
-    /// If not limited, service will try to serve as many connections as possible until it exhausts system resources(os error),
-    /// and then close the listener, no longer accepting new connection requests, and the established connections remain working
+    ///
+    /// A slot is reserved as soon as a connection enters the service and is only
+    /// released when that connection goes away, so the limit covers every
+    /// connection the process is holding resources for, not just established
+    /// sessions:
+    ///
+    /// - inbound connections, reserved right after `accept(2)` and **before** any
+    ///   protocol detection or secio/TLS handshake work is done on their behalf.
+    ///   An unauthenticated peer therefore cannot make the service hold sockets
+    ///   or handshake tasks beyond this number;
+    /// - outbound dials, reserved before the dial is started;
+    /// - established sessions, until [`ServiceEvent::SessionClose`] is handled.
+    ///
+    /// When the limit is reached, new inbound connections are closed immediately
+    /// (QUIC attempts are refused without a handshake) and new dials fail with
+    /// [`TransportErrorKind::Io`] of kind [`std::io::ErrorKind::ConnectionRefused`],
+    /// reported through [`ServiceError::DialerError`] / [`ServiceError::ListenError`].
+    /// Already-established connections keep working.
+    ///
+    /// [`ServiceEvent::SessionClose`]: crate::service::ServiceEvent::SessionClose
+    /// [`TransportErrorKind::Io`]: crate::error::TransportErrorKind::Io
+    /// [`ServiceError::DialerError`]: crate::service::ServiceError::DialerError
+    /// [`ServiceError::ListenError`]: crate::service::ServiceError::ListenError
     ///
     /// Default is 65535
     pub fn max_connection_number(mut self, number: usize) -> Self {

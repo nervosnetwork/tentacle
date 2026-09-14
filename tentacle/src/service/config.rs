@@ -529,14 +529,6 @@ impl State {
             State::PreShutdown | State::Forever => (),
         }
     }
-
-    #[inline]
-    pub fn into_inner(self) -> Option<usize> {
-        match self {
-            State::Running(num) => Some(num),
-            State::PreShutdown | State::Forever => None,
-        }
-    }
 }
 
 #[cfg(test)]
