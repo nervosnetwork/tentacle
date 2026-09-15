@@ -885,11 +885,12 @@ mod tests {
         let server_addr = listener.listen_addr().clone();
 
         let server_task = tokio::spawn(async move {
+            #[allow(deprecated)]
             let (_addr, hs) = listener
-                .accept_and_handshake()
+                .accept()
                 .await
-                .expect("not closed")
-                .expect("handshake ok");
+                .expect("accept ok")
+                .expect("not closed");
             // Application-initiated close on the server side.
             hs.connection().close(0u32.into(), b"bye");
         });

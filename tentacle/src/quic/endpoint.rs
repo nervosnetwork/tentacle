@@ -188,13 +188,13 @@ impl HandshakeCapacity {
 
 /// Server-side QUIC listener, wrapping a bound `quinn::Endpoint`.
 ///
-/// Drive it with [`QuicListener::for_each_handshake`]. There is deliberately no
-/// "accept one connection, handshake it, then accept the next" API: a QUIC
-/// listener cannot know who a peer is until its TLS handshake completes, so a
-/// peer that opens a connection and then goes silent would hold such a loop
-/// hostage until the handshake timed out. Accepting and handshaking are kept
-/// separate internally precisely so they can run concurrently under a deadline
-/// and a capacity bound.
+/// Drive it with [`QuicListener::for_each_handshake`], which runs inbound
+/// handshakes concurrently under a deadline and a capacity bound. A QUIC
+/// listener cannot know who a peer is until its TLS handshake completes, so
+/// the older "accept one connection, handshake it, then accept the next" shape
+/// ([`QuicListener::accept`], deprecated) lets a peer that opens a connection
+/// and then goes silent hold the listener hostage until that handshake times
+/// out.
 pub struct QuicListener {
     endpoint: quinn::Endpoint,
     listen_addr: Multiaddr,
@@ -298,21 +298,42 @@ impl QuicListener {
         .await
     }
 
-    /// Test-only convenience: take the next attempt and drive its handshake
-    /// under the configured deadline.
+    /// Take the next connection attempt and drive its TLS handshake to
+    /// completion, returning the verified [`QuicHandshake`] paired with the
+    /// remote peer's multiaddr.
     ///
-    /// Production code must not accept this way — one pending handshake would
-    /// block every later peer. Use [`QuicListener::for_each_handshake`].
-    #[cfg(test)]
-    pub(crate) async fn accept_and_handshake(
-        &self,
-    ) -> Option<Result<(Multiaddr, QuicHandshake), QuicErrorKind>> {
-        let incoming = self.accept_incoming().await?;
-        Some(
-            crate::runtime::timeout(self.handshake_timeout, Self::handshake(incoming))
-                .await
-                .unwrap_or_else(|_| Err(QuicErrorKind::HandshakeTimedOut(self.handshake_timeout))),
-        )
+    /// Returns `Ok(None)` when the endpoint has been closed. `Err(_)` means
+    /// **this particular attempt** failed (bad cert, peer-id mismatch, dropped
+    /// client, handshake deadline exceeded, …); the endpoint is still alive and
+    /// the caller is expected to call `accept()` again.
+    ///
+    /// # Deprecated
+    ///
+    /// Calling this in a loop serialises handshakes: the listener cannot look
+    /// at the next peer until the current handshake finishes. Since a QUIC
+    /// listener has to complete a TLS handshake before it learns who the peer
+    /// is, any unauthenticated stranger can open a connection, go silent, and
+    /// keep the loop stuck for a whole
+    /// [`QuicConfig::handshake_timeout`] — repeatable indefinitely, which
+    /// denies service to every honest peer.
+    ///
+    /// [`QuicListener::for_each_handshake`] replaces it: it keeps accepting
+    /// while handshakes run concurrently, bounded by a
+    /// [`HandshakeCapacity`], so a silent peer costs one slot and delays
+    /// nobody.
+    #[deprecated(
+        since = "0.7.8",
+        note = "serialises inbound handshakes, so one silent peer can stall the listener; \
+                use `QuicListener::for_each_handshake` instead"
+    )]
+    pub async fn accept(&self) -> Result<Option<(Multiaddr, QuicHandshake)>, QuicErrorKind> {
+        let Some(incoming) = self.accept_incoming().await else {
+            return Ok(None);
+        };
+        crate::runtime::timeout(self.handshake_timeout, Self::handshake(incoming))
+            .await
+            .unwrap_or_else(|_| Err(QuicErrorKind::HandshakeTimedOut(self.handshake_timeout)))
+            .map(Some)
     }
 
     /// Stop accepting new connections and close the underlying UDP socket.
@@ -736,12 +757,14 @@ mod tests {
         let server_addr = listener.listen_addr().clone();
 
         // Server task: accept, read up to 64 bytes from a bidi stream, echo back.
+        // Also keeps the deprecated `accept` covered.
         let server_task = tokio::spawn(async move {
+            #[allow(deprecated)]
             let (_remote_addr, session) = listener
-                .accept_and_handshake()
+                .accept()
                 .await
-                .expect("not closed")
-                .expect("handshake ok");
+                .expect("accept ok")
+                .expect("not closed");
             let conn = session.connection().clone();
             // Stopping a listener must not close an already accepted session.
             drop(listener);
@@ -801,7 +824,8 @@ mod tests {
         // Drive the listener so the handshake can progress (the server-side
         // failure is fine; we only need the listener task to keep polling).
         let _server_task = tokio::spawn(async move {
-            let _ignore = listener.accept_and_handshake().await;
+            #[allow(deprecated)]
+            let _ignore = listener.accept().await;
         });
 
         let client_key = SecioKeyPair::secp256k1_generated();
