@@ -382,6 +382,45 @@ impl Stream for TcpBaseListener {
     }
 }
 
+/// Read a complete protocol prefix without consuming it. Use the same bounded
+/// detector both before and after consuming a trusted PROXY header.
+async fn peek_protocol_prefix(stream: &TcpStream, timeout: Duration) -> io::Result<[u8; 16]> {
+    peek_protocol_prefix_with(timeout, || async {
+        let mut prefix = [0u8; 16];
+        let n = stream.peek(&mut prefix).await?;
+        Ok((n, prefix))
+    })
+    .await
+}
+
+async fn peek_protocol_prefix_with<F, Fut>(timeout: Duration, mut peek: F) -> io::Result<[u8; 16]>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<(usize, [u8; 16])>>,
+{
+    crate::runtime::timeout(timeout, async {
+        loop {
+            let (n, prefix) = peek().await?;
+            match n {
+                16 => return Ok(prefix),
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed during protocol detection",
+                    ));
+                }
+                _ => {
+                    // Partial peeked bytes remain immediately readable. Yield
+                    // so both the deadline and other tasks can make progress.
+                    crate::runtime::delay_for(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "protocol detection timed out"))?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn protocol_select(
     mut stream: TcpStream,
@@ -393,41 +432,17 @@ async fn protocol_select(
     connection_permit: Option<OwnedSemaphorePermit>,
     #[cfg(feature = "tls")] acceptor: TlsAcceptor,
 ) {
-    let mut peek_buf = [0u8; 16];
-    let peek_result = crate::runtime::timeout(timeout, async {
-        loop {
-            match stream.peek(&mut peek_buf).await {
-                Ok(16) => return Ok(()),
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "connection closed during protocol detection",
-                    ));
-                }
-                Ok(_) => {
-                    // `peek` does not consume bytes, so a partial prefix remains
-                    // immediately readable. Yield briefly instead of spinning.
-                    crate::runtime::delay_for(Duration::from_millis(10)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await;
-    match peek_result {
-        Err(_) => {
-            debug!("protocol detection timed out before 16 bytes were available");
-            return;
-        }
-        Ok(Err(error)) => {
+    #[cfg_attr(not(any(feature = "tls", feature = "ws")), allow(unused_variables))]
+    let peek_buf = match peek_protocol_prefix(&stream, timeout).await {
+        Ok(prefix) => prefix,
+        Err(error) => {
             debug!(
                 "stream encountered error during protocol detection: {}",
                 error
             );
             return;
         }
-        Ok(Ok(())) => {}
-    }
+    };
 
     // Track whether PROXY protocol has been parsed (to avoid double parsing when
     // TcpAndTls continues to OnlyTcp or OnlyTls)
@@ -543,27 +558,16 @@ async fn protocol_select(
                             proxy_parsed = true;
                             remote_address = addr;
                             // After parsing PROXY protocol, we need to peek fresh data
-                            let mut new_peek_buf = [0u8; 16];
-                            let peek_now = std::time::Instant::now();
-                            loop {
-                                match stream.peek(&mut new_peek_buf).await {
-                                    Ok(n) if n == 16 => break,
-                                    Ok(_) => {
-                                        if peek_now.elapsed() > timeout {
-                                            debug!(
-                                                "Failed to peek 16 bytes after PROXY protocol parsing"
-                                            );
-                                            return;
-                                        }
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        debug!("stream encountered err after PROXY parsing: {}", e);
-                                        return;
-                                    }
+                            match peek_protocol_prefix(&stream, timeout).await {
+                                Ok(prefix) => prefix,
+                                Err(error) => {
+                                    debug!(
+                                        "protocol detection failed after PROXY parsing: {}",
+                                        error
+                                    );
+                                    return;
                                 }
                             }
-                            new_peek_buf
                         }
                         Ok(ProxyProtocolResult::NotProxyProtocol) => {
                             debug!("Not a PROXY protocol connection from {}", remote_address);
@@ -796,5 +800,186 @@ async fn extract_forwarded_for_from_ws_handshake(
             SocketAddr::new(ip, port)
         }
         None => fallback_address,
+    }
+}
+
+#[cfg(test)]
+mod protocol_detection_tests {
+    use super::*;
+    use futures::future;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn pending_peek_times_out_and_releases_connection_slot() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let permit = limiter.clone().try_acquire_owned().unwrap();
+        let detect = async move {
+            let _permit = permit;
+            peek_protocol_prefix_with(Duration::from_millis(30), future::pending).await
+        };
+        let error = crate::runtime::timeout(Duration::from_secs(2), detect)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_peek_yields_and_obeys_deadline() {
+        let reads = AtomicUsize::new(0);
+        let error = peek_protocol_prefix_with(Duration::from_millis(30), || {
+            let count = reads.fetch_add(1, Ordering::SeqCst);
+            // Fail fast if cooperative waiting is accidentally removed. This
+            // also prevents a regressed detector from hanging the test runtime.
+            future::ready(if count < 10 {
+                Ok((1, [0; 16]))
+            } else {
+                Err(io::Error::other("detector polled without yielding"))
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(reads.load(Ordering::SeqCst) <= 10);
+    }
+
+    #[tokio::test]
+    async fn eof_and_io_errors_are_not_retried() {
+        for kind in [io::ErrorKind::UnexpectedEof, io::ErrorKind::ConnectionReset] {
+            let reads = AtomicUsize::new(0);
+            let error = peek_protocol_prefix_with(Duration::from_secs(1), || {
+                assert_eq!(reads.fetch_add(1, Ordering::SeqCst), 0);
+                future::ready(if kind == io::ErrorKind::UnexpectedEof {
+                    Ok((0, [0; 16]))
+                } else {
+                    Err(io::Error::from(kind))
+                })
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_prefix_is_returned_after_partial_read() {
+        let mut reads = 0;
+        let prefix = [7; 16];
+        let result = peek_protocol_prefix_with(Duration::from_secs(1), || {
+            reads += 1;
+            future::ready(Ok((if reads == 1 { 8 } else { 16 }, prefix)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, prefix);
+        assert_eq!(reads, 2);
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn post_proxy_detection_preserves_prefix_address_and_permit() {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Complete, ordinary PROXY + yamux input: no stalled network peer.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (accepted, client) = tokio::join!(
+            listener.accept(),
+            TcpStream::connect(listener.local_addr().unwrap()),
+        );
+        let (server, remote) = accepted.unwrap();
+        let mut client = client.unwrap();
+        let prefix = [0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        client
+            .write_all(b"PROXY TCP4 10.0.0.1 127.0.0.1 1234 80\r\n")
+            .await
+            .unwrap();
+        client.write_all(&prefix).await.unwrap();
+
+        let limiter = Arc::new(Semaphore::new(1));
+        let permit = limiter.clone().try_acquire_owned().unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let select = protocol_select(
+            server,
+            Duration::from_secs(1),
+            UpgradeModeEnum::TcpAndTls,
+            sender,
+            remote,
+            Arc::new(vec![remote.ip()]),
+            Some(permit),
+            TlsAcceptor::from(Arc::new(default_tls_server_config())),
+        );
+        let (_, result) = crate::runtime::timeout(Duration::from_secs(2), async {
+            tokio::join!(select, receiver.next())
+        })
+        .await
+        .unwrap();
+        let (address, stream, permit) = result.expect("TCP stream after PROXY header");
+        assert_eq!(address.to_string(), "/ip4/10.0.0.1/tcp/1234");
+        assert_eq!(limiter.available_permits(), 0);
+        let MultiStream::Tcp(mut stream) = stream else {
+            panic!("expected TCP")
+        };
+        let mut observed = [0; 16];
+        crate::runtime::timeout(Duration::from_secs(1), stream.read_exact(&mut observed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, prefix);
+        drop(stream);
+        drop(permit);
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    /// A peer that sends a trusted PROXY header and then goes silent must not
+    /// pin a connection slot. The post-PROXY detector used to `peek` with no
+    /// deadline at all, so such a peer held its permit — and its socket —
+    /// forever.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn post_proxy_silent_peer_releases_connection_slot() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (accepted, client) = tokio::join!(
+            listener.accept(),
+            TcpStream::connect(listener.local_addr().unwrap()),
+        );
+        let (server, remote) = accepted.unwrap();
+        let mut client = client.unwrap();
+        // Only the PROXY header: never the protocol prefix that follows it.
+        client
+            .write_all(b"PROXY TCP4 10.0.0.1 127.0.0.1 1234 80\r\n")
+            .await
+            .unwrap();
+
+        let limiter = Arc::new(Semaphore::new(1));
+        let permit = limiter.clone().try_acquire_owned().unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+        let detection_timeout = Duration::from_millis(200);
+        crate::runtime::timeout(
+            Duration::from_secs(5),
+            protocol_select(
+                server,
+                detection_timeout,
+                UpgradeModeEnum::TcpAndTls,
+                sender,
+                remote,
+                Arc::new(vec![remote.ip()]),
+                Some(permit),
+                TlsAcceptor::from(Arc::new(default_tls_server_config())),
+            ),
+        )
+        .await
+        .expect("post-PROXY detection must obey its deadline");
+        assert_eq!(
+            limiter.available_permits(),
+            1,
+            "the connection slot must be released"
+        );
+        // Keep the peer alive for the whole test so the stall is a silent
+        // peer rather than a closed socket.
+        drop(client);
     }
 }

@@ -1,3 +1,20 @@
+## Unreleased
+
+### Security fixes
+
+- Use the same bounded, cooperatively yielding protocol-prefix detector before
+  and after a trusted PROXY header in combined TCP/TLS listeners. Pending reads
+  time out, partial prefixes do not busy-loop, and EOF terminates detection.
+- Bound inbound QUIC handshakes with an absolute deadline measured from
+  admission. Transport activity cannot extend the deadline; handshake timeout
+  releases the service-wide connection permit instead of retaining it indefinitely.
+
+### API changes
+
+- Add `QuicConfig::handshake_timeout` (default 10 seconds; zero is rejected) and
+  `QuicErrorKind::HandshakeTimedOut`. Exhaustive configuration initializers and
+  error matches must account for these additions.
+
 ## tentacle 0.7.5 yamux 0.3.18
 
 ### Bug fix

@@ -5,8 +5,8 @@
 //!   pre-built `quinn::ServerConfig`. It is the user-facing entry point that
 //!   the higher-level service builder hands to the transport layer.
 //! - [`QuicEndpoint::listen`] binds a UDP socket and returns a
-//!   [`QuicListener`] that yields accepted [`QuicHandshake`]s (each one with
-//!   its TLS handshake already completed and verified).
+//!   [`QuicListener`] that yields [`QuicIncoming`] attempts for admission
+//!   control before completing their TLS handshakes under an absolute deadline.
 //! - [`QuicEndpoint::dial`] opens a one-shot client endpoint and dials the
 //!   given multiaddr, returning a fully-handshaken [`QuicHandshake`].
 //! - [`parse_quic_multiaddr`] enforces the legal address shape.
@@ -15,7 +15,12 @@
 //! deliberately keeps `dial` to a fresh client endpoint per call so the
 //! basic flow can be unit-tested in isolation.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -63,6 +68,11 @@ impl<K: KeyProvider> QuicEndpoint<K> {
     /// per-dial so that a per-dial `expected_peer_id` can be wired into the
     /// server-cert verifier.
     pub fn new(local_key: K, config: QuicConfig) -> Result<Self, QuicErrorKind> {
+        if config.handshake_timeout.is_zero() {
+            return Err(QuicErrorKind::Misconfigured(
+                "handshake_timeout must be nonzero".into(),
+            ));
+        }
         let cert = build_self_signed(&local_key)?;
         let server_config = build_quinn_server_config(local_key.clone(), &cert, &config)?;
         Ok(Self {
@@ -78,6 +88,8 @@ impl<K: KeyProvider> QuicEndpoint<K> {
     /// `addr` and return a [`QuicListener`] yielding accepted sessions.
     ///
     /// `addr` must match the shape accepted by [`parse_quic_multiaddr`].
+    /// Each incoming attempt uses [`QuicConfig::handshake_timeout`] from the
+    /// moment it is returned by [`QuicListener::accept`].
     pub fn listen(&self, addr: Multiaddr) -> Result<QuicListener, QuicErrorKind> {
         let (socket_addr, _peer_id) = parse_quic_multiaddr(&addr)?;
         let endpoint = quinn::Endpoint::server(self.server_config.clone(), socket_addr)?;
@@ -85,6 +97,7 @@ impl<K: KeyProvider> QuicEndpoint<K> {
         Ok(QuicListener {
             endpoint,
             listen_addr: socketaddr_to_quic_multiaddr(local_addr),
+            handshake_timeout: self.config.handshake_timeout,
         })
     }
 
@@ -147,6 +160,36 @@ impl<K: KeyProvider> QuicEndpoint<K> {
 /// behalf. Call [`QuicIncoming::finish`] to complete the handshake.
 pub struct QuicIncoming {
     inner: quinn::Incoming,
+    deadline: HandshakeDeadline,
+}
+
+/// Count queueing time after admission as well as time spent polling TLS.
+/// Transport activity and later calls to `finish` cannot reset this deadline.
+struct HandshakeDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl HandshakeDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    async fn finish<T>(
+        self,
+        handshake: impl Future<Output = Result<T, QuicErrorKind>>,
+    ) -> Result<T, QuicErrorKind> {
+        let remaining = self.timeout.saturating_sub(self.started.elapsed());
+        if remaining.is_zero() {
+            return Err(QuicErrorKind::HandshakeTimedOut(self.timeout));
+        }
+        crate::runtime::timeout(remaining, handshake)
+            .await
+            .unwrap_or(Err(QuicErrorKind::HandshakeTimedOut(self.timeout)))
+    }
 }
 
 impl QuicIncoming {
@@ -166,10 +209,16 @@ impl QuicIncoming {
     /// `Err(_)` means **this particular handshake attempt** failed (bad cert,
     /// peer-id mismatch, dropped client, …); the listener endpoint is still
     /// alive and the caller is expected to keep accepting.
+    /// The absolute deadline starts at `QuicListener::accept`, not when this
+    /// future is first polled, and is not extended by transport activity.
     pub async fn finish(self) -> Result<QuicHandshake, QuicErrorKind> {
-        let conn = self.inner.await?;
-        let remote_pubkey = peer_pubkey_from_connection(&conn)?;
-        Ok(QuicHandshake::new(conn, remote_pubkey))
+        self.deadline
+            .finish(async move {
+                let conn = self.inner.await?;
+                let remote_pubkey = peer_pubkey_from_connection(&conn)?;
+                Ok(QuicHandshake::new(conn, remote_pubkey))
+            })
+            .await
     }
 }
 
@@ -180,6 +229,7 @@ impl QuicIncoming {
 pub struct QuicListener {
     endpoint: quinn::Endpoint,
     listen_addr: Multiaddr,
+    handshake_timeout: Duration,
 }
 
 impl QuicListener {
@@ -195,10 +245,10 @@ impl QuicListener {
     /// [`QuicIncoming`] has not been handshaken yet, so the caller can apply
     /// admission control before spending any work on it.
     pub async fn accept(&self) -> Option<QuicIncoming> {
-        self.endpoint
-            .accept()
-            .await
-            .map(|inner| QuicIncoming { inner })
+        self.endpoint.accept().await.map(|inner| QuicIncoming {
+            inner,
+            deadline: HandshakeDeadline::new(self.handshake_timeout),
+        })
     }
 
     /// Stop accepting new connections and close the underlying UDP socket.
@@ -473,6 +523,168 @@ mod tests {
     use super::*;
     use crate::secio::SecioKeyPair;
     use std::str::FromStr;
+
+    #[test]
+    fn reject_zero_handshake_timeout() {
+        let config = QuicConfig {
+            handshake_timeout: Duration::ZERO,
+            ..QuicConfig::default()
+        };
+        assert!(matches!(
+            QuicEndpoint::new(SecioKeyPair::secp256k1_generated(), config),
+            Err(QuicErrorKind::Misconfigured(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_expires_and_releases_connection_slot() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = limiter.clone().try_acquire_owned().unwrap();
+        let deadline = HandshakeDeadline::new(Duration::from_millis(30));
+        // Model the service task: the permit spans `finish`, then is dropped
+        // on error instead of being transferred to a session event.
+        let task = async move {
+            let _permit = permit;
+            deadline
+                .finish(futures::future::pending::<Result<(), QuicErrorKind>>())
+                .await
+        };
+        let result = crate::runtime::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(QuicErrorKind::HandshakeTimedOut(_))));
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn handshake_progress_does_not_reset_deadline() {
+        let deadline = HandshakeDeadline::new(Duration::from_millis(30));
+        let result = crate::runtime::timeout(
+            Duration::from_secs(2),
+            deadline.finish(async {
+                // Simulated handshake activity, without sending network traffic.
+                loop {
+                    crate::runtime::delay_for(Duration::from_millis(5)).await;
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), QuicErrorKind>(())
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(QuicErrorKind::HandshakeTimedOut(_))));
+    }
+
+    #[tokio::test]
+    async fn expired_handshake_is_not_polled() {
+        let deadline = HandshakeDeadline {
+            started: Instant::now() - Duration::from_secs(1),
+            timeout: Duration::from_millis(30),
+        };
+        let result = deadline
+            .finish(async {
+                panic!("an expired handshake must not be started");
+                #[allow(unreachable_code)]
+                Ok::<(), QuicErrorKind>(())
+            })
+            .await;
+        assert!(matches!(result, Err(QuicErrorKind::HandshakeTimedOut(_))));
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_preserves_success_and_errors() {
+        let result = HandshakeDeadline::new(Duration::from_secs(1))
+            .finish(async { Ok(7) })
+            .await;
+        assert_eq!(result.unwrap(), 7);
+        let result = HandshakeDeadline::new(Duration::from_secs(1))
+            .finish(async { Err::<(), _>(QuicErrorKind::NoPeerCert) })
+            .await;
+        assert!(matches!(result, Err(QuicErrorKind::NoPeerCert)));
+    }
+
+    #[tokio::test]
+    async fn cancelling_handshake_drops_pending_work_and_permit() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = limiter.clone().try_acquire_owned().unwrap();
+        let task = async move {
+            let _permit = permit;
+            HandshakeDeadline::new(Duration::from_secs(30))
+                .finish(futures::future::pending::<Result<(), QuicErrorKind>>())
+                .await
+        };
+        let mut task = Box::pin(task);
+        assert!(futures::poll!(&mut task).is_pending());
+        assert_eq!(limiter.available_permits(), 0);
+        drop(task);
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    /// A UDP relay that passes a peer's **first** datagram on to `server` and
+    /// drops everything after it, so the server allocates an inbound handshake
+    /// that the peer never completes.
+    async fn spawn_stalling_relay(server: SocketAddr) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let mut forwarded = false;
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                if from != server && !forwarded {
+                    let _ignore = socket.send_to(&buf[..n], server).await;
+                    forwarded = true;
+                }
+            }
+        });
+        relay_addr
+    }
+
+    /// End-to-end counterpart of the `HandshakeDeadline` unit tests: a real
+    /// peer that opens a QUIC connection and then goes silent must be dropped
+    /// at `handshake_timeout`, not at quinn's much longer idle timeout.
+    #[tokio::test]
+    async fn inbound_handshake_obeys_handshake_timeout() {
+        let handshake_timeout = Duration::from_millis(300);
+        let server = QuicEndpoint::new(
+            SecioKeyPair::secp256k1_generated(),
+            QuicConfig {
+                handshake_timeout,
+                ..QuicConfig::default()
+            },
+        )
+        .unwrap();
+        let listener = server
+            .listen(Multiaddr::from_str("/ip4/127.0.0.1/udp/0/quic-v1").unwrap())
+            .expect("listen");
+        let (server_socket, _) = parse_quic_multiaddr(listener.listen_addr()).unwrap();
+        let relay = spawn_stalling_relay(server_socket).await;
+
+        let _silent_peer = tokio::spawn(async move {
+            let client =
+                QuicEndpoint::new(SecioKeyPair::secp256k1_generated(), QuicConfig::default())
+                    .unwrap();
+            let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", relay.port())
+                .parse()
+                .unwrap();
+            let _ignore = client.dial(addr).await;
+        });
+
+        let incoming = crate::runtime::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("the initial packet must reach the listener")
+            .expect("endpoint still open");
+        let started = Instant::now();
+        let error = crate::runtime::timeout(Duration::from_secs(5), incoming.finish())
+            .await
+            .expect("finish must obey the handshake deadline")
+            .expect_err("a silent peer cannot complete a handshake");
+        assert!(matches!(error, QuicErrorKind::HandshakeTimedOut(_)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "handshake should have been abandoned at {handshake_timeout:?}, took {:?}",
+            started.elapsed()
+        );
+    }
 
     // ────────────── address parsing ──────────────
 
