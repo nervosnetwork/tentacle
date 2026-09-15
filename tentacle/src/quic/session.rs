@@ -56,7 +56,7 @@ use crate::{
 /// public key recovered from its tentacle identity extension.
 ///
 /// This is what `QuicEndpoint::dial()` returns and what
-/// `QuicListener::accept()` yields. Once the higher-level service has set
+/// `QuicListener::handshake()` yields. Once the higher-level service has set
 /// up a `SessionMeta` for it, the handshake is consumed by
 /// [`QuicSession::new`] to build the full session loop.
 #[derive(Debug)]
@@ -886,10 +886,10 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (_addr, hs) = listener
-                .accept()
+                .accept_and_handshake()
                 .await
-                .expect("accept ok")
-                .expect("not closed");
+                .expect("not closed")
+                .expect("handshake ok");
             // Application-initiated close on the server side.
             hs.connection().close(0u32.into(), b"bye");
         });

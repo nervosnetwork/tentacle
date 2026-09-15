@@ -40,12 +40,14 @@ use crate::{
 #[cfg(feature = "quic")]
 use crate::{
     quic::{
-        endpoint::{QuicEndpoint, QuicEndpointHandle},
+        endpoint::{HandshakeCapacity, QuicEndpoint, QuicEndpointHandle, QuicListener},
         session::QuicSession,
     },
     session::QuicListenAccepted,
     utils::{TransportType, find_type},
 };
+#[cfg(feature = "quic")]
+use std::ops::ControlFlow;
 
 pub(crate) mod config;
 mod control;
@@ -116,6 +118,10 @@ struct InnerService<K> {
     /// See [`QuicEndpointSlot`] for the per-state user-visible error.
     #[cfg(feature = "quic")]
     quic_endpoint: QuicEndpointSlot,
+
+    /// Shared across all QUIC listeners, including results awaiting delivery.
+    #[cfg(feature = "quic")]
+    quic_pending_handshakes: HandshakeCapacity,
 
     handshake_type: HandshakeType<K>,
 
@@ -250,6 +256,15 @@ where
                 handshake_type,
                 #[cfg(feature = "quic")]
                 quic_endpoint,
+                #[cfg(feature = "quic")]
+                quic_pending_handshakes: HandshakeCapacity::new(
+                    // Invalid limits are reported by `quic_endpoint` above; a
+                    // zero budget here just means no listener will ever run.
+                    config
+                        .quic_config
+                        .as_ref()
+                        .map_or(0, |cfg| cfg.max_pending_handshakes),
+                ),
                 multi_transport: {
                     #[cfg(target_family = "wasm")]
                     let transport = MultiTransport::new(config.timeout.timeout);
@@ -640,38 +655,11 @@ where
 
         self.listens.insert(listen_address.clone());
 
-        let mut sender = self.session_event_sender.clone();
-        let listen_addr_for_loop = listen_address.clone();
-        let task = async move {
-            loop {
-                match listener.accept().await {
-                    Ok(Some((remote_addr, handshake))) => {
-                        let public_key = handshake.remote_pubkey().clone();
-                        let event = SessionEvent::QuicListenAccepted(QuicListenAccepted {
-                            session: handshake,
-                            public_key,
-                            address: remote_addr,
-                            listen_address: Some(listen_addr_for_loop.clone()),
-                            ty: SessionType::Inbound,
-                        });
-                        if sender.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    // Per-connection handshake failure (bad cert, peer-id
-                    // mismatch, dropped client, …). The endpoint is still
-                    // alive — log and keep accepting.
-                    Err(error) => {
-                        log::debug!(
-                            "quic accept handshake failed: {:?} for address {:?}",
-                            error,
-                            listen_addr_for_loop
-                        );
-                    }
-                }
-            }
-        };
+        let task = Self::run_quic_listener(
+            listener,
+            self.session_event_sender.clone(),
+            self.quic_pending_handshakes.clone(),
+        );
         let mut future_sender = self.future_task_sender.clone();
         crate::runtime::spawn(async move {
             let _ignore = future_sender.send(Box::pin(task)).await;
@@ -712,6 +700,7 @@ where
         let mut sender = self.session_event_sender.clone();
 
         let listen_address_for_start = listen_address.clone();
+        let permits = self.quic_pending_handshakes.clone();
         let task = async move {
             // Tell the service main loop the listen completed.
             if let Err(err) = sender
@@ -725,34 +714,7 @@ where
                 return;
             }
 
-            // Drive the accept loop until the endpoint is closed.
-            loop {
-                match listener.accept().await {
-                    Ok(Some((remote_addr, handshake))) => {
-                        let public_key = handshake.remote_pubkey().clone();
-                        let event = SessionEvent::QuicListenAccepted(QuicListenAccepted {
-                            session: handshake,
-                            public_key,
-                            address: remote_addr,
-                            listen_address: Some(listen_address.clone()),
-                            ty: SessionType::Inbound,
-                        });
-                        if sender.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    // Per-connection handshake failure; endpoint is still
-                    // alive — log and keep accepting.
-                    Err(error) => {
-                        log::debug!(
-                            "quic accept handshake failed: {:?} for address {:?}",
-                            error,
-                            listen_address_for_start
-                        );
-                    }
-                }
-            }
+            Self::run_quic_listener(listener, sender, permits).await;
         };
 
         let mut future_sender = self.future_task_sender.clone();
@@ -761,6 +723,56 @@ where
         });
         self.state.increase();
         Ok(())
+    }
+
+    #[cfg(feature = "quic")]
+    async fn run_quic_listener(
+        listener: QuicListener,
+        sender: mpsc::Sender<SessionEvent>,
+        capacity: HandshakeCapacity,
+    ) {
+        let listen_address = listener.listen_addr().clone();
+        listener
+            .for_each_handshake(capacity, move |result| {
+                let mut sender = sender.clone();
+                let listen_address = listen_address.clone();
+                async move {
+                    match result {
+                        Ok((remote_addr, handshake)) => {
+                            let public_key = handshake.remote_pubkey().clone();
+                            let sent = sender
+                                .send(SessionEvent::QuicListenAccepted(QuicListenAccepted {
+                                    session: handshake,
+                                    public_key,
+                                    address: remote_addr,
+                                    listen_address: Some(listen_address),
+                                    ty: SessionType::Inbound,
+                                }))
+                                .await
+                                .is_ok();
+                            // A closed receiver means the service has shut down.
+                            if sent {
+                                ControlFlow::Continue(())
+                            } else {
+                                ControlFlow::Break(())
+                            }
+                        }
+                        Err(error) => {
+                            log::debug!(
+                                "quic accept handshake failed: {:?} for address {:?}",
+                                error,
+                                listen_address
+                            );
+                            if sender.is_closed() {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            }
+                        }
+                    }
+                }
+            })
+            .await
     }
 
     /// Spawn protocol handle

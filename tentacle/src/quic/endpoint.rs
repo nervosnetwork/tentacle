@@ -5,8 +5,8 @@
 //!   pre-built `quinn::ServerConfig`. It is the user-facing entry point that
 //!   the higher-level service builder hands to the transport layer.
 //! - [`QuicEndpoint::listen`] binds a UDP socket and returns a
-//!   [`QuicListener`] that yields accepted [`QuicHandshake`]s (each one with
-//!   its TLS handshake already completed and verified).
+//!   [`QuicListener`], whose inbound attempts are turned into verified
+//!   [`QuicHandshake`]s concurrently by the service's bounded handshake driver.
 //! - [`QuicEndpoint::dial`] opens a one-shot client endpoint and dials the
 //!   given multiaddr, returning a fully-handshaken [`QuicHandshake`].
 //! - [`parse_quic_multiaddr`] enforces the legal address shape.
@@ -15,10 +15,11 @@
 //! deliberately keeps `dial` to a fresh client endpoint per call so the
 //! basic flow can be unit-tested in isolation.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, ops::ControlFlow, sync::Arc, time::Duration};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use tokio::sync::Semaphore;
 
 use crate::{
     multiaddr::{Multiaddr, Protocol},
@@ -63,6 +64,14 @@ impl<K: KeyProvider> QuicEndpoint<K> {
     /// per-dial so that a per-dial `expected_peer_id` can be wired into the
     /// server-cert verifier.
     pub fn new(local_key: K, config: QuicConfig) -> Result<Self, QuicErrorKind> {
+        if config.handshake_timeout.is_zero()
+            || config.max_pending_handshakes == 0
+            || config.max_pending_handshakes > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(QuicErrorKind::Misconfigured(
+                "handshake_timeout and max_pending_handshakes must be positive and the latter must fit a semaphore".into(),
+            ));
+        }
         let cert = build_self_signed(&local_key)?;
         let server_config = build_quinn_server_config(local_key.clone(), &cert, &config)?;
         Ok(Self {
@@ -85,6 +94,7 @@ impl<K: KeyProvider> QuicEndpoint<K> {
         Ok(QuicListener {
             endpoint,
             listen_addr: socketaddr_to_quic_multiaddr(local_addr),
+            handshake_timeout: self.config.handshake_timeout,
         })
     }
 
@@ -135,45 +145,174 @@ impl<K: KeyProvider> QuicEndpoint<K> {
     }
 }
 
+// ────────────────────────────── HandshakeCapacity ──────────────────────────────
+
+/// How many inbound QUIC handshakes may be in flight at once.
+///
+/// A slot is taken when a connection attempt is admitted and returned when its
+/// handshake finishes, fails, times out, or its result has been handed to the
+/// application. Peers arriving with no slot free are refused immediately,
+/// which caps the work and memory a stranger can make the node allocate before
+/// it has authenticated anyone.
+///
+/// Clone it to share one budget between several listeners — that is what
+/// `Service` does, so the bound applies to the whole node rather than per
+/// listen address.
+#[derive(Clone, Debug)]
+pub struct HandshakeCapacity(Arc<Semaphore>);
+
+impl HandshakeCapacity {
+    /// Allow at most `max_pending` concurrent inbound handshakes.
+    ///
+    /// Values above `tokio::sync::Semaphore::MAX_PERMITS` are clamped.
+    pub fn new(max_pending: usize) -> Self {
+        Self(Arc::new(Semaphore::new(
+            max_pending.min(Semaphore::MAX_PERMITS),
+        )))
+    }
+
+    /// Slots not currently occupied by a pending handshake.
+    ///
+    /// Useful as a health metric: a listener sitting at zero is being kept
+    /// busy by peers that do not finish their handshakes.
+    pub fn available(&self) -> usize {
+        self.0.available_permits()
+    }
+
+    pub(crate) fn permits(&self) -> Arc<Semaphore> {
+        self.0.clone()
+    }
+}
+
 // ─────────────────────────────────── QuicListener ──────────────────────────────────
 
 /// Server-side QUIC listener, wrapping a bound `quinn::Endpoint`.
 ///
-/// Each call to [`QuicListener::accept`] yields a fully-handshaken
-/// [`QuicHandshake`] together with the multiaddr of the remote peer.
+/// Drive it with [`QuicListener::for_each_handshake`]. There is deliberately no
+/// "accept one connection, handshake it, then accept the next" API: a QUIC
+/// listener cannot know who a peer is until its TLS handshake completes, so a
+/// peer that opens a connection and then goes silent would hold such a loop
+/// hostage until the handshake timed out. Accepting and handshaking are kept
+/// separate internally precisely so they can run concurrently under a deadline
+/// and a capacity bound.
 pub struct QuicListener {
     endpoint: quinn::Endpoint,
     listen_addr: Multiaddr,
+    handshake_timeout: Duration,
 }
 
 impl QuicListener {
+    /// Receive a request without waiting for TLS or peer authentication.
+    async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept().await
+    }
+
+    /// Drive one inbound attempt's TLS handshake and identity verification.
+    ///
+    /// `Err(_)` means **this particular attempt** failed (bad cert, peer-id
+    /// mismatch, dropped client, …); the listener endpoint is still alive.
+    async fn handshake(
+        incoming: quinn::Incoming,
+    ) -> Result<(Multiaddr, QuicHandshake), QuicErrorKind> {
+        let remote_addr = incoming.remote_address();
+        let conn = incoming.await?;
+        let remote_pubkey = peer_pubkey_from_connection(&conn)?;
+        Ok((
+            socketaddr_to_quic_multiaddr(remote_addr),
+            QuicHandshake::new(conn, remote_pubkey),
+        ))
+    }
+
     /// The actual local listen address (resolved after bind, so e.g.
     /// `/udp/0/quic-v1` becomes `/udp/<picked-port>/quic-v1`).
     pub fn listen_addr(&self) -> &Multiaddr {
         &self.listen_addr
     }
 
-    /// Accept the next incoming connection, drive its TLS handshake to
-    /// completion, and return the resulting [`QuicHandshake`] paired with the
-    /// remote peer's multiaddr.
+    /// Serve this listener, running inbound handshakes concurrently.
     ///
-    /// Returns `Ok(None)` when the endpoint has been closed. `Err(_)` means
-    /// **this particular handshake attempt** failed (bad cert, peer-id
-    /// mismatch, dropped client, …); the underlying UDP endpoint is still
-    /// alive and the caller is expected to call `accept()` again to take
-    /// the next connection.
-    pub async fn accept(&self) -> Result<Option<(Multiaddr, QuicHandshake)>, QuicErrorKind> {
-        let incoming = match self.endpoint.accept().await {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        let remote_addr = incoming.remote_address();
-        let conn = incoming.await?;
-        let remote_pubkey = peer_pubkey_from_connection(&conn)?;
-        Ok(Some((
-            socketaddr_to_quic_multiaddr(remote_addr),
-            QuicHandshake::new(conn, remote_pubkey),
-        )))
+    /// Connection attempts are taken off the endpoint queue as fast as they
+    /// arrive; each one that fits in `capacity` gets its TLS handshake and
+    /// tentacle identity check driven in the background, under the
+    /// [`QuicConfig::handshake_timeout`] of the endpoint that bound this
+    /// listener. Attempts that do not fit are refused straight away. A peer
+    /// that never completes its handshake therefore costs one slot for at most
+    /// the handshake deadline and delays nobody else.
+    ///
+    /// `on_handshake` is called once per attempt, with `Ok((remote_addr,
+    /// handshake))` for a peer whose identity has been verified, or `Err(_)`
+    /// for one that failed or timed out. Return
+    /// [`ControlFlow::Continue`] to keep serving, or [`ControlFlow::Break`] to
+    /// stop — this future then resolves. It also resolves on its own when the
+    /// endpoint is closed. The slot is held until `on_handshake` completes, so
+    /// a slow consumer applies backpressure instead of letting finished
+    /// connections pile up.
+    ///
+    /// ```no_run
+    /// # use std::ops::ControlFlow;
+    /// # use tentacle::quic::{config::QuicConfig, endpoint::{HandshakeCapacity, QuicEndpoint}};
+    /// # use tentacle::secio::SecioKeyPair;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = QuicConfig::default();
+    /// let capacity = HandshakeCapacity::new(config.max_pending_handshakes);
+    /// let endpoint = QuicEndpoint::new(SecioKeyPair::secp256k1_generated(), config)?;
+    /// let listener = endpoint.listen("/ip4/0.0.0.0/udp/8000/quic-v1".parse()?)?;
+    ///
+    /// listener
+    ///     .for_each_handshake(capacity, |result| async move {
+    ///         match result {
+    ///             Ok((addr, handshake)) => {
+    ///                 println!("{addr} is {:?}", handshake.remote_pubkey().peer_id());
+    ///             }
+    ///             Err(error) => println!("inbound handshake failed: {error}"),
+    ///         }
+    ///         ControlFlow::Continue(())
+    ///     })
+    ///     .await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn for_each_handshake<F, Fut>(self, capacity: HandshakeCapacity, on_handshake: F)
+    where
+        F: Fn(Result<(Multiaddr, QuicHandshake), QuicErrorKind>) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = ControlFlow<()>> + Send + 'static,
+    {
+        let deadline = self.handshake_timeout;
+        let incoming = futures::stream::unfold(self, |listener| async move {
+            listener
+                .accept_incoming()
+                .await
+                .map(|incoming| (incoming, listener))
+        });
+        crate::quic::incoming::drive(
+            incoming,
+            capacity.permits(),
+            deadline,
+            Self::handshake,
+            move |result| {
+                let on_handshake = on_handshake.clone();
+                async move { on_handshake(result).await.is_continue() }
+            },
+            quinn::Incoming::refuse,
+        )
+        .await
+    }
+
+    /// Test-only convenience: take the next attempt and drive its handshake
+    /// under the configured deadline.
+    ///
+    /// Production code must not accept this way — one pending handshake would
+    /// block every later peer. Use [`QuicListener::for_each_handshake`].
+    #[cfg(test)]
+    pub(crate) async fn accept_and_handshake(
+        &self,
+    ) -> Option<Result<(Multiaddr, QuicHandshake), QuicErrorKind>> {
+        let incoming = self.accept_incoming().await?;
+        Some(
+            crate::runtime::timeout(self.handshake_timeout, Self::handshake(incoming))
+                .await
+                .unwrap_or_else(|_| Err(QuicErrorKind::HandshakeTimedOut(self.handshake_timeout))),
+        )
     }
 
     /// Stop accepting new connections and close the underlying UDP socket.
@@ -556,6 +695,29 @@ mod tests {
         QuicEndpoint::new(key, QuicConfig::default()).expect("endpoint construction");
     }
 
+    #[test]
+    fn endpoint_rejects_invalid_handshake_limits() {
+        for config in [
+            QuicConfig {
+                handshake_timeout: Duration::ZERO,
+                ..QuicConfig::default()
+            },
+            QuicConfig {
+                max_pending_handshakes: 0,
+                ..QuicConfig::default()
+            },
+            QuicConfig {
+                max_pending_handshakes: usize::MAX,
+                ..QuicConfig::default()
+            },
+        ] {
+            assert!(matches!(
+                QuicEndpoint::new(SecioKeyPair::secp256k1_generated(), config),
+                Err(QuicErrorKind::Misconfigured(_))
+            ));
+        }
+    }
+
     // ────────────── end-to-end smoke ──────────────
 
     /// One server + one client, both built from `QuicEndpoint`. The client
@@ -576,11 +738,13 @@ mod tests {
         // Server task: accept, read up to 64 bytes from a bidi stream, echo back.
         let server_task = tokio::spawn(async move {
             let (_remote_addr, session) = listener
-                .accept()
+                .accept_and_handshake()
                 .await
-                .expect("accept ok")
-                .expect("not closed");
+                .expect("not closed")
+                .expect("handshake ok");
             let conn = session.connection().clone();
+            // Stopping a listener must not close an already accepted session.
+            drop(listener);
             let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
             let mut buf = vec![0u8; 64];
             let n = recv.read(&mut buf).await.expect("read").expect("data");
@@ -637,7 +801,7 @@ mod tests {
         // Drive the listener so the handshake can progress (the server-side
         // failure is fine; we only need the listener task to keep polling).
         let _server_task = tokio::spawn(async move {
-            let _ = listener.accept().await.unwrap();
+            let _ignore = listener.accept_and_handshake().await;
         });
 
         let client_key = SecioKeyPair::secp256k1_generated();
