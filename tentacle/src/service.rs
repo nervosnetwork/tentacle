@@ -808,80 +808,71 @@ where
         proto_id: ProtocolId,
         priority: Priority,
         data: Bytes,
+        reserved: Option<SessionContext>,
     ) {
+        let reserved_size = data.len();
+        if let Some(context) = &reserved
+            && context.closed()
+        {
+            context.decr_pending_data_size(reserved_size);
+            return;
+        }
         let data = match self.before_sends.get(&proto_id) {
             Some(function) => function(data),
             None => data,
         };
 
-        match target {
-            // Send data to the specified protocol for the specified session.
-            TargetSession::Single(id) => {
-                if let Some(control) = self.sessions.get_mut(&id) {
-                    control.inner.incr_pending_data_size(data.len());
-                    let _ignore = control
-                        .send(priority, SessionEvent::ProtocolMessage { proto_id, data })
-                        .await;
-                }
+        let session_ids: Vec<_> = match target {
+            TargetSession::Single(id) => vec![id],
+            TargetSession::Multi(iter) => iter.collect(),
+            TargetSession::Filter(mut filter) => self
+                .sessions
+                .keys()
+                .filter(|id| filter(id))
+                .copied()
+                .collect(),
+            TargetSession::All => self.sessions.keys().copied().collect(),
+        };
+
+        let mut reservation_consumed = false;
+        for id in session_ids {
+            debug!(
+                "send message to session [{}], proto [{}], data len: {}",
+                id,
+                proto_id,
+                data.len()
+            );
+            let message_reserved_size = reserved
+                .as_ref()
+                .filter(|context| context.id == id)
+                .map(|_| reserved_size);
+            if message_reserved_size.is_some() {
+                reservation_consumed = true;
             }
-            TargetSession::Multi(iter) => {
-                for id in iter {
-                    if let Some(control) = self.sessions.get_mut(&id) {
-                        control.inner.incr_pending_data_size(data.len());
-                        let _ignore = control
-                            .send(
-                                priority,
-                                SessionEvent::ProtocolMessage {
-                                    proto_id,
-                                    data: data.clone(),
-                                },
-                            )
-                            .await;
-                    }
+
+            let blocked_context = if let Some(control) = self.sessions.get_mut(&id) {
+                control
+                    .send_message(priority, proto_id, data.clone(), message_reserved_size)
+                    .await
+                    .then(|| control.inner.clone())
+            } else {
+                if let (Some(context), Some(size)) = (&reserved, message_reserved_size) {
+                    context.decr_pending_data_size(size);
                 }
+                None
+            };
+            if let Some(session_context) = blocked_context {
+                let _ignore = self
+                    .handle_sender
+                    .send(ServiceError::SessionBlocked { session_context }.into())
+                    .await;
             }
-            // Send data to the specified protocol for the specified sessions.
-            TargetSession::Filter(mut filter) => {
-                for (id, control) in self.sessions.iter_mut().filter(|(id, _)| filter(id)) {
-                    debug!(
-                        "send message to session [{}], proto [{}], data len: {}",
-                        id,
-                        proto_id,
-                        data.len()
-                    );
-                    control.inner.incr_pending_data_size(data.len());
-                    let _ignore = control
-                        .send(
-                            priority,
-                            SessionEvent::ProtocolMessage {
-                                proto_id,
-                                data: data.clone(),
-                            },
-                        )
-                        .await;
-                }
-            }
-            // Broadcast data for a specified protocol.
-            TargetSession::All => {
-                debug!(
-                    "broadcast message, peer count: {}, proto_id: {}, data len: {}",
-                    self.sessions.len(),
-                    proto_id,
-                    data.len()
-                );
-                for control in self.sessions.values_mut() {
-                    control.inner.incr_pending_data_size(data.len());
-                    let _ignore = control
-                        .send(
-                            priority,
-                            SessionEvent::ProtocolMessage {
-                                proto_id,
-                                data: data.clone(),
-                            },
-                        )
-                        .await;
-                }
-            }
+        }
+
+        // A reserved task is always single-session, but keep rollback local to
+        // the task in case its target disappeared or becomes inconsistent.
+        if !reservation_consumed && let Some(context) = reserved {
+            context.decr_pending_data_size(reserved_size);
         }
     }
 
@@ -1024,6 +1015,7 @@ where
                 remote_pubkey,
                 session_closed,
                 pending_data_size,
+                self.config.session_config.send_buffer_size,
             )),
         );
 
@@ -1604,8 +1596,28 @@ where
                 target,
                 proto_id,
                 data,
+                reserved,
             } => {
-                self.handle_message(target, proto_id, priority, data).await;
+                self.handle_message(target, proto_id, priority, data, reserved)
+                    .await;
+            }
+            ServiceTask::SessionBlocked { session_context } => {
+                if let Some(control) = self.sessions.get_mut(&session_context.id) {
+                    let context = control.inner.clone();
+                    let id = context.id;
+                    let _ignore = control
+                        .send(Priority::High, SessionEvent::SessionClose { id })
+                        .await;
+                    let _ignore = self
+                        .handle_sender
+                        .send(
+                            ServiceError::SessionBlocked {
+                                session_context: context,
+                            }
+                            .into(),
+                        )
+                        .await;
+                }
             }
             ServiceTask::Dial { address, target } => {
                 if !(self.dial_protocols.contains_key(&address)

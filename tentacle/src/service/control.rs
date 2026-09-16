@@ -135,6 +135,7 @@ impl ServiceControl {
             target,
             proto_id,
             data,
+            reserved: None,
         })
     }
 
@@ -150,6 +151,7 @@ impl ServiceControl {
             target,
             proto_id,
             data,
+            reserved: None,
         })
     }
 
@@ -399,6 +401,7 @@ impl ServiceAsyncControl {
             target,
             proto_id,
             data,
+            reserved: None,
         })
         .await
     }
@@ -415,8 +418,42 @@ impl ServiceAsyncControl {
             target,
             proto_id,
             data,
+            reserved: None,
         })
         .await
+    }
+
+    pub(crate) async fn send_reserved_message_to(
+        &self,
+        session_context: crate::context::SessionContext,
+        proto_id: ProtocolId,
+        data: Bytes,
+        quick: bool,
+    ) -> Result {
+        let task = ServiceTask::ProtocolMessage {
+            target: TargetSession::Single(session_context.id),
+            proto_id,
+            data,
+            reserved: Some(session_context),
+        };
+        if quick {
+            self.quick_send(task).await
+        } else {
+            self.send(task).await
+        }
+    }
+
+    pub(crate) async fn report_session_blocked(
+        &self,
+        session_context: crate::context::SessionContext,
+        quick: bool,
+    ) -> Result {
+        let task = ServiceTask::SessionBlocked { session_context };
+        if quick {
+            self.quick_send(task).await
+        } else {
+            self.send(task).await
+        }
     }
 
     /// Send a future task

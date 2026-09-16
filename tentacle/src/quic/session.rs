@@ -29,7 +29,7 @@ use std::{
 };
 
 use futures::{SinkExt, channel::mpsc, future::BoxFuture, prelude::*, stream::iter};
-use log::{debug, error, log_enabled, trace, warn};
+use log::{debug, error, log_enabled, trace};
 use nohash_hasher::IntMap;
 use quinn::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio_util::codec::{Framed, FramedParts, LengthDelimitedCodec};
@@ -38,7 +38,7 @@ use crate::{
     ProtocolId, StreamId, SubstreamReadPart,
     buffer::{Buffer, PriorityBuffer, SendResult},
     channel::mpsc::{self as priority_mpsc, Priority},
-    context::SessionContext,
+    context::{PendingDataGuard, SessionContext},
     protocol_handle_stream::{ServiceProtocolEvent, SessionProtocolEvent},
     protocol_select::{ProtocolInfo, client_select, server_select},
     quic::stream::QuicBiStream,
@@ -298,6 +298,8 @@ impl QuicSession {
         }
     }
 
+    /// See the yamux session equivalent: the send-buffer limit is enforced at
+    /// message admission, so there is nothing left to check here.
     #[inline]
     fn distribute_to_substream(&mut self, cx: &mut Context) {
         for buffer in self
@@ -306,26 +308,6 @@ impl QuicSession {
             .filter(|buffer| !buffer.is_empty())
         {
             if let SendResult::Pending = buffer.try_send(cx) {
-                if self.context.pending_data_size() > self.config.send_buffer_size {
-                    self.state = SessionState::Abnormal;
-                    warn!(
-                        "session {:?} unable to send message, \
-                         user allow buffer size: {}, \
-                         current buffer size: {}, so kill it",
-                        self.context,
-                        self.config.send_buffer_size,
-                        self.context.pending_data_size()
-                    );
-                    buffer.clear();
-                    self.event_output(
-                        cx,
-                        SessionEvent::ChangeState {
-                            id: self.context.id,
-                            state: SessionState::Abnormal,
-                            error: None,
-                        },
-                    );
-                }
                 break;
             }
         }
@@ -504,9 +486,12 @@ impl QuicSession {
     fn handle_session_event(&mut self, cx: &mut Context, event: SessionEvent, priority: Priority) {
         match event {
             SessionEvent::ProtocolMessage { proto_id, data, .. } => {
+                // The guard owns the reserved bytes from here on: every path
+                // that drops the message below returns the capacity.
+                let guard = PendingDataGuard::new(self.context.clone(), data.len());
                 if let Some(stream_id) = self.proto_streams.get(&proto_id) {
                     if let Some(buffer) = self.substreams.get_mut(stream_id) {
-                        let event = ProtocolEvent::Message { data };
+                        let event = ProtocolEvent::Message { data, guard };
                         if priority.is_high() {
                             buffer.push_high(event)
                         } else {
@@ -866,6 +851,7 @@ mod tests {
             Some(pk),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicUsize::new(0)),
+            SessionConfig::default().send_buffer_size,
         ))
     }
 

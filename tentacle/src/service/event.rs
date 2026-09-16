@@ -155,7 +155,12 @@ pub(crate) enum ServiceTask {
         proto_id: ProtocolId,
         /// data
         data: Bytes,
+        /// Session bytes reserved before this task entered the service queue.
+        reserved: Option<SessionContext>,
     },
+    /// A protocol sender exceeded a session's pending-byte limit before its
+    /// message entered the service queue.
+    SessionBlocked { session_context: SessionContext },
     /// Open specify protocol
     ProtocolOpen {
         /// Session id
@@ -275,6 +280,9 @@ impl fmt::Debug for ServiceTask {
         match self {
             ProtocolMessage { proto_id, data, .. } => {
                 write!(f, "proto_id: {}, message: {:?}", proto_id, data)
+            }
+            SessionBlocked { session_context } => {
+                write!(f, "session({}) send buffer blocked", session_context.id)
             }
             SetProtocolNotify {
                 proto_id, token, ..

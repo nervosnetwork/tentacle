@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use futures::prelude::*;
 use std::{
+    fmt,
     ops::{Deref, DerefMut},
     sync::{
         Arc,
@@ -52,6 +53,79 @@ impl SessionController {
             })
         }
     }
+
+    /// Reserve byte capacity before handing protocol data to the session.
+    /// Returns `true` exactly once when this message would exceed the limit.
+    pub(crate) async fn send_message(
+        &mut self,
+        priority: Priority,
+        proto_id: ProtocolId,
+        data: Bytes,
+        reserved_size: Option<usize>,
+    ) -> bool {
+        let data_size = data.len();
+        let accounted_size = if let Some(reserved_size) = reserved_size {
+            if self.inner.closed() {
+                self.inner.decr_pending_data_size(reserved_size);
+                return false;
+            }
+
+            if data_size > reserved_size {
+                match self.inner.reserve_pending_data(data_size - reserved_size) {
+                    PendingDataReservation::Reserved => {}
+                    PendingDataReservation::LimitReached => {
+                        self.inner.decr_pending_data_size(reserved_size);
+                        let id = self.inner.id;
+                        let _ignore = self
+                            .send(Priority::High, SessionEvent::SessionClose { id })
+                            .await;
+                        return true;
+                    }
+                    PendingDataReservation::Closed => {
+                        self.inner.decr_pending_data_size(reserved_size);
+                        return false;
+                    }
+                }
+            } else {
+                self.inner.decr_pending_data_size(reserved_size - data_size);
+            }
+            data_size
+        } else {
+            match self.inner.reserve_pending_data(data_size) {
+                PendingDataReservation::Reserved => data_size,
+                PendingDataReservation::LimitReached => {
+                    let id = self.inner.id;
+                    let _ignore = self
+                        .send(Priority::High, SessionEvent::SessionClose { id })
+                        .await;
+                    return true;
+                }
+                PendingDataReservation::Closed => return false,
+            }
+        };
+
+        // A concurrent sender may have reached the limit after this message
+        // reserved its bytes. Do not admit the message after that happens.
+        if self.inner.closed() {
+            self.inner.decr_pending_data_size(accounted_size);
+            return false;
+        }
+
+        let result = self
+            .send(priority, SessionEvent::ProtocolMessage { proto_id, data })
+            .await;
+        if result.is_err() {
+            self.inner.decr_pending_data_size(accounted_size);
+        }
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingDataReservation {
+    Reserved,
+    LimitReached,
+    Closed,
 }
 
 /// Session context, contains basic information about the current connection
@@ -68,6 +142,7 @@ pub struct SessionContext {
     pub remote_pubkey: Option<PublicKey>,
     pub(crate) closed: Arc<AtomicBool>,
     pending_data_size: Arc<AtomicUsize>,
+    send_buffer_size: usize,
 }
 
 impl SessionContext {
@@ -78,6 +153,7 @@ impl SessionContext {
         remote_pubkey: Option<PublicKey>,
         closed: Arc<AtomicBool>,
         pending_data_size: Arc<AtomicUsize>,
+        send_buffer_size: usize,
     ) -> SessionContext {
         SessionContext {
             id,
@@ -86,13 +162,40 @@ impl SessionContext {
             remote_pubkey,
             closed,
             pending_data_size,
+            send_buffer_size,
         }
     }
 
-    // Increase when data pushed to Service's write buffer
-    pub(crate) fn incr_pending_data_size(&self, data_size: usize) {
-        self.pending_data_size
-            .fetch_add(data_size, Ordering::AcqRel);
+    /// Atomically reserve pending-byte capacity without exceeding the limit.
+    pub(crate) fn reserve_pending_data(&self, data_size: usize) -> PendingDataReservation {
+        if self.closed() {
+            return PendingDataReservation::Closed;
+        }
+
+        if self
+            .pending_data_size
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(data_size)
+                    .filter(|next| *next <= self.send_buffer_size)
+            })
+            .is_err()
+        {
+            return if !self.closed.swap(true, Ordering::SeqCst) {
+                PendingDataReservation::LimitReached
+            } else {
+                PendingDataReservation::Closed
+            };
+        }
+
+        // Coordinate with a concurrent limit breach or shutdown occurring
+        // immediately after the atomic reservation.
+        if self.closed() {
+            self.decr_pending_data_size(data_size);
+            PendingDataReservation::Closed
+        } else {
+            PendingDataReservation::Reserved
+        }
     }
 
     // Decrease when data sent to underlying Yamux Stream
@@ -101,13 +204,55 @@ impl SessionContext {
             .fetch_sub(data_size, Ordering::AcqRel);
     }
 
-    /// Session is closed
+    /// Whether this session is gone.
+    ///
+    /// This also becomes `true` the moment an outbound message would exceed
+    /// [`crate::builder::ServiceBuilder::set_send_buffer_size`], which is when
+    /// the session is scheduled to be closed — slightly before the close has
+    /// actually been carried out.
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
-    /// Session pending data size
+    /// Outbound bytes queued for this session but not yet handed to the
+    /// transport. Never exceeds the configured send buffer size, because
+    /// capacity is reserved before a message is accepted.
     pub fn pending_data_size(&self) -> usize {
         self.pending_data_size.load(Ordering::Acquire)
+    }
+}
+
+/// Ownership of send-buffer capacity reserved for one queued message.
+///
+/// Bytes count against the session's send buffer from the moment they are
+/// reserved until they stop being queued — either because the transport sink
+/// took them, or because they were thrown away. Every queue in between (the
+/// session's per-substream buffer, the substream channel, the substream's own
+/// write buffers) carries this guard next to the data, so the capacity is
+/// returned exactly once no matter which of those paths the data leaves by:
+/// a written frame, a closed substream, a cleared buffer, a disconnected
+/// channel or a dropped task.
+///
+/// Dropping the guard is the release; there is deliberately no way to leak it.
+pub(crate) struct PendingDataGuard {
+    context: Arc<SessionContext>,
+    size: usize,
+}
+
+impl PendingDataGuard {
+    pub(crate) fn new(context: Arc<SessionContext>, size: usize) -> Self {
+        Self { context, size }
+    }
+}
+
+impl Drop for PendingDataGuard {
+    fn drop(&mut self) {
+        self.context.decr_pending_data_size(self.size);
+    }
+}
+
+impl fmt::Debug for PendingDataGuard {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "PendingDataGuard({})", self.size)
     }
 }
 
@@ -354,21 +499,50 @@ pub struct ProtocolContextMutRef<'a> {
 
 impl ProtocolContextMutRef<'_> {
     /// Send message to current protocol current session
+    ///
+    /// `Ok(())` means the message was handed to the service, not that it was
+    /// delivered. It is also returned when the message is deliberately dropped
+    /// because the session is gone or has just exceeded
+    /// [`crate::builder::ServiceBuilder::set_send_buffer_size`] — in the latter
+    /// case the session is closed and
+    /// [`crate::service::ServiceError::SessionBlocked`] is reported to the
+    /// service handle. `Err(_)` only reports that the service itself is no
+    /// longer reachable.
     #[inline]
     pub async fn send_message(&self, data: Bytes) -> Result {
-        let proto_id = self.proto_id();
-        self.inner
-            .send_message_to(self.session.id, proto_id, data)
-            .await
+        self.send_message_inner(data, false).await
     }
 
     /// Send message to current protocol current session on quick channel
+    ///
+    /// Same delivery semantics as [`ProtocolContextMutRef::send_message`].
     #[inline]
     pub async fn quick_send_message(&self, data: Bytes) -> Result {
-        let proto_id = self.proto_id();
-        self.inner
-            .quick_send_message_to(self.session.id, proto_id, data)
-            .await
+        self.send_message_inner(data, true).await
+    }
+
+    async fn send_message_inner(&self, data: Bytes, quick: bool) -> Result {
+        let data_size = data.len();
+        match self.session.reserve_pending_data(data_size) {
+            PendingDataReservation::Reserved => {
+                let result = self
+                    .inner
+                    .control()
+                    .send_reserved_message_to(self.session.clone(), self.proto_id(), data, quick)
+                    .await;
+                if result.is_err() {
+                    self.session.decr_pending_data_size(data_size);
+                }
+                result
+            }
+            PendingDataReservation::LimitReached => {
+                self.inner
+                    .control()
+                    .report_session_blocked(self.session.clone(), quick)
+                    .await
+            }
+            PendingDataReservation::Closed => Ok(()),
+        }
     }
 
     /// Protocol id
@@ -407,5 +581,191 @@ impl DerefMut for ProtocolContextMutRef<'_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
+    }
+}
+
+#[cfg(test)]
+mod pending_data_tests {
+    use super::*;
+    use crate::{channel::mpsc, service::SessionType};
+
+    fn controller() -> (SessionController, mpsc::Receiver<SessionEvent>) {
+        let (sender, receiver) = mpsc::channel(4);
+        let context = Arc::new(SessionContext::new(
+            SessionId::default(),
+            "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+            SessionType::Inbound,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+            4,
+        ));
+        (SessionController::new(sender, context), receiver)
+    }
+
+    #[tokio::test]
+    async fn send_buffer_limit_is_checked_before_session_channel_admission() {
+        let (mut controller, _receiver) = controller();
+        assert!(
+            !controller
+                .send_message(
+                    Priority::Normal,
+                    1.into(),
+                    Bytes::from_static(b"1234"),
+                    None
+                )
+                .await
+        );
+        assert_eq!(controller.inner.pending_data_size(), 4);
+
+        assert!(
+            controller
+                .send_message(Priority::Normal, 1.into(), Bytes::from_static(b"5"), None)
+                .await
+        );
+        assert_eq!(controller.inner.pending_data_size(), 4);
+        assert!(controller.inner.closed());
+
+        // Reporting and close initiation are idempotent after the first breach.
+        assert!(
+            !controller
+                .send_message(Priority::Normal, 1.into(), Bytes::from_static(b"6"), None)
+                .await
+        );
+        assert_eq!(controller.inner.pending_data_size(), 4);
+    }
+
+    #[tokio::test]
+    async fn closed_session_channel_rolls_back_reserved_bytes() {
+        let (mut controller, receiver) = controller();
+        drop(receiver);
+        assert!(
+            !controller
+                .send_message(
+                    Priority::Normal,
+                    1.into(),
+                    Bytes::from_static(b"data"),
+                    None
+                )
+                .await
+        );
+        assert_eq!(controller.inner.pending_data_size(), 0);
+    }
+
+    #[test]
+    fn pending_byte_reservation_rejects_overflow() {
+        let (controller, _receiver) = controller();
+        controller
+            .inner
+            .pending_data_size
+            .store(usize::MAX, Ordering::Release);
+        assert_eq!(
+            controller.inner.reserve_pending_data(1),
+            PendingDataReservation::LimitReached
+        );
+        assert_eq!(controller.inner.pending_data_size(), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn protocol_sender_reserves_bytes_before_service_queue_admission() {
+        let (controller, _session_receiver) = controller();
+        let session = controller.inner.clone();
+        let (task_sender, mut task_receiver) = mpsc::channel(4);
+        let service_context = ServiceContext::new(task_sender, Arc::new(AtomicBool::new(false)));
+        let mut protocol_context = ProtocolContext::new(service_context, 1.into());
+
+        protocol_context
+            .as_mut(&session)
+            .send_message(Bytes::from_static(b"1234"))
+            .await
+            .unwrap();
+        assert_eq!(session.pending_data_size(), 4);
+        assert!(matches!(
+            task_receiver.next().await,
+            Some((
+                _,
+                ServiceTask::ProtocolMessage {
+                    reserved: Some(_),
+                    ..
+                }
+            ))
+        ));
+
+        protocol_context
+            .as_mut(&session)
+            .send_message(Bytes::from_static(b"5"))
+            .await
+            .unwrap();
+        assert!(session.closed());
+        assert_eq!(session.pending_data_size(), 4);
+        assert!(matches!(
+            task_receiver.next().await,
+            Some((_, ServiceTask::SessionBlocked { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn protocol_sender_rolls_back_when_service_queue_is_closed() {
+        let (controller, _session_receiver) = controller();
+        let session = controller.inner.clone();
+        let (task_sender, task_receiver) = mpsc::channel(1);
+        drop(task_receiver);
+        let service_context = ServiceContext::new(task_sender, Arc::new(AtomicBool::new(false)));
+        let mut protocol_context = ProtocolContext::new(service_context, 1.into());
+
+        assert!(
+            protocol_context
+                .as_mut(&session)
+                .send_message(Bytes::from_static(b"1234"))
+                .await
+                .is_err()
+        );
+        assert_eq!(session.pending_data_size(), 0);
+    }
+
+    /// Reserved bytes must come back whenever queued data is discarded rather
+    /// than written. Without this, a session that closes protocols while data
+    /// is queued permanently loses part of its send budget and is eventually
+    /// killed even though it is healthy.
+    #[test]
+    fn dropping_queued_data_returns_reserved_capacity() {
+        let (controller, _receiver) = controller();
+        let session = controller.inner.clone();
+
+        assert_eq!(
+            session.reserve_pending_data(3),
+            PendingDataReservation::Reserved
+        );
+        let guard = PendingDataGuard::new(session.clone(), 3);
+        assert_eq!(session.pending_data_size(), 3);
+
+        // Simulates every queue between the session and the transport being
+        // discarded: substream closed, buffer cleared, channel disconnected.
+        drop(guard);
+        assert_eq!(session.pending_data_size(), 0);
+
+        // And the freed capacity is immediately reusable.
+        assert_eq!(
+            session.reserve_pending_data(4),
+            PendingDataReservation::Reserved
+        );
+        assert_eq!(session.pending_data_size(), 4);
+    }
+
+    /// Each reservation is released exactly once, so a long-lived session can
+    /// keep sending instead of slowly exhausting its own budget.
+    #[test]
+    fn capacity_is_reusable_across_many_messages() {
+        let (controller, _receiver) = controller();
+        let session = controller.inner.clone();
+
+        for _ in 0..1000 {
+            assert_eq!(
+                session.reserve_pending_data(4),
+                PendingDataReservation::Reserved
+            );
+            drop(PendingDataGuard::new(session.clone(), 4));
+            assert_eq!(session.pending_data_size(), 0);
+        }
     }
 }
