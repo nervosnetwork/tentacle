@@ -541,7 +541,14 @@ impl ProtocolContextMutRef<'_> {
                     .report_session_blocked(self.session.clone(), quick)
                     .await
             }
-            PendingDataReservation::Closed => Ok(()),
+            PendingDataReservation::Closed => {
+                // Keep closed-session sends cancellation-safe. Returning a
+                // ready future here lets a protocol callback that repeatedly
+                // ignores the result spin forever without giving the runtime
+                // a chance to tear the protocol task down.
+                crate::runtime::yield_now().await;
+                Ok(())
+            }
         }
     }
 
