@@ -7,7 +7,7 @@ Tentacle 的 `quic` feature 增加了一条**与现有 TCP + secio + yamux 流�
 `/ip4/<addr>/udp/<port>/quic-v1` 的 multiaddr 走 QUIC，其余地址继续走经典栈。
 
 QUIC 支持由 `quic` Cargo feature 控制。它已被列入默认 feature 集合，所以
-直接 `tentacle = "*"` 就已经编进了 QUIC。要关掉就用 `default-features = false`。
+直接 `tentacle = "0.7"` 就已经编进了 QUIC。要关掉就用 `default-features = false`。
 
 ```toml
 [dependencies]
@@ -84,8 +84,9 @@ binding_sig = secp256k1_sign(K_secio, sha256(BINDING_DOMAIN || K_tls_SPKI_der))
 
 1. 证书链里只有一张叶子证书，没有中间证书。
 2. 叶子证书当前处于有效期之内。
-3. 叶子证书有且仅有一个 tentacle OID 的 extension，能 molecule-decode 出
-   `TentacleQuicIdentityV1`，且 `version == 1`。
+3. 叶子证书有且仅有一个 tentacle OID 的 extension，能将 payload
+   molecule-decode 为 `(version, secio_pubkey, binding_sig)`，且
+   `version == 1`。
 4. `secio_pubkey` 对 `sha256(BINDING_DOMAIN || leaf_spki_der)` 的
    secp256k1 验签通过。
 5. （仅客户端）如果 dial 地址含有 `/p2p/<expected>`，要求

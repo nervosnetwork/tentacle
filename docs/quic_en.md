@@ -9,7 +9,7 @@ route through the QUIC stack, everything else continues through the
 classic pipeline.
 
 QUIC support is gated by the `quic` Cargo feature. The feature is in the
-default feature set, so a stock `tentacle = "*"` dependency already has
+default feature set, so a stock `tentacle = "0.7"` dependency already has
 QUIC compiled in. To opt out, set `default-features = false`.
 
 ```toml
@@ -93,7 +93,8 @@ When a peer connects, the verifier (custom `rustls` `ServerCertVerifier`
 1. The chain contains exactly one leaf certificate (no intermediates).
 2. The leaf is currently within its validity window.
 3. The leaf has exactly one extension with the tentacle OID; molecule-decode
-   it as `TentacleQuicIdentityV1` with `version == 1`.
+   its payload as `(version, secio_pubkey, binding_sig)` and require
+   `version == 1`.
 4. The secp256k1 binding signature verifies against
    `sha256(BINDING_DOMAIN || leaf_spki_der)` under `secio_pubkey`.
 5. (Client only) If the dial target multiaddr contained `/p2p/<expected>`,

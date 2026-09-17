@@ -38,7 +38,7 @@ use futures::{
 };
 use log::info;
 use std::collections::HashMap;
-use std::{str, time::Duration};
+use std::time::Duration;
 use tentacle::{
     ProtocolId, SessionId, async_trait,
     builder::{MetaBuilder, ServiceBuilder},
@@ -159,7 +159,7 @@ impl ServiceProtocol for PHandle {
             "received from [{}]: proto [{}] data {:?}, message count: {}",
             context.session.id,
             context.proto_id,
-            str::from_utf8(data.as_ref()).unwrap(),
+            String::from_utf8_lossy(data.as_ref()),
             self.count
         );
     }
