@@ -189,7 +189,7 @@ impl StreamHandle {
                     self.state = StreamState::RemoteClosing;
                 }
                 StreamState::LocalClosing => {
-                    self.state = StreamState::Closed;
+                    return self.close();
                 }
                 _ => return Err(Error::UnexpectedFlag),
             }
@@ -894,6 +894,51 @@ mod test {
             assert_eq!(&b[..4], b"1234");
 
             assert_eq!(stream.state, StreamState::LocalClosing);
+        });
+    }
+
+    #[test]
+    fn test_remote_fin_after_local_close_notifies_session() {
+        let rt = rt();
+        rt.block_on(async {
+            let (mut frame_sender, frame_receiver) = channel(2);
+            let (unbound_sender, mut unbound_receiver) = unbounded();
+            let mut stream = StreamHandle::new(
+                0,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                INITIAL_STREAM_WINDOW,
+            );
+
+            stream.shutdown().await.unwrap();
+            assert_eq!(stream.state, StreamState::LocalClosing);
+
+            let event = unbound_receiver.next().await.unwrap();
+            match event {
+                StreamEvent::Frame(frame) => {
+                    assert!(frame.flags().contains(Flag::Fin));
+                    assert_eq!(frame.ty(), Type::WindowUpdate);
+                }
+                _ => panic!("must be fin window update"),
+            }
+
+            let flags = Flags::from(Flag::Fin);
+            let frame = Frame::new_window_update(flags, 0, 0);
+            frame_sender.send(frame).await.unwrap();
+
+            let mut b = [0; 1024];
+            assert_eq!(stream.read(&mut b).await.unwrap(), 0);
+            assert_eq!(stream.state, StreamState::Closed);
+
+            let event = unbound_receiver.next().await.unwrap();
+            match event {
+                StreamEvent::Closed(0) => (),
+                _ => panic!("must notify session that stream is closed"),
+            }
+
+            drop(stream);
+            assert!(unbound_receiver.try_recv().is_err());
         });
     }
 

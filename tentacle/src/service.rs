@@ -933,8 +933,8 @@ where
         self.sessions
             .len()
             .checked_add(self.state.into_inner().unwrap_or_default())
-            .map(|count| self.config.max_connection_number < count)
-            .unwrap_or_default()
+            .map(|count| self.config.max_connection_number <= count)
+            .unwrap_or(true)
     }
 
     /// Common session-registration steps shared by yamux and QUIC paths

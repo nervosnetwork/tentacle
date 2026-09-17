@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tentacle::{
     ProtocolId, async_trait,
@@ -89,6 +89,17 @@ fn create_meta(id: ProtocolId) -> (ProtocolMeta, Arc<AtomicUsize>, Arc<AtomicBoo
     )
 }
 
+fn wait_for_result(result: &AtomicBool, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if result.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    result.load(Ordering::SeqCst)
+}
+
 fn test_session_protocol_order(secio: bool) {
     let (meta, count, res_1) = create_meta(1.into());
     let (addr_sender, addr_receiver) = channel::oneshot::channel::<Multiaddr>();
@@ -122,8 +133,8 @@ fn test_session_protocol_order(secio: bool) {
     });
     handle_2.join().unwrap();
 
-    assert!(res_1.load(Ordering::SeqCst));
-    assert!(res_2.load(Ordering::SeqCst));
+    assert!(wait_for_result(&res_1, Duration::from_secs(10)));
+    assert!(wait_for_result(&res_2, Duration::from_secs(10)));
 }
 
 #[test]

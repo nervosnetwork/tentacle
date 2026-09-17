@@ -205,6 +205,9 @@ where
     /// Users can make their own custom configuration for all tcp socket at the bottom of Tentacle according to their own needs,
     /// for example, use reuse port to try to build nat penetration
     ///
+    /// Tentacle does not enable `SO_REUSEADDR` on listening sockets by default. Users that need fast rebinding
+    /// can opt in explicitly by setting `reuse_address` in this socket transformer.
+    ///
     /// In this way, any actively connected outbound connection is potentially connectable. Through this setting,
     /// the device after NAT can have the opportunity to be connected to the public network.
     ///

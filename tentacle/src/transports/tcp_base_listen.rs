@@ -41,6 +41,17 @@ use crate::{
     utils::{multiaddr_to_socketaddr, socketaddr_to_multiaddr},
 };
 
+#[cfg(feature = "tls")]
+fn default_tls_server_config() -> ServerConfig {
+    ServerConfig::builder_with_provider(
+        tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("the aws-lc-rs provider supports rustls default protocol versions")
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new()))
+}
+
 pub enum TcpBaseListenerEnum {
     Upgrade,
     New(TcpBaseListener),
@@ -124,11 +135,7 @@ pub async fn bind(
             #[cfg(feature = "tls")]
             let tls_server_config = config.tls_server_config.unwrap_or(
                 // if enable tls but not set tls config, it will use a empty server config
-                Arc::new(
-                    ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new())),
-                ),
+                Arc::new(default_tls_server_config()),
             );
 
             Ok((
@@ -275,11 +282,7 @@ impl TcpBaseListener {
             sender: tx,
             pending_stream: rx,
             #[cfg(feature = "tls")]
-            tls_config: Arc::new(
-                ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new())),
-            ),
+            tls_config: Arc::new(default_tls_server_config()),
             trusted_proxies,
         }
     }
