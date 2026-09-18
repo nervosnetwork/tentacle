@@ -395,11 +395,7 @@ fn spawn_endpoint_keepalive(endpoint: quinn::Endpoint, conn: quinn::Connection) 
     crate::runtime::spawn(async move {
         let _ = conn.closed().await;
         endpoint.close(0u32.into(), b"closed");
-        let _ = tokio::time::timeout(Duration::from_millis(100), endpoint.wait_idle())
-            .await
-            // Panicking in tokio tasks will terminate the task, and in here termination the task is acceptable.
-            // QUIC related code will only work on native tokio runtime.
-            .unwrap();
+        let _ignore = tokio::time::timeout(Duration::from_millis(100), endpoint.wait_idle()).await;
     });
 }
 

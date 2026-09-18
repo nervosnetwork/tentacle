@@ -1,14 +1,3 @@
-use bytes::Bytes;
-use futures::prelude::*;
-use std::{
-    ops::{Deref, DerefMut},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
 use crate::channel::QuickSinkExt;
 use crate::{
     ProtocolId, SessionId,
@@ -22,20 +11,34 @@ use crate::{
     },
     session::SessionEvent,
 };
+use bytes::Bytes;
+use futures::prelude::*;
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::OwnedSemaphorePermit;
 
 pub(crate) struct SessionController {
     pub(crate) sender: mpsc::Sender<SessionEvent>,
     pub(crate) inner: Arc<SessionContext>,
+    _connection_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl SessionController {
     pub(crate) fn new(
         event_sender: mpsc::Sender<SessionEvent>,
         inner: Arc<SessionContext>,
+        connection_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             sender: event_sender,
             inner,
+            _connection_permit: connection_permit,
         }
     }
 
