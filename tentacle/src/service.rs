@@ -5,12 +5,14 @@ use secio::KeyProvider;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(not(target_family = "wasm"))]
 use crate::service::helper::Listener;
@@ -40,7 +42,7 @@ use crate::{
 #[cfg(feature = "quic")]
 use crate::{
     quic::{
-        endpoint::{QuicEndpoint, QuicEndpointHandle},
+        endpoint::{QuicEndpoint, QuicEndpointHandle, QuicListener},
         session::QuicSession,
     },
     session::QuicListenAccepted,
@@ -128,6 +130,8 @@ struct InnerService<K> {
     config: ServiceConfig,
     /// service state
     state: State,
+    /// One RAII permit is held by every pending or established connection.
+    connection_limiter: Arc<Semaphore>,
 
     next_session: SessionId,
 
@@ -232,6 +236,10 @@ where
             (HandshakeType::Noop, None) => QuicEndpointSlot::NotRequested,
         };
 
+        let connection_limiter = Arc::new(Semaphore::new(
+            config.max_connection_number.min(Semaphore::MAX_PERMITS),
+        ));
+
         Service {
             handle,
             service_context: service_context.clone_self(),
@@ -259,6 +267,7 @@ where
                         config.timeout,
                         config.tcp_config.clone(),
                         config.trusted_proxies.clone(),
+                        Some(connection_limiter.clone()),
                     );
                     #[cfg(feature = "tls")]
                     let transport = transport.tls_config(config.tls_config.clone());
@@ -272,6 +281,7 @@ where
                 igd_client,
                 dial_protocols: HashMap::default(),
                 state: State::new(forever),
+                connection_limiter,
                 next_session: SessionId::default(),
                 session_event_sender,
                 session_event_receiver,
@@ -371,11 +381,18 @@ where
             return Ok(self);
         }
 
+        let connection_permit = inner.acquire_connection_permit()?;
         let dial_future = inner.multi_transport.clone().dial(address.clone())?;
 
         match dial_future.await {
             Ok((addr, incoming)) => {
-                inner.handshake(incoming, SessionType::Outbound, addr, None);
+                inner.handshake(
+                    incoming,
+                    SessionType::Outbound,
+                    addr,
+                    None,
+                    connection_permit,
+                );
                 inner.dial_protocols.insert(address, target);
                 inner.state.increase();
                 Ok(self)
@@ -431,6 +448,18 @@ impl<K> InnerService<K>
 where
     K: KeyProvider,
 {
+    fn acquire_connection_permit(&self) -> Result<OwnedSemaphorePermit> {
+        self.connection_limiter
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TransportErrorKind::Io(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "connection limit reached",
+                ))
+            })
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn spawn_listener(&mut self, incoming: MultiIncoming, listen_address: Multiaddr) {
         let listener = Listener {
@@ -441,6 +470,7 @@ where
             timeout: self.config.timeout.timeout,
             listen_addr: listen_address,
             future_task_sender: self.future_task_sender.clone(),
+            connection_limiter: self.connection_limiter.clone(),
             listens_upgrade_modes: self.multi_transport.listens_upgrade_modes.clone(),
         };
         let mut sender = self.future_task_sender.clone();
@@ -498,6 +528,7 @@ where
             return self.dial_inner_quic(address, target);
         }
 
+        let connection_permit = self.acquire_connection_permit()?;
         let dial_future = self.multi_transport.clone().dial(address.clone())?;
         self.dial_protocols.insert(address.clone(), target);
 
@@ -519,6 +550,7 @@ where
                         event_sender: sender,
                         max_frame_length,
                         timeout,
+                        connection_permit,
                     }
                     .handshake(incoming)
                     .await;
@@ -575,6 +607,7 @@ where
     #[cfg(feature = "quic")]
     fn dial_inner_quic(&mut self, address: Multiaddr, target: TargetProtocol) -> Result<()> {
         let endpoint = self.resolve_quic_endpoint(&address)?;
+        let connection_permit = self.acquire_connection_permit()?;
 
         self.dial_protocols.insert(address.clone(), target);
 
@@ -589,6 +622,7 @@ where
                         address,
                         listen_address: None,
                         ty: SessionType::Outbound,
+                        connection_permit,
                     });
                     if let Err(err) = sender.send(event).await {
                         error!("quic dial result send back error: {:?}", err);
@@ -640,38 +674,12 @@ where
 
         self.listens.insert(listen_address.clone());
 
-        let mut sender = self.session_event_sender.clone();
-        let listen_addr_for_loop = listen_address.clone();
-        let task = async move {
-            loop {
-                match listener.accept().await {
-                    Ok(Some((remote_addr, handshake))) => {
-                        let public_key = handshake.remote_pubkey().clone();
-                        let event = SessionEvent::QuicListenAccepted(QuicListenAccepted {
-                            session: handshake,
-                            public_key,
-                            address: remote_addr,
-                            listen_address: Some(listen_addr_for_loop.clone()),
-                            ty: SessionType::Inbound,
-                        });
-                        if sender.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    // Per-connection handshake failure (bad cert, peer-id
-                    // mismatch, dropped client, …). The endpoint is still
-                    // alive — log and keep accepting.
-                    Err(error) => {
-                        log::debug!(
-                            "quic accept handshake failed: {:?} for address {:?}",
-                            error,
-                            listen_addr_for_loop
-                        );
-                    }
-                }
-            }
-        };
+        let task = quic_accept_loop(
+            listener,
+            listen_address.clone(),
+            self.connection_limiter.clone(),
+            self.session_event_sender.clone(),
+        );
         let mut future_sender = self.future_task_sender.clone();
         crate::runtime::spawn(async move {
             let _ignore = future_sender.send(Box::pin(task)).await;
@@ -711,12 +719,17 @@ where
         let listen_address = listener.listen_addr().clone();
         let mut sender = self.session_event_sender.clone();
 
-        let listen_address_for_start = listen_address.clone();
+        let accept_loop = quic_accept_loop(
+            listener,
+            listen_address.clone(),
+            self.connection_limiter.clone(),
+            self.session_event_sender.clone(),
+        );
         let task = async move {
             // Tell the service main loop the listen completed.
             if let Err(err) = sender
                 .send(SessionEvent::ListenStart {
-                    listen_address: listen_address_for_start.clone(),
+                    listen_address,
                     incoming: MultiIncoming::TcpUpgrade,
                 })
                 .await
@@ -726,33 +739,7 @@ where
             }
 
             // Drive the accept loop until the endpoint is closed.
-            loop {
-                match listener.accept().await {
-                    Ok(Some((remote_addr, handshake))) => {
-                        let public_key = handshake.remote_pubkey().clone();
-                        let event = SessionEvent::QuicListenAccepted(QuicListenAccepted {
-                            session: handshake,
-                            public_key,
-                            address: remote_addr,
-                            listen_address: Some(listen_address.clone()),
-                            ty: SessionType::Inbound,
-                        });
-                        if sender.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    // Per-connection handshake failure; endpoint is still
-                    // alive — log and keep accepting.
-                    Err(error) => {
-                        log::debug!(
-                            "quic accept handshake failed: {:?} for address {:?}",
-                            error,
-                            listen_address_for_start
-                        );
-                    }
-                }
-            }
+            accept_loop.await;
         };
 
         let mut future_sender = self.future_task_sender.clone();
@@ -893,6 +880,7 @@ where
         ty: SessionType,
         remote_address: Multiaddr,
         listen_address: Option<Multiaddr>,
+        connection_permit: OwnedSemaphorePermit,
     ) where
         H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
     {
@@ -904,6 +892,7 @@ where
             event_sender: self.session_event_sender.clone(),
             max_frame_length: self.config.max_frame_length,
             timeout: self.config.timeout.timeout,
+            connection_permit,
         }
         .handshake(socket);
 
@@ -929,14 +918,6 @@ where
         }
     }
 
-    fn reached_max_connection_limit(&self) -> bool {
-        self.sessions
-            .len()
-            .checked_add(self.state.into_inner().unwrap_or_default())
-            .map(|count| self.config.max_connection_number <= count)
-            .unwrap_or(true)
-    }
-
     /// Common session-registration steps shared by yamux and QUIC paths
     /// (steps 1–5 of `session_open`):
     /// 1. duplicate-connection check (by remote public key)
@@ -954,6 +935,7 @@ where
         mut address: Multiaddr,
         ty: SessionType,
         listen_addr: Option<Multiaddr>,
+        connection_permit: OwnedSemaphorePermit,
     ) -> Option<SessionOpenContext> {
         let target = self
             .dial_protocols
@@ -1025,6 +1007,7 @@ where
                 session_closed,
                 pending_data_size,
             )),
+            connection_permit,
         );
 
         let session_context = session_control.inner.clone();
@@ -1105,11 +1088,12 @@ where
         address: Multiaddr,
         ty: SessionType,
         listen_addr: Option<Multiaddr>,
+        connection_permit: OwnedSemaphorePermit,
     ) where
         H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
     {
         let ctx = match self
-            .session_open_common(remote_pubkey, address, ty, listen_addr)
+            .session_open_common(remote_pubkey, address, ty, listen_addr, connection_permit)
             .await
         {
             Some(c) => c,
@@ -1154,9 +1138,16 @@ where
         address: Multiaddr,
         ty: SessionType,
         listen_addr: Option<Multiaddr>,
+        connection_permit: OwnedSemaphorePermit,
     ) {
         let ctx = match self
-            .session_open_common(Some(remote_pubkey.clone()), address, ty, listen_addr)
+            .session_open_common(
+                Some(remote_pubkey.clone()),
+                address,
+                ty,
+                listen_addr,
+                connection_permit,
+            )
             .await
         {
             Some(c) => c,
@@ -1387,37 +1378,42 @@ where
                 address,
                 ty,
                 listen_address,
+                connection_permit,
             } => {
                 if ty.is_outbound() {
                     self.state.decrease();
                 }
-                if !self.reached_max_connection_limit() {
-                    self.session_open(handle, public_key, address, ty, listen_address)
-                        .await;
-                }
+                self.session_open(
+                    handle,
+                    public_key,
+                    address,
+                    ty,
+                    listen_address,
+                    connection_permit,
+                )
+                .await;
             }
             #[cfg(feature = "quic")]
             SessionEvent::QuicListenAccepted(accepted) => {
                 if accepted.ty.is_outbound() {
                     self.state.decrease();
                 }
-                if !self.reached_max_connection_limit() {
-                    self.quic_session_open(
-                        accepted.session,
-                        accepted.public_key,
-                        accepted.address,
-                        accepted.ty,
-                        accepted.listen_address,
-                    )
-                    .await;
-                } else {
-                    accepted
-                        .session
-                        .connection()
-                        .close(0u32.into(), b"capacity");
-                }
+                self.quic_session_open(
+                    accepted.session,
+                    accepted.public_key,
+                    accepted.address,
+                    accepted.ty,
+                    accepted.listen_address,
+                    accepted.connection_permit,
+                )
+                .await;
             }
-            SessionEvent::HandshakeError { ty, error, address } => {
+            SessionEvent::HandshakeError {
+                ty,
+                error,
+                address,
+                connection_permit: _connection_permit,
+            } => {
                 if ty.is_outbound() {
                     self.state.decrease();
                     self.dial_protocols.remove(&address);
@@ -1666,6 +1662,26 @@ where
                 raw_session,
                 session_info,
             } => {
+                let connection_permit = match self.acquire_connection_permit() {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        // The raw session is dropped here; report the refusal so
+                        // the upper layer can observe connections rejected by the
+                        // `max_connection_number` limit on both directions.
+                        let event = match &session_info {
+                            RawSessionInfo::Outbound { .. } => ServiceError::DialerError {
+                                address: remote_address,
+                                error: DialerErrorKind::TransportError(error),
+                            },
+                            RawSessionInfo::Inbound { listen_addr } => ServiceError::ListenError {
+                                address: listen_addr.clone(),
+                                error: ListenErrorKind::TransportError(error),
+                            },
+                        };
+                        let _ignore = self.handle_sender.send(event.into()).await;
+                        return;
+                    }
+                };
                 let (ty, listen_addr) = match session_info {
                     RawSessionInfo::Inbound { listen_addr } => {
                         (SessionType::Inbound, Some(listen_addr))
@@ -1676,7 +1692,13 @@ where
                         (SessionType::Outbound, None)
                     }
                 };
-                self.handshake(raw_session, ty, remote_address, listen_addr);
+                self.handshake(
+                    raw_session,
+                    ty,
+                    remote_address,
+                    listen_addr,
+                    connection_permit,
+                );
             }
             ServiceTask::Disconnect { session_id } => {
                 self.session_close(session_id, Source::External).await
@@ -1826,5 +1848,66 @@ where
                 }
             }
         }
+    }
+}
+
+/// Drive a QUIC accept loop until the endpoint is closed.
+///
+/// A connection slot is reserved as soon as a connection attempt is taken off
+/// the endpoint queue and **before** its TLS handshake is driven, so peers
+/// arriving over `max_connection_number` are refused without the node
+/// spending any handshake work or per-connection state on them. Each accepted
+/// attempt is handshaken in its own task — holding the reserved slot for the
+/// whole handshake — so a slow peer cannot stall the accept loop, and the
+/// number of in-flight handshakes stays bounded by the same limit.
+#[cfg(feature = "quic")]
+async fn quic_accept_loop(
+    listener: QuicListener,
+    listen_address: Multiaddr,
+    connection_limiter: Arc<Semaphore>,
+    sender: mpsc::Sender<SessionEvent>,
+) {
+    loop {
+        if sender.is_closed() {
+            break;
+        }
+        let Some(incoming) = listener.accept().await else {
+            break;
+        };
+        let remote_address = incoming.remote_address();
+        let Ok(connection_permit) = connection_limiter.clone().try_acquire_owned() else {
+            debug!(
+                "quic connection limit reached, refusing inbound connection from {:?}",
+                remote_address
+            );
+            incoming.refuse();
+            continue;
+        };
+
+        let mut sender = sender.clone();
+        let listen_address = listen_address.clone();
+        crate::runtime::spawn(async move {
+            match incoming.finish().await {
+                Ok(handshake) => {
+                    let public_key = handshake.remote_pubkey().clone();
+                    let event = SessionEvent::QuicListenAccepted(QuicListenAccepted {
+                        session: handshake,
+                        public_key,
+                        address: remote_address,
+                        listen_address: Some(listen_address),
+                        ty: SessionType::Inbound,
+                        connection_permit,
+                    });
+                    let _ignore = sender.send(event).await;
+                }
+                // Per-connection handshake failure (bad cert, peer-id
+                // mismatch, dropped client, …). The endpoint is still
+                // alive — log, release the slot and keep accepting.
+                Err(error) => debug!(
+                    "quic accept handshake failed: {:?} for address {:?}",
+                    error, listen_address
+                ),
+            }
+        });
     }
 }

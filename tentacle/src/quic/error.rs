@@ -1,6 +1,10 @@
 /// Errors that can occur in the QUIC transport.
 #[derive(Debug, thiserror::Error)]
 pub enum QuicErrorKind {
+    /// The inbound handshake exceeded its absolute deadline.
+    #[error("Inbound QUIC handshake timed out after {0:?}")]
+    HandshakeTimedOut(std::time::Duration),
+
     /// Failed to build or parse the X.509 certificate.
     #[error("Certificate error: {0}")]
     CertificateError(String),
