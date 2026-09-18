@@ -324,7 +324,12 @@ impl TcpBaseListener {
                                     Ok(permit) => Some(permit),
                                     Err(_) => {
                                         debug!("connection limit reached, dropping inbound stream");
-                                        return Poll::Ready(Ok(()));
+                                        let waker = cx.waker().clone();
+                                        crate::runtime::spawn(async move {
+                                            crate::runtime::delay_for(Duration::from_millis(100)).await;
+                                            waker.wake();
+                                        });
+                                        return Poll::Pending;
                                     }
                                 }
                             } else {
