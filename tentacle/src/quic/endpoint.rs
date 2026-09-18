@@ -290,10 +290,14 @@ fn build_quinn_server_config<K: KeyProvider>(
     let cert_der = CertificateDer::from(cert.cert_der.clone());
     let key_der: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from(cert.key_der.clone());
 
-    let rustls_cfg = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(Arc::new(TentacleQuicClientCertVerifier::new(local_key)))
-        .with_single_cert(vec![cert_der], key_der.into())
-        .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?;
+    let rustls_cfg = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?
+    .with_client_cert_verifier(Arc::new(TentacleQuicClientCertVerifier::new(local_key)))
+    .with_single_cert(vec![cert_der], key_der.into())
+    .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?;
 
     let quic_crypto = QuicServerConfig::try_from(rustls_cfg)
         .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?;
@@ -321,14 +325,18 @@ fn build_quinn_client_config<K: KeyProvider>(
     let cert = CertificateDer::from(cert_der.to_vec());
     let key: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from(key_der.to_vec());
 
-    let rustls_cfg = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TentacleQuicServerCertVerifier::new(
-            local_key,
-            expected_peer_id,
-        )))
-        .with_client_auth_cert(vec![cert], key.into())
-        .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?;
+    let rustls_cfg = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(TentacleQuicServerCertVerifier::new(
+        local_key,
+        expected_peer_id,
+    )))
+    .with_client_auth_cert(vec![cert], key.into())
+    .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?;
 
     let quic_crypto = QuicClientConfig::try_from(rustls_cfg)
         .map_err(|e| QuicErrorKind::TlsConfig(e.to_string()))?;

@@ -27,12 +27,24 @@ use tentacle::secio::SecioKeyPair;
 
 // ───────────────────────────────── helpers ─────────────────────────────────
 
+fn server_config_builder() -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+    ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .expect("the aws-lc-rs provider supports rustls default protocol versions")
+}
+
+fn client_config_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+    ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .expect("the aws-lc-rs provider supports rustls default protocol versions")
+}
+
 /// Build a `rustls::ServerConfig` that authenticates clients via
 /// [`TentacleQuicClientCertVerifier`] and presents `cert` as its own identity.
 fn tentacle_server_config(key: SecioKeyPair, cert: TentacleQuicCert) -> ServerConfig {
     let cert_der = CertificateDer::from(cert.cert_der);
     let key_der = PrivatePkcs8KeyDer::from(cert.key_der);
-    ServerConfig::builder()
+    server_config_builder()
         .with_client_cert_verifier(Arc::new(TentacleQuicClientCertVerifier::new(key)))
         .with_single_cert(vec![cert_der], key_der.into())
         .expect("server rustls config")
@@ -47,7 +59,7 @@ fn tentacle_client_config(
 ) -> ClientConfig {
     let cert_der = CertificateDer::from(cert.cert_der);
     let key_der = PrivatePkcs8KeyDer::from(cert.key_der);
-    ClientConfig::builder()
+    client_config_builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(TentacleQuicServerCertVerifier::new(
             key,
@@ -174,7 +186,7 @@ async fn e2e_handshake_fails_when_client_has_no_extension() {
     let (plain_cert, plain_key) = build_plain_cert_and_key();
     let local_key = SecioKeyPair::secp256k1_generated();
 
-    let rustls_client = ClientConfig::builder()
+    let rustls_client = client_config_builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(TentacleQuicServerCertVerifier::new(
             local_key, None,

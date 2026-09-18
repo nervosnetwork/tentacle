@@ -142,7 +142,10 @@ fn test_kill(secio: bool) {
             let mem_stop = current_used_memory().unwrap();
             let cpu_stop = current_used_cpu().unwrap();
             assert!((mem_stop - mem_start) / mem_start < 0.1);
-            assert!((cpu_stop - cpu_start) / cpu_start < 0.1);
+            // CPU usage is already a ratio. Comparing its relative change is
+            // unstable when the initial sample is close to zero, so allow at
+            // most a ten-percentage-point increase instead.
+            assert!(cpu_stop - cpu_start < 0.1);
         }
         Ok(ForkResult::Child) => {
             let rt = tokio::runtime::Runtime::new().unwrap();

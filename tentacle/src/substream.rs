@@ -112,6 +112,30 @@ pub(crate) enum ProtocolEvent {
     TimeoutCheck,
 }
 
+/// Applies backpressure at the substream event-recv path.
+///
+/// The substream can only push a frame into the underlying yamux stream when
+/// `poll_ready` reports `Ready`; otherwise the frame is buffered locally in
+/// either `write_buf` (normal priority) or `high_write_buf` (high priority).
+/// Without this guard, a peer that stops reading its yamux window can force
+/// unbounded local buffering when the application keeps calling one of the
+/// `quick_send_message` / `send_message` APIs.
+///
+/// Historically only `write_buf.len()` was checked here, which allowed
+/// high-priority traffic (`quick_send_message`, `quick_filter_broadcast`) to
+/// grow `high_write_buf` past `send_event_size` while `write_buf` stayed
+/// empty. Both queues must be gated for the reverse-pressure signal that
+/// eventually reaches `Session::distribute_to_substream` and lets the
+/// per-session byte limit (`send_buffer_size`) fire on `pending_data_size`.
+#[inline]
+fn write_buf_over_threshold(
+    write_buf_len: usize,
+    high_write_buf_len: usize,
+    send_event_size: usize,
+) -> bool {
+    write_buf_len > send_event_size || high_write_buf_len > send_event_size
+}
+
 /// Each custom protocol in a session corresponds to a sub stream
 /// Can be seen as the route of each protocol
 pub(crate) struct Substream<U> {
@@ -375,7 +399,11 @@ where
             return Poll::Ready(None);
         }
 
-        if self.write_buf.len() > self.config.send_event_size() {
+        if write_buf_over_threshold(
+            self.write_buf.len(),
+            self.high_write_buf.len(),
+            self.config.send_event_size(),
+        ) {
             return Poll::Pending;
         }
 
@@ -789,7 +817,11 @@ where
             return Poll::Ready(None);
         }
 
-        if self.write_buf.len() > self.config.send_event_size() {
+        if write_buf_over_threshold(
+            self.write_buf.len(),
+            self.high_write_buf.len(),
+            self.config.send_event_size(),
+        ) {
             return Poll::Pending;
         }
 
@@ -1036,5 +1068,48 @@ impl SubstreamWritePartBuilder {
             event_sender: Buffer::new(self.event_sender),
             event_receiver: self.event_receiver,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_buf_over_threshold;
+
+    /// Both queues empty are far below the threshold: recv is allowed.
+    #[test]
+    fn write_buf_over_threshold_returns_false_when_both_empty() {
+        assert!(!write_buf_over_threshold(0, 0, 1));
+    }
+
+    /// Normal path: `write_buf` alone exceeding the threshold is enough to
+    /// stop reading more events. This is the historical behavior and must be
+    /// preserved.
+    #[test]
+    fn write_buf_over_threshold_blocks_when_normal_full() {
+        assert!(write_buf_over_threshold(2, 0, 1));
+    }
+
+    /// Regression for the high-priority queue bypass:
+    /// prior to the fix, `high_write_buf` could grow without bound while
+    /// `write_buf` stayed empty, so this predicate would report `false`
+    /// even though buffered high-priority frames were already piling up.
+    #[test]
+    fn write_buf_over_threshold_blocks_when_high_full() {
+        assert!(write_buf_over_threshold(0, 2, 1));
+    }
+
+    /// Boundary check: `<=` must not trigger backpressure. `send_event_size`
+    /// itself is still "acceptable"; only strictly greater than is blocking.
+    #[test]
+    fn write_buf_over_threshold_at_boundary_is_not_blocking() {
+        assert!(!write_buf_over_threshold(1, 1, 1));
+        assert!(!write_buf_over_threshold(0, 1, 1));
+        assert!(!write_buf_over_threshold(1, 0, 1));
+    }
+
+    /// Both queues over: still blocked (belt and suspenders).
+    #[test]
+    fn write_buf_over_threshold_blocks_when_both_full() {
+        assert!(write_buf_over_threshold(5, 5, 1));
     }
 }
