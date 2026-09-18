@@ -1472,7 +1472,7 @@ where
                             );
                             crate::runtime::spawn(async move {
                                 let mut handle = handle;
-                                let _ = handle.shutdown().await;
+                                let _ignore = handle.shutdown().await;
                             });
                             return;
                         }
