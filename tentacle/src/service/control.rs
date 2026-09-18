@@ -21,6 +21,32 @@ use bytes::Bytes;
 
 type Result = std::result::Result<(), SendErrorKind>;
 
+pub(crate) struct ServiceTaskBudgetGuard<'a> {
+    budget: &'a ServiceTaskBudget,
+    should_release: bool,
+}
+
+impl<'a> ServiceTaskBudgetGuard<'a> {
+    pub fn new(budget: &'a ServiceTaskBudget) -> std::result::Result<Self, SendErrorKind> {
+        budget.acquire().map(|_| Self {
+            budget,
+            should_release: true,
+        })
+    }
+    pub fn cancel_release(mut self) -> Self {
+        self.should_release = false;
+        self
+    }
+}
+
+impl<'a> Drop for ServiceTaskBudgetGuard<'a> {
+    fn drop(&mut self) {
+        if self.should_release {
+            self.budget.release();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ServiceTaskBudget {
     limit: usize,
@@ -58,15 +84,14 @@ impl ServiceTaskBudget {
     }
 }
 
-fn acquire_task_budget(
+fn acquire_task_budget<'a>(
     event: &ServiceTask,
-    budget: &ServiceTaskBudget,
-) -> std::result::Result<bool, SendErrorKind> {
+    budget: &'a ServiceTaskBudget,
+) -> std::result::Result<Option<ServiceTaskBudgetGuard<'a>>, SendErrorKind> {
     if event.counts_against_budget() {
-        budget.acquire()?;
-        Ok(true)
+        Some(ServiceTaskBudgetGuard::new(budget)).transpose()
     } else {
-        Ok(false)
+        Ok(None)
     }
 }
 
@@ -98,16 +123,18 @@ impl ServiceControl {
             return Err(SendErrorKind::BrokenPipe);
         }
         let acquired_budget = acquire_task_budget(&event, &self.task_budget)?;
-        self.task_sender.try_send(event).map_err(|err| {
-            if acquired_budget {
-                self.task_budget.release();
-            }
-            if err.is_full() {
-                SendErrorKind::WouldBlock
-            } else {
-                SendErrorKind::BrokenPipe
-            }
-        })
+        self.task_sender
+            .try_send(event)
+            .map_err(|err| {
+                if err.is_full() {
+                    SendErrorKind::WouldBlock
+                } else {
+                    SendErrorKind::BrokenPipe
+                }
+            })
+            .inspect(|_| {
+                acquired_budget.map(|x| x.cancel_release());
+            })
     }
 
     /// Send raw event on quick channel
@@ -117,16 +144,18 @@ impl ServiceControl {
             return Err(SendErrorKind::BrokenPipe);
         }
         let acquired_budget = acquire_task_budget(&event, &self.task_budget)?;
-        self.task_sender.try_quick_send(event).map_err(|err| {
-            if acquired_budget {
-                self.task_budget.release();
-            }
-            if err.is_full() {
-                SendErrorKind::WouldBlock
-            } else {
-                SendErrorKind::BrokenPipe
-            }
-        })
+        self.task_sender
+            .try_quick_send(event)
+            .map_err(|err| {
+                if err.is_full() {
+                    SendErrorKind::WouldBlock
+                } else {
+                    SendErrorKind::BrokenPipe
+                }
+            })
+            .inspect(|_| {
+                acquired_budget.map(|x| x.cancel_release());
+            })
     }
 
     /// Create a new listener
@@ -372,13 +401,16 @@ impl ServiceAsyncControl {
             return Err(SendErrorKind::BrokenPipe);
         }
         let acquired_budget = acquire_task_budget(&event, &self.task_budget)?;
-        self.task_sender.async_send(event).await.map_err(|_err| {
-            if acquired_budget {
-                self.task_budget.release();
-            }
-            // await only return err when channel close
-            SendErrorKind::BrokenPipe
-        })
+        self.task_sender
+            .async_send(event)
+            .await
+            .map_err(|_err| {
+                // await only return err when channel close
+                SendErrorKind::BrokenPipe
+            })
+            .inspect(|_| {
+                acquired_budget.map(|x| x.cancel_release());
+            })
     }
 
     /// Send raw event on quick channel
@@ -392,11 +424,11 @@ impl ServiceAsyncControl {
             .async_quick_send(event)
             .await
             .map_err(|_err| {
-                if acquired_budget {
-                    self.task_budget.release();
-                }
                 // await only return err when channel close
                 SendErrorKind::BrokenPipe
+            })
+            .inspect(|_| {
+                acquired_budget.map(|x| x.cancel_release());
             })
     }
 
