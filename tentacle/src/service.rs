@@ -994,14 +994,6 @@ where
         }
     }
 
-    fn reached_max_connection_limit(&self) -> bool {
-        self.sessions
-            .len()
-            .checked_add(self.state.into_inner().unwrap_or_default())
-            .map(|count| self.config.max_connection_number <= count)
-            .unwrap_or(true)
-    }
-
     /// Common session-registration steps shared by yamux and QUIC paths
     /// (steps 1–5 of `session_open`):
     /// 1. duplicate-connection check (by remote public key)
@@ -1467,17 +1459,34 @@ where
                 if ty.is_outbound() {
                     self.state.decrease();
                 }
-                if ty.is_outbound() || connection_permit.is_some() {
-                    self.session_open(
-                        handle,
-                        public_key,
-                        address,
-                        ty,
-                        listen_address,
-                        connection_permit,
-                    )
-                    .await;
-                }
+                let connection_permit = if ty.is_outbound() || connection_permit.is_some() {
+                    connection_permit
+                } else {
+                    match self.acquire_inbound_connection_permit() {
+                        Ok(p) => Some(p),
+                        Err(err) => {
+                            log::debug!(
+                                "Unable to acquire inbound connection permit for {}: {}",
+                                address,
+                                err
+                            );
+                            crate::runtime::spawn(async move {
+                                let mut handle = handle;
+                                let _ = handle.shutdown().await;
+                            });
+                            return;
+                        }
+                    }
+                };
+                self.session_open(
+                    handle,
+                    public_key,
+                    address,
+                    ty,
+                    listen_address,
+                    connection_permit,
+                )
+                .await;
             }
             #[cfg(feature = "quic")]
             SessionEvent::QuicListenAccepted(accepted) => {
@@ -1945,5 +1954,127 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "tokio-runtime", not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+    use crate::{builder::ServiceBuilder, secio::NoopKeyProvider};
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    fn service_with_inbound_limit(limit: usize) -> Service<(), NoopKeyProvider> {
+        ServiceBuilder::<NoopKeyProvider>::default()
+            .max_inbound_connection_number(limit)
+            .forever(true)
+            .build(())
+    }
+
+    fn inbound_handshake_success<H>(handle: H) -> SessionEvent
+    where
+        H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
+    {
+        let address = "/memory/1".parse().unwrap();
+        SessionEvent::HandshakeSuccess {
+            handle: Box::new(handle),
+            public_key: None,
+            address,
+            ty: SessionType::Inbound,
+            listen_address: Some("/memory/1".parse().unwrap()),
+            connection_permit: None,
+        }
+    }
+
+    #[test]
+    fn inbound_handshake_without_permit_opens_session() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut service = service_with_inbound_limit(1);
+            let mut inner = service.inner_service.take().unwrap();
+            let mut service_events = service.recv;
+            let (handle, _remote) = tokio::io::duplex(64);
+
+            let acknowledge_session_open = async {
+                match service_events.next().await {
+                    Some(ServiceEventAndError::Event {
+                        event: ServiceEvent::SessionOpen { session_context },
+                        wait_response: Some(response),
+                    }) => {
+                        assert!(session_context.ty.is_inbound());
+                        response.send(()).unwrap();
+                    }
+                    _ => panic!("expected an inbound SessionOpen event"),
+                }
+            };
+
+            futures::join!(
+                inner.handle_session_event(inbound_handshake_success(handle)),
+                acknowledge_session_open,
+            );
+
+            assert_eq!(inner.sessions.len(), 1);
+            assert_eq!(inner.inbound_connection_limiter.available_permits(), 0);
+
+            inner.sessions.clear();
+            assert_eq!(inner.inbound_connection_limiter.available_permits(), 1);
+        });
+    }
+
+    struct ShutdownProbe(Option<futures::channel::oneshot::Sender<()>>);
+
+    impl AsyncRead for ShutdownProbe {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ShutdownProbe {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if let Some(sender) = self.0.take() {
+                let _ignore = sender.send(());
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn inbound_handshake_without_permit_is_closed_at_capacity() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut service = service_with_inbound_limit(0);
+            let mut inner = service.inner_service.take().unwrap();
+            let (shutdown_sender, shutdown_receiver) = futures::channel::oneshot::channel();
+
+            inner
+                .handle_session_event(inbound_handshake_success(ShutdownProbe(Some(
+                    shutdown_sender,
+                ))))
+                .await;
+
+            shutdown_receiver
+                .await
+                .expect("rejected inbound connection was not shut down");
+            assert!(inner.sessions.is_empty());
+        });
     }
 }
