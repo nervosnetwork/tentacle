@@ -906,7 +906,7 @@ mod tests {
         ));
 
         // Simulate one service-loop iteration: pull a task and release if it
-        // counts against the budget (mirrors service.rs:1829-1833).
+        // counts against the budget (mirrors the service loop dequeue path in InnerService::run).
         let (_priority, task) = receiver
             .try_next()
             .expect("queued task")
