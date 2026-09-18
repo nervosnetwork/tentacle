@@ -242,6 +242,15 @@ pub(crate) enum ServiceTask {
     Shutdown(bool),
 }
 
+impl ServiceTask {
+    pub(crate) fn counts_against_budget(&self) -> bool {
+        matches!(
+            self,
+            ServiceTask::ProtocolMessage { .. } | ServiceTask::FutureTask { .. }
+        )
+    }
+}
+
 /// Raw session info
 pub enum RawSessionInfo {
     /// Inbound session
