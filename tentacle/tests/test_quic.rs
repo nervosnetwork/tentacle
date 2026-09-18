@@ -190,6 +190,32 @@ impl ServiceHandle for CollectingHandle {
 /// Test 1: two QUIC services exchange messages over a single protocol.
 #[test]
 fn test_quic_basic_connectivity() {
+    check_quic_basic_connectivity(false);
+}
+
+#[test]
+fn test_quic_control_listen_connectivity() {
+    check_quic_basic_connectivity(true);
+}
+
+struct ListenAddressSender(Option<oneshot::Sender<Multiaddr>>);
+
+#[async_trait]
+impl ServiceHandle for ListenAddressSender {
+    async fn handle_error(&mut self, _context: &mut ServiceContext, error: ServiceError) {
+        panic!("unexpected server error: {:?}", error);
+    }
+
+    async fn handle_event(&mut self, _context: &mut ServiceContext, event: ServiceEvent) {
+        if let ServiceEvent::ListenStarted { address } = event
+            && let Some(sender) = self.0.take()
+        {
+            let _ignore = sender.send(address);
+        }
+    }
+}
+
+fn check_quic_basic_connectivity(via_control: bool) {
     let (server_meta, server_rx) = make_echo_meta(1.into(), 50);
     let (client_meta, client_rx) = make_echo_meta(1.into(), 50);
 
@@ -200,13 +226,23 @@ fn test_quic_basic_connectivity() {
 
     let _server = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut service = build_service(server_key, vec![server_meta], (), true);
+        let mut service = build_service(
+            server_key,
+            vec![server_meta],
+            ListenAddressSender(Some(addr_tx)),
+            true,
+        );
         rt.block_on(async move {
-            let listen = service
-                .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
-                .await
-                .expect("server listen");
-            let _ignore = addr_tx.send(listen);
+            let address = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+            if via_control {
+                service
+                    .control()
+                    .listen(address)
+                    .await
+                    .expect("control listen");
+            } else {
+                service.listen(address).await.expect("server listen");
+            }
             service.run().await
         });
     });
@@ -569,5 +605,210 @@ fn test_quic_not_enabled_rejected() {
                     .unwrap_or_else(|e| format!("{:?}", e))
             ),
         }
+    });
+}
+
+// ─────────────────────── stalled-handshake accept-loop DoS ───────────────────────
+
+/// Reports `SessionOpen` to a channel so a test can observe inbound sessions.
+struct SessionOpenReporter(crossbeam_channel::Sender<()>);
+
+#[async_trait]
+impl ServiceHandle for SessionOpenReporter {
+    async fn handle_error(&mut self, _context: &mut ServiceContext, _error: ServiceError) {}
+
+    async fn handle_event(&mut self, _context: &mut ServiceContext, event: ServiceEvent) {
+        if let ServiceEvent::SessionOpen { .. } = event {
+            let _ignore = self.0.send(());
+        }
+    }
+}
+
+/// A UDP relay that forwards only a peer's **first** datagram to `server` and
+/// drops everything afterwards.
+///
+/// A real QUIC client dialing the relay therefore gets its Initial delivered —
+/// the server allocates an inbound connection attempt — but the client's
+/// handshake flight never arrives, so that attempt stays pending until it
+/// times out. This is the unauthenticated "start a handshake and go silent"
+/// attacker from the finding, without needing to hand-craft QUIC packets.
+fn spawn_stalling_relay(server: std::net::SocketAddr) -> std::net::SocketAddr {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind relay");
+    let relay_addr = socket.local_addr().expect("relay addr");
+    thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        let mut forwarded = false;
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            // Drop the server's replies, and every client datagram but the first.
+            if from != server && !forwarded {
+                let _ignore = socket.send_to(&buf[..n], server);
+                forwarded = true;
+            }
+        }
+    });
+    relay_addr
+}
+
+/// Start a QUIC dial through `relay` and leave it hanging forever.
+fn spawn_stalled_dial(relay: std::net::SocketAddr) {
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let endpoint = tentacle::quic::endpoint::QuicEndpoint::new(
+                SecioKeyPair::secp256k1_generated(),
+                QuicConfig::default(),
+            )
+            .expect("attacker endpoint");
+            let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", relay.port())
+                .parse()
+                .unwrap();
+            let _ignore = endpoint.dial(addr).await;
+            // Keep the runtime (and the stalled attempt) alive for the test.
+            tokio::time::sleep(Duration::from_secs(120)).await;
+        });
+    });
+}
+
+/// Test 8: inbound QUIC handshakes that never complete must not stall the
+/// accept loop. Several peers send a QUIC Initial and then go silent; a
+/// legitimate peer dialing afterwards must still connect promptly instead of
+/// waiting for those handshakes to time out.
+#[test]
+fn test_quic_stalled_handshake_does_not_block_accept_loop() {
+    const STALLED_PEERS: usize = 3;
+
+    let server_key = SecioKeyPair::secp256k1_generated();
+    let server_pid = server_key.peer_id();
+
+    let (open_tx, open_rx) = crossbeam_channel::unbounded();
+    let (addr_tx, addr_rx) = crossbeam_channel::bounded(1);
+
+    let _server = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = build_service(
+            server_key,
+            vec![make_echo_meta(1.into(), 1).0],
+            SessionOpenReporter(open_tx),
+            true,
+        );
+        rt.block_on(async move {
+            let listen = service
+                .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .await
+                .expect("server listen");
+            let _ignore = addr_tx.send(listen);
+            service.run().await
+        });
+    });
+
+    let listen_addr = addr_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("listen address");
+    let server_socket: std::net::SocketAddr = {
+        let port = listen_addr
+            .iter()
+            .find_map(|p| match p {
+                tentacle::multiaddr::Protocol::Udp(port) => Some(port),
+                _ => None,
+            })
+            .expect("listen port");
+        format!("127.0.0.1:{port}").parse().unwrap()
+    };
+
+    // Occupy the listener with handshakes that will never complete.
+    for _ in 0..STALLED_PEERS {
+        spawn_stalled_dial(spawn_stalling_relay(server_socket));
+    }
+    thread::sleep(Duration::from_millis(500));
+
+    // A legitimate peer must still get in promptly.
+    let dial_addr: Multiaddr = format!("{}/p2p/{}", listen_addr, server_pid.to_base58())
+        .parse()
+        .unwrap();
+    let _client = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = build_service(
+            SecioKeyPair::secp256k1_generated(),
+            vec![make_echo_meta(1.into(), 1).0],
+            (),
+            true,
+        );
+        rt.block_on(async move {
+            service.dial(dial_addr, TargetProtocol::All).await.ok();
+            service.run().await
+        });
+    });
+
+    open_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("legitimate peer must connect while other handshakes are pending");
+}
+
+// ────────────────────── low-level listener API (downstream) ──────────────────────
+
+/// Test 9: a downstream project that wants the QUIC transport without the full
+/// `Service` can drive a listener itself through the public
+/// `QuicListener::for_each_handshake`, which keeps accepting while handshakes
+/// run concurrently under a capacity bound.
+#[test]
+fn test_quic_listener_for_each_handshake_public_api() {
+    use std::ops::ControlFlow;
+    use tentacle::quic::endpoint::{HandshakeCapacity, QuicEndpoint};
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let config = QuicConfig::default();
+        let capacity = HandshakeCapacity::new(config.max_pending_handshakes);
+        assert_eq!(capacity.available(), config.max_pending_handshakes);
+
+        let server_key = SecioKeyPair::secp256k1_generated();
+        let server_pid = server_key.peer_id();
+        let server = QuicEndpoint::new(server_key, config).expect("server endpoint");
+        let listener = server
+            .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .expect("listen");
+        let listen_addr = listener.listen_addr().clone();
+
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+        let serving = tokio::spawn(async move {
+            listener
+                .for_each_handshake(capacity, move |result| {
+                    let peer_tx = peer_tx.clone();
+                    async move {
+                        let _ignore =
+                            peer_tx.send(result.map(|(addr, handshake)| {
+                                (addr, handshake.remote_pubkey().peer_id())
+                            }));
+                        // One peer is enough for this test.
+                        ControlFlow::Break(())
+                    }
+                })
+                .await
+        });
+
+        let client_key = SecioKeyPair::secp256k1_generated();
+        let client_pid = client_key.peer_id();
+        let client = QuicEndpoint::new(client_key, QuicConfig::default()).expect("client endpoint");
+        let dial_addr: Multiaddr = format!("{}/p2p/{}", listen_addr, server_pid.to_base58())
+            .parse()
+            .unwrap();
+        let handshake = client.dial(dial_addr).await.expect("dial");
+        assert_eq!(handshake.remote_pubkey().peer_id(), server_pid);
+
+        let (remote_addr, remote_pid) = peer_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("listener must report the inbound peer")
+            .expect("inbound handshake must succeed");
+        assert_eq!(remote_pid, client_pid, "identity must be verified");
+        assert!(
+            remote_addr.to_string().contains("/quic-v1"),
+            "expected a quic multiaddr, got {remote_addr}"
+        );
+
+        // `ControlFlow::Break` must stop the listener loop.
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("for_each_handshake must resolve after Break")
+            .expect("listener task");
     });
 }
