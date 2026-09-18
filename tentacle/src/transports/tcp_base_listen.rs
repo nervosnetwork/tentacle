@@ -321,23 +321,24 @@ impl TcpBaseListener {
                         let sender = self.sender.clone();
                         let upgrade_mode = self.upgrade_mode.to_enum();
                         let trusted_proxies = Arc::clone(&self.trusted_proxies);
-                        let connection_permit =
-                            if let Some(limiter) = self.connection_limiter.as_ref() {
-                                match limiter.clone().try_acquire_owned() {
-                                    Ok(permit) => Some(permit),
-                                    Err(_) => {
-                                        debug!("connection limit reached, dropping inbound stream");
-                                        let waker = cx.waker().clone();
-                                        crate::runtime::spawn(async move {
-                                            crate::runtime::delay_for(Duration::from_millis(100)).await;
-                                            waker.wake();
-                                        });
-                                        return Poll::Pending;
-                                    }
+                        let connection_permit = if let Some(limiter) =
+                            self.connection_limiter.as_ref()
+                        {
+                            match limiter.clone().try_acquire_owned() {
+                                Ok(permit) => Some(permit),
+                                Err(_) => {
+                                    debug!("connection limit reached, dropping inbound stream");
+                                    let waker = cx.waker().clone();
+                                    crate::runtime::spawn(async move {
+                                        crate::runtime::delay_for(Duration::from_millis(100)).await;
+                                        waker.wake();
+                                    });
+                                    return Poll::Pending;
                                 }
-                            } else {
-                                None
-                            };
+                            }
+                        } else {
+                            None
+                        };
                         #[cfg(feature = "tls")]
                         let acceptor = TlsAcceptor::from(Arc::clone(&self.tls_config));
                         crate::runtime::spawn(protocol_select(
