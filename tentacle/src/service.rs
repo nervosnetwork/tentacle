@@ -818,16 +818,19 @@ where
             // Send data to the specified protocol for the specified session.
             TargetSession::Single(id) => {
                 if let Some(control) = self.sessions.get_mut(&id) {
-                    control.inner.incr_pending_data_size(data.len());
+                    let data_size = data.len();
+                    control.inner.incr_pending_data_size(data_size);
                     let _ignore = control
                         .send(priority, SessionEvent::ProtocolMessage { proto_id, data })
-                        .await;
+                        .await
+                        .map_err(|_| control.inner.decr_pending_data_size(data_size));
                 }
             }
             TargetSession::Multi(iter) => {
                 for id in iter {
                     if let Some(control) = self.sessions.get_mut(&id) {
-                        control.inner.incr_pending_data_size(data.len());
+                        let data_size = data.len();
+                        control.inner.incr_pending_data_size(data_size);
                         let _ignore = control
                             .send(
                                 priority,
@@ -836,7 +839,8 @@ where
                                     data: data.clone(),
                                 },
                             )
-                            .await;
+                            .await
+                            .map_err(|_| control.inner.decr_pending_data_size(data_size));
                     }
                 }
             }
@@ -849,7 +853,8 @@ where
                         proto_id,
                         data.len()
                     );
-                    control.inner.incr_pending_data_size(data.len());
+                    let data_size = data.len();
+                    control.inner.incr_pending_data_size(data_size);
                     let _ignore = control
                         .send(
                             priority,
@@ -858,7 +863,8 @@ where
                                 data: data.clone(),
                             },
                         )
-                        .await;
+                        .await
+                        .map_err(|_| control.inner.decr_pending_data_size(data_size));
                 }
             }
             // Broadcast data for a specified protocol.
@@ -870,7 +876,8 @@ where
                     data.len()
                 );
                 for control in self.sessions.values_mut() {
-                    control.inner.incr_pending_data_size(data.len());
+                    let data_size = data.len();
+                    control.inner.incr_pending_data_size(data_size);
                     let _ignore = control
                         .send(
                             priority,
@@ -879,7 +886,8 @@ where
                                 data: data.clone(),
                             },
                         )
-                        .await;
+                        .await
+                        .map_err(|_| control.inner.decr_pending_data_size(data_size));
                 }
             }
         }

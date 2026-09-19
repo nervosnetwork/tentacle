@@ -98,7 +98,10 @@ impl SessionContext {
     // Decrease when data sent to underlying Yamux Stream
     pub(crate) fn decr_pending_data_size(&self, data_size: usize) {
         self.pending_data_size
-            .fetch_sub(data_size, Ordering::AcqRel);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(data_size))
+            })
+            .ok();
     }
 
     /// Session is closed
