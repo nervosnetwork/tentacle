@@ -80,6 +80,7 @@ pub(crate) struct HandshakeContext<K> {
     pub(crate) ty: SessionType,
     pub(crate) remote_address: Multiaddr,
     pub(crate) listen_address: Option<Multiaddr>,
+    pub(crate) tracked_state: bool,
 }
 
 impl<K> HandshakeContext<K>
@@ -111,6 +112,7 @@ where
                             ty: self.ty,
                             error: HandshakeErrorKind::Timeout(error.to_string()),
                             address: self.remote_address,
+                            tracked_state: self.tracked_state,
                         }
                     }
                     Ok(res) => match res {
@@ -120,6 +122,7 @@ where
                             address: self.remote_address,
                             ty: self.ty,
                             listen_address: self.listen_address,
+                            tracked_state: self.tracked_state,
                         },
                         Err(error) => {
                             debug!(
@@ -130,6 +133,7 @@ where
                                 ty: self.ty,
                                 error: HandshakeErrorKind::SecioError(error),
                                 address: self.remote_address,
+                                tracked_state: self.tracked_state,
                             }
                         }
                     },
@@ -145,6 +149,7 @@ where
                     address: self.remote_address,
                     ty: self.ty,
                     listen_address: self.listen_address,
+                    tracked_state: self.tracked_state,
                 };
                 if let Err(err) = self.event_sender.send(event).await {
                     error!("handshake result send back error: {:?}", err);
@@ -395,6 +400,7 @@ where
             event_sender: self.event_sender.clone(),
             max_frame_length: self.max_frame_length,
             timeout: self.timeout,
+            tracked_state: false,
         }
         .handshake(socket);
 
