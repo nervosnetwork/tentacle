@@ -69,6 +69,10 @@ impl DnsResolver {
         }
     }
 
+    pub(crate) fn tcp_target(&self) -> (&str, u16) {
+        (&self.domain, self.port)
+    }
+
     fn new_addr(
         &mut self,
         mut iter: IntoIter<SocketAddr>,
