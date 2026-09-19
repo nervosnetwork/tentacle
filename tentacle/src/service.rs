@@ -18,7 +18,7 @@ use crate::{
     ProtocolId, SessionId,
     buffer::Buffer,
     channel::{mpsc as priority_mpsc, mpsc::Priority},
-    context::{ServiceContext, SessionContext, SessionController},
+    context::{PendingDataGuard, ServiceContext, SessionContext, SessionController},
     error::{DialerErrorKind, ListenErrorKind, ProtocolHandleErrorKind, TransportErrorKind},
     multiaddr::{Multiaddr, Protocol},
     protocol_handle_stream::{
@@ -804,84 +804,67 @@ where
 
     async fn handle_message(
         &mut self,
-        target: TargetSession,
         proto_id: ProtocolId,
         priority: Priority,
         data: Bytes,
+        reservations: Vec<PendingDataGuard>,
+        blocked: Vec<SessionContext>,
     ) {
+        for context in blocked {
+            self.handle_blocked_session(context).await;
+        }
+
+        if reservations.is_empty() {
+            return;
+        }
+
         let data = match self.before_sends.get(&proto_id) {
             Some(function) => function(data),
             None => data,
         };
 
-        match target {
-            // Send data to the specified protocol for the specified session.
-            TargetSession::Single(id) => {
-                if let Some(control) = self.sessions.get_mut(&id) {
-                    control.inner.incr_pending_data_size(data.len());
-                    let _ignore = control
-                        .send(priority, SessionEvent::ProtocolMessage { proto_id, data })
-                        .await;
-                }
+        for reservation in reservations {
+            let id = reservation.context().id;
+            debug!(
+                "send message to session [{}], proto [{}], data len: {}",
+                id,
+                proto_id,
+                data.len()
+            );
+
+            let blocked_context = if let Some(control) = self.sessions.get_mut(&id) {
+                control
+                    .send_message(priority, proto_id, data.clone(), reservation)
+                    .await
+                    .then(|| control.inner.clone())
+            } else {
+                None
+            };
+            if let Some(session_context) = blocked_context {
+                let _ignore = self
+                    .handle_sender
+                    .send(ServiceError::SessionBlocked { session_context }.into())
+                    .await;
             }
-            TargetSession::Multi(iter) => {
-                for id in iter {
-                    if let Some(control) = self.sessions.get_mut(&id) {
-                        control.inner.incr_pending_data_size(data.len());
-                        let _ignore = control
-                            .send(
-                                priority,
-                                SessionEvent::ProtocolMessage {
-                                    proto_id,
-                                    data: data.clone(),
-                                },
-                            )
-                            .await;
+        }
+    }
+
+    async fn handle_blocked_session(&mut self, session_context: SessionContext) {
+        if let Some(control) = self.sessions.get_mut(&session_context.id) {
+            let context = control.inner.clone();
+            let id = context.id;
+            let _ignore = control
+                .send(Priority::High, SessionEvent::SessionClose { id })
+                .await;
+            let _ignore = self
+                .handle_sender
+                .send(
+                    ServiceError::SessionBlocked {
+                        session_context: context,
                     }
-                }
-            }
-            // Send data to the specified protocol for the specified sessions.
-            TargetSession::Filter(mut filter) => {
-                for (id, control) in self.sessions.iter_mut().filter(|(id, _)| filter(id)) {
-                    debug!(
-                        "send message to session [{}], proto [{}], data len: {}",
-                        id,
-                        proto_id,
-                        data.len()
-                    );
-                    control.inner.incr_pending_data_size(data.len());
-                    let _ignore = control
-                        .send(
-                            priority,
-                            SessionEvent::ProtocolMessage {
-                                proto_id,
-                                data: data.clone(),
-                            },
-                        )
-                        .await;
-                }
-            }
-            // Broadcast data for a specified protocol.
-            TargetSession::All => {
-                debug!(
-                    "broadcast message, peer count: {}, proto_id: {}, data len: {}",
-                    self.sessions.len(),
-                    proto_id,
-                    data.len()
-                );
-                for control in self.sessions.values_mut() {
-                    control.inner.incr_pending_data_size(data.len());
-                    let _ignore = control
-                        .send(
-                            priority,
-                            SessionEvent::ProtocolMessage {
-                                proto_id,
-                                data: data.clone(),
-                            },
-                        )
-                        .await;
-                }
-            }
+                    .into(),
+                )
+                .await;
         }
     }
 
@@ -1024,6 +1007,7 @@ where
                 remote_pubkey,
                 session_closed,
                 pending_data_size,
+                self.config.session_config.send_buffer_size,
             )),
         );
 
@@ -1032,6 +1016,9 @@ where
         // must insert here, otherwise, the session protocol handle cannot be opened
         self.sessions
             .insert(session_control.inner.id, session_control);
+        self.service_context
+            .control()
+            .register_session(session_context.clone());
 
         // Open all session protocol handles
         let handles = self.session_handles_open(self.next_session);
@@ -1230,6 +1217,7 @@ where
         self.session_proto_handles.retain(|key, _| id != key.0);
 
         if let Some(session_control) = self.sessions.remove(&id) {
+            self.service_context.control().unregister_session(id);
             // Service handle processing flow
             let _ignore = self
                 .handle_sender
@@ -1601,11 +1589,16 @@ where
     async fn handle_service_task(&mut self, event: ServiceTask, priority: Priority) {
         match event {
             ServiceTask::ProtocolMessage {
-                target,
                 proto_id,
                 data,
+                reservations,
+                blocked,
             } => {
-                self.handle_message(target, proto_id, priority, data).await;
+                self.handle_message(proto_id, priority, data, reservations, blocked)
+                    .await;
+            }
+            ServiceTask::SessionBlocked { session_context } => {
+                self.handle_blocked_session(session_context).await;
             }
             ServiceTask::Dial { address, target } => {
                 if !(self.dial_protocols.contains_key(&address)

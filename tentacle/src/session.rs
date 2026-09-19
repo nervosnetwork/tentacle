@@ -1,5 +1,5 @@
 use futures::{SinkExt, channel::mpsc, prelude::*, stream::iter};
-use log::{debug, error, log_enabled, trace, warn};
+use log::{debug, error, log_enabled, trace};
 use nohash_hasher::IntMap;
 use std::{
     collections::HashMap,
@@ -20,7 +20,7 @@ use crate::{
         QuickSinkExt,
         mpsc::{self as priority_mpsc, Priority},
     },
-    context::SessionContext,
+    context::{PendingDataGuard, SessionContext},
     error::{HandshakeErrorKind, ProtocolHandleErrorKind, TransportErrorKind},
     multiaddr::Multiaddr,
     protocol_handle_stream::{ServiceProtocolEvent, SessionProtocolEvent},
@@ -107,6 +107,8 @@ pub(crate) enum SessionEvent {
         proto_id: ProtocolId,
         /// Data
         data: bytes::Bytes,
+        /// Owns this message's send-buffer reservation while it is queued.
+        guard: PendingDataGuard,
     },
     /// Protocol open event
     ProtocolOpen {
@@ -360,6 +362,13 @@ impl Session {
         }
     }
 
+    /// Flush queued protocol messages towards their substreams.
+    ///
+    /// There is deliberately no send-buffer check here. The byte limit is
+    /// enforced before a message is admitted, in
+    /// [`crate::context::SessionContext::reserve_pending_data`], so
+    /// `pending_data_size` can never exceed `send_buffer_size` by the time it
+    /// reaches this point. Re-checking it here would be dead code.
     #[inline]
     fn distribute_to_substream(&mut self, cx: &mut Context) {
         for buffer in self
@@ -368,26 +377,6 @@ impl Session {
             .filter(|buffer| !buffer.is_empty())
         {
             if let SendResult::Pending = buffer.try_send(cx) {
-                if self.context.pending_data_size() > self.config.send_buffer_size {
-                    self.state = SessionState::Abnormal;
-                    warn!(
-                        "session {:?} unable to send message, \
-                         user allow buffer size: {}, \
-                         current buffer size: {}, so kill it",
-                        self.context,
-                        self.config.send_buffer_size,
-                        self.context.pending_data_size()
-                    );
-                    buffer.clear();
-                    self.event_output(
-                        cx,
-                        SessionEvent::ChangeState {
-                            id: self.context.id,
-                            state: SessionState::Abnormal,
-                            error: None,
-                        },
-                    );
-                }
                 break;
             }
         }
@@ -566,10 +555,14 @@ impl Session {
     /// Handling events send by the service
     fn handle_session_event(&mut self, cx: &mut Context, event: SessionEvent, priority: Priority) {
         match event {
-            SessionEvent::ProtocolMessage { proto_id, data, .. } => {
+            SessionEvent::ProtocolMessage {
+                proto_id,
+                data,
+                guard,
+            } => {
                 if let Some(stream_id) = self.proto_streams.get(&proto_id) {
                     if let Some(buffer) = self.substreams.get_mut(stream_id) {
-                        let event = ProtocolEvent::Message { data };
+                        let event = ProtocolEvent::Message { data, guard };
                         if priority.is_high() {
                             buffer.push_high(event)
                         } else {
