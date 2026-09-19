@@ -107,6 +107,8 @@ pub(crate) enum SessionEvent {
         proto_id: ProtocolId,
         /// Data
         data: bytes::Bytes,
+        /// Owns this message's send-buffer reservation while it is queued.
+        guard: PendingDataGuard,
     },
     /// Protocol open event
     ProtocolOpen {
@@ -553,10 +555,11 @@ impl Session {
     /// Handling events send by the service
     fn handle_session_event(&mut self, cx: &mut Context, event: SessionEvent, priority: Priority) {
         match event {
-            SessionEvent::ProtocolMessage { proto_id, data, .. } => {
-                // The guard owns the reserved bytes from here on: every path
-                // that drops the message below returns the capacity.
-                let guard = PendingDataGuard::new(self.context.clone(), data.len());
+            SessionEvent::ProtocolMessage {
+                proto_id,
+                data,
+                guard,
+            } => {
                 if let Some(stream_id) = self.proto_streams.get(&proto_id) {
                     if let Some(buffer) = self.substreams.get_mut(stream_id) {
                         let event = ProtocolEvent::Message { data, guard };

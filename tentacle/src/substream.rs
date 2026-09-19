@@ -131,9 +131,9 @@ pub(crate) enum ProtocolEvent {
 /// Historically only `write_buf.len()` was checked here, which allowed
 /// high-priority traffic (`quick_send_message`, `quick_filter_broadcast`) to
 /// grow `high_write_buf` past `send_event_size` while `write_buf` stayed
-/// empty. Both queues must be gated for the reverse-pressure signal that
-/// eventually reaches `Session::distribute_to_substream` and lets the
-/// per-session byte limit (`send_buffer_size`) fire on `pending_data_size`.
+/// empty. Both queues must be gated so item-count backpressure is applied
+/// consistently; the per-session byte limit is enforced separately before
+/// queue admission.
 #[inline]
 fn write_buf_over_threshold(
     write_buf_len: usize,

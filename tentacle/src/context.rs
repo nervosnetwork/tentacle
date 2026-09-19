@@ -61,62 +61,41 @@ impl SessionController {
         priority: Priority,
         proto_id: ProtocolId,
         data: Bytes,
-        reserved_size: Option<usize>,
+        mut guard: PendingDataGuard,
     ) -> bool {
         let data_size = data.len();
-        let accounted_size = if let Some(reserved_size) = reserved_size {
-            if self.inner.closed() {
-                self.inner.decr_pending_data_size(reserved_size);
-                return false;
-            }
+        if guard.context().closed() {
+            return false;
+        }
 
-            if data_size > reserved_size {
-                match self.inner.reserve_pending_data(data_size - reserved_size) {
-                    PendingDataReservation::Reserved => {}
-                    PendingDataReservation::LimitReached => {
-                        self.inner.decr_pending_data_size(reserved_size);
-                        let id = self.inner.id;
-                        let _ignore = self
-                            .send(Priority::High, SessionEvent::SessionClose { id })
-                            .await;
-                        return true;
-                    }
-                    PendingDataReservation::Closed => {
-                        self.inner.decr_pending_data_size(reserved_size);
-                        return false;
-                    }
-                }
-            } else {
-                self.inner.decr_pending_data_size(reserved_size - data_size);
+        match guard.resize(data_size) {
+            PendingDataReservation::Reserved => {}
+            PendingDataReservation::LimitReached => {
+                let id = self.inner.id;
+                let _ignore = self
+                    .send(Priority::High, SessionEvent::SessionClose { id })
+                    .await;
+                return true;
             }
-            data_size
-        } else {
-            match self.inner.reserve_pending_data(data_size) {
-                PendingDataReservation::Reserved => data_size,
-                PendingDataReservation::LimitReached => {
-                    let id = self.inner.id;
-                    let _ignore = self
-                        .send(Priority::High, SessionEvent::SessionClose { id })
-                        .await;
-                    return true;
-                }
-                PendingDataReservation::Closed => return false,
-            }
-        };
+            PendingDataReservation::Closed => return false,
+        }
 
         // A concurrent sender may have reached the limit after this message
         // reserved its bytes. Do not admit the message after that happens.
         if self.inner.closed() {
-            self.inner.decr_pending_data_size(accounted_size);
             return false;
         }
 
-        let result = self
-            .send(priority, SessionEvent::ProtocolMessage { proto_id, data })
+        let _ignore = self
+            .send(
+                priority,
+                SessionEvent::ProtocolMessage {
+                    proto_id,
+                    data,
+                    guard,
+                },
+            )
             .await;
-        if result.is_err() {
-            self.inner.decr_pending_data_size(accounted_size);
-        }
         false
     }
 }
@@ -234,13 +213,30 @@ impl SessionContext {
 ///
 /// Dropping the guard is the release; there is deliberately no way to leak it.
 pub(crate) struct PendingDataGuard {
-    context: Arc<SessionContext>,
+    context: SessionContext,
     size: usize,
 }
 
 impl PendingDataGuard {
-    pub(crate) fn new(context: Arc<SessionContext>, size: usize) -> Self {
+    pub(crate) fn new(context: SessionContext, size: usize) -> Self {
         Self { context, size }
+    }
+
+    pub(crate) fn context(&self) -> &SessionContext {
+        &self.context
+    }
+
+    pub(crate) fn resize(&mut self, size: usize) -> PendingDataReservation {
+        if size > self.size {
+            match self.context.reserve_pending_data(size - self.size) {
+                PendingDataReservation::Reserved => self.size = size,
+                result => return result,
+            }
+        } else if size < self.size {
+            self.context.decr_pending_data_size(self.size - size);
+            self.size = size;
+        }
+        PendingDataReservation::Reserved
     }
 }
 
@@ -525,15 +521,11 @@ impl ProtocolContextMutRef<'_> {
         let data_size = data.len();
         match self.session.reserve_pending_data(data_size) {
             PendingDataReservation::Reserved => {
-                let result = self
-                    .inner
+                let guard = PendingDataGuard::new(self.session.clone(), data_size);
+                self.inner
                     .control()
-                    .send_reserved_message_to(self.session.clone(), self.proto_id(), data, quick)
-                    .await;
-                if result.is_err() {
-                    self.session.decr_pending_data_size(data_size);
-                }
-                result
+                    .send_reserved_message_to(guard, self.proto_id(), data, quick)
+                    .await
             }
             PendingDataReservation::LimitReached => {
                 self.inner
@@ -611,40 +603,40 @@ mod pending_data_tests {
     }
 
     #[tokio::test]
-    async fn send_buffer_limit_is_checked_before_session_channel_admission() {
-        let (mut controller, _receiver) = controller();
-        assert!(
-            !controller
-                .send_message(
-                    Priority::Normal,
-                    1.into(),
-                    Bytes::from_static(b"1234"),
-                    None
-                )
-                .await
+    async fn resized_message_is_checked_before_session_channel_admission() {
+        let (mut controller, mut receiver) = controller();
+        assert_eq!(
+            controller.inner.reserve_pending_data(3),
+            PendingDataReservation::Reserved
         );
-        assert_eq!(controller.inner.pending_data_size(), 4);
+        let guard = PendingDataGuard::new(controller.inner.as_ref().clone(), 3);
 
         assert!(
             controller
-                .send_message(Priority::Normal, 1.into(), Bytes::from_static(b"5"), None)
+                .send_message(
+                    Priority::Normal,
+                    1.into(),
+                    Bytes::from_static(b"12345"),
+                    guard,
+                )
                 .await
         );
-        assert_eq!(controller.inner.pending_data_size(), 4);
+        assert_eq!(controller.inner.pending_data_size(), 0);
         assert!(controller.inner.closed());
-
-        // Reporting and close initiation are idempotent after the first breach.
-        assert!(
-            !controller
-                .send_message(Priority::Normal, 1.into(), Bytes::from_static(b"6"), None)
-                .await
-        );
-        assert_eq!(controller.inner.pending_data_size(), 4);
+        assert!(matches!(
+            receiver.next().await,
+            Some((Priority::High, SessionEvent::SessionClose { .. }))
+        ));
     }
 
     #[tokio::test]
     async fn closed_session_channel_rolls_back_reserved_bytes() {
         let (mut controller, receiver) = controller();
+        assert_eq!(
+            controller.inner.reserve_pending_data(4),
+            PendingDataReservation::Reserved
+        );
+        let guard = PendingDataGuard::new(controller.inner.as_ref().clone(), 4);
         drop(receiver);
         assert!(
             !controller
@@ -652,7 +644,7 @@ mod pending_data_tests {
                     Priority::Normal,
                     1.into(),
                     Bytes::from_static(b"data"),
-                    None
+                    guard,
                 )
                 .await
         );
@@ -687,15 +679,10 @@ mod pending_data_tests {
             .await
             .unwrap();
         assert_eq!(session.pending_data_size(), 4);
+        let (_, queued) = task_receiver.next().await.unwrap();
         assert!(matches!(
-            task_receiver.next().await,
-            Some((
-                _,
-                ServiceTask::ProtocolMessage {
-                    reserved: Some(_),
-                    ..
-                }
-            ))
+            &queued,
+            ServiceTask::ProtocolMessage { reservations, .. } if reservations.len() == 1
         ));
 
         protocol_context
@@ -709,6 +696,36 @@ mod pending_data_tests {
             task_receiver.next().await,
             Some((_, ServiceTask::SessionBlocked { .. }))
         ));
+        drop(queued);
+        assert_eq!(session.pending_data_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_protocol_send_releases_its_reservation() {
+        let (controller, _session_receiver) = controller();
+        let session = controller.inner.clone();
+        let (task_sender, mut task_receiver) = mpsc::channel(0);
+        let service_context = ServiceContext::new(task_sender, Arc::new(AtomicBool::new(false)));
+        let mut protocol_context = ProtocolContext::new(service_context, 1.into());
+
+        protocol_context
+            .as_mut(&session)
+            .send_message(Bytes::from_static(b"12"))
+            .await
+            .unwrap();
+        assert_eq!(session.pending_data_size(), 2);
+
+        let context = protocol_context.as_mut(&session);
+        let mut pending_send = Box::pin(context.send_message(Bytes::from_static(b"34")));
+        assert!(pending_send.as_mut().now_or_never().is_none());
+        assert_eq!(session.pending_data_size(), 4);
+
+        drop(pending_send);
+        assert_eq!(session.pending_data_size(), 2);
+
+        let (_, queued) = task_receiver.next().await.unwrap();
+        drop(queued);
+        assert_eq!(session.pending_data_size(), 0);
     }
 
     #[tokio::test]
@@ -743,7 +760,7 @@ mod pending_data_tests {
             session.reserve_pending_data(3),
             PendingDataReservation::Reserved
         );
-        let guard = PendingDataGuard::new(session.clone(), 3);
+        let guard = PendingDataGuard::new(session.as_ref().clone(), 3);
         assert_eq!(session.pending_data_size(), 3);
 
         // Simulates every queue between the session and the transport being
@@ -771,7 +788,7 @@ mod pending_data_tests {
                 session.reserve_pending_data(4),
                 PendingDataReservation::Reserved
             );
-            drop(PendingDataGuard::new(session.clone(), 4));
+            drop(PendingDataGuard::new(session.as_ref().clone(), 4));
             assert_eq!(session.pending_data_size(), 0);
         }
     }

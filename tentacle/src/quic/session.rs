@@ -38,7 +38,7 @@ use crate::{
     ProtocolId, StreamId, SubstreamReadPart,
     buffer::{Buffer, PriorityBuffer, SendResult},
     channel::mpsc::{self as priority_mpsc, Priority},
-    context::{PendingDataGuard, SessionContext},
+    context::SessionContext,
     protocol_handle_stream::{ServiceProtocolEvent, SessionProtocolEvent},
     protocol_select::{ProtocolInfo, client_select, server_select},
     quic::stream::QuicBiStream,
@@ -485,10 +485,11 @@ impl QuicSession {
     /// Handle an event injected by `InnerService`.
     fn handle_session_event(&mut self, cx: &mut Context, event: SessionEvent, priority: Priority) {
         match event {
-            SessionEvent::ProtocolMessage { proto_id, data, .. } => {
-                // The guard owns the reserved bytes from here on: every path
-                // that drops the message below returns the capacity.
-                let guard = PendingDataGuard::new(self.context.clone(), data.len());
+            SessionEvent::ProtocolMessage {
+                proto_id,
+                data,
+                guard,
+            } => {
                 if let Some(stream_id) = self.proto_streams.get(&proto_id) {
                     if let Some(buffer) = self.substreams.get_mut(stream_id) {
                         let event = ProtocolEvent::Message { data, guard };

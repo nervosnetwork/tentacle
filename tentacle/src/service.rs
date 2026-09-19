@@ -18,7 +18,7 @@ use crate::{
     ProtocolId, SessionId,
     buffer::Buffer,
     channel::{mpsc as priority_mpsc, mpsc::Priority},
-    context::{ServiceContext, SessionContext, SessionController},
+    context::{PendingDataGuard, ServiceContext, SessionContext, SessionController},
     error::{DialerErrorKind, ListenErrorKind, ProtocolHandleErrorKind, TransportErrorKind},
     multiaddr::{Multiaddr, Protocol},
     protocol_handle_stream::{
@@ -804,61 +804,40 @@ where
 
     async fn handle_message(
         &mut self,
-        target: TargetSession,
         proto_id: ProtocolId,
         priority: Priority,
         data: Bytes,
-        reserved: Option<SessionContext>,
+        reservations: Vec<PendingDataGuard>,
+        blocked: Vec<SessionContext>,
     ) {
-        let reserved_size = data.len();
-        if let Some(context) = &reserved
-            && context.closed()
-        {
-            context.decr_pending_data_size(reserved_size);
+        for context in blocked {
+            self.handle_blocked_session(context).await;
+        }
+
+        if reservations.is_empty() {
             return;
         }
+
         let data = match self.before_sends.get(&proto_id) {
             Some(function) => function(data),
             None => data,
         };
 
-        let session_ids: Vec<_> = match target {
-            TargetSession::Single(id) => vec![id],
-            TargetSession::Multi(iter) => iter.collect(),
-            TargetSession::Filter(mut filter) => self
-                .sessions
-                .keys()
-                .filter(|id| filter(id))
-                .copied()
-                .collect(),
-            TargetSession::All => self.sessions.keys().copied().collect(),
-        };
-
-        let mut reservation_consumed = false;
-        for id in session_ids {
+        for reservation in reservations {
+            let id = reservation.context().id;
             debug!(
                 "send message to session [{}], proto [{}], data len: {}",
                 id,
                 proto_id,
                 data.len()
             );
-            let message_reserved_size = reserved
-                .as_ref()
-                .filter(|context| context.id == id)
-                .map(|_| reserved_size);
-            if message_reserved_size.is_some() {
-                reservation_consumed = true;
-            }
 
             let blocked_context = if let Some(control) = self.sessions.get_mut(&id) {
                 control
-                    .send_message(priority, proto_id, data.clone(), message_reserved_size)
+                    .send_message(priority, proto_id, data.clone(), reservation)
                     .await
                     .then(|| control.inner.clone())
             } else {
-                if let (Some(context), Some(size)) = (&reserved, message_reserved_size) {
-                    context.decr_pending_data_size(size);
-                }
                 None
             };
             if let Some(session_context) = blocked_context {
@@ -868,11 +847,24 @@ where
                     .await;
             }
         }
+    }
 
-        // A reserved task is always single-session, but keep rollback local to
-        // the task in case its target disappeared or becomes inconsistent.
-        if !reservation_consumed && let Some(context) = reserved {
-            context.decr_pending_data_size(reserved_size);
+    async fn handle_blocked_session(&mut self, session_context: SessionContext) {
+        if let Some(control) = self.sessions.get_mut(&session_context.id) {
+            let context = control.inner.clone();
+            let id = context.id;
+            let _ignore = control
+                .send(Priority::High, SessionEvent::SessionClose { id })
+                .await;
+            let _ignore = self
+                .handle_sender
+                .send(
+                    ServiceError::SessionBlocked {
+                        session_context: context,
+                    }
+                    .into(),
+                )
+                .await;
         }
     }
 
@@ -1024,6 +1016,9 @@ where
         // must insert here, otherwise, the session protocol handle cannot be opened
         self.sessions
             .insert(session_control.inner.id, session_control);
+        self.service_context
+            .control()
+            .register_session(session_context.clone());
 
         // Open all session protocol handles
         let handles = self.session_handles_open(self.next_session);
@@ -1222,6 +1217,7 @@ where
         self.session_proto_handles.retain(|key, _| id != key.0);
 
         if let Some(session_control) = self.sessions.remove(&id) {
+            self.service_context.control().unregister_session(id);
             // Service handle processing flow
             let _ignore = self
                 .handle_sender
@@ -1593,31 +1589,16 @@ where
     async fn handle_service_task(&mut self, event: ServiceTask, priority: Priority) {
         match event {
             ServiceTask::ProtocolMessage {
-                target,
                 proto_id,
                 data,
-                reserved,
+                reservations,
+                blocked,
             } => {
-                self.handle_message(target, proto_id, priority, data, reserved)
+                self.handle_message(proto_id, priority, data, reservations, blocked)
                     .await;
             }
             ServiceTask::SessionBlocked { session_context } => {
-                if let Some(control) = self.sessions.get_mut(&session_context.id) {
-                    let context = control.inner.clone();
-                    let id = context.id;
-                    let _ignore = control
-                        .send(Priority::High, SessionEvent::SessionClose { id })
-                        .await;
-                    let _ignore = self
-                        .handle_sender
-                        .send(
-                            ServiceError::SessionBlocked {
-                                session_context: context,
-                            }
-                            .into(),
-                        )
-                        .await;
-                }
+                self.handle_blocked_session(session_context).await;
             }
             ServiceTask::Dial { address, target } => {
                 if !(self.dial_protocols.contains_key(&address)
