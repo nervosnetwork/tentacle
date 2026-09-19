@@ -237,6 +237,7 @@ impl<'a> Protocol<'a> {
                 w.put(bytes)
             }
             Protocol::P2P(b) => {
+                check_p2p(b).expect("invalid p2p multihash bytes");
                 w.put(encode::u32(P2P, &mut buf));
                 w.put(encode::usize(b.len(), &mut encode::usize_buffer()));
                 w.put(&b[..])
