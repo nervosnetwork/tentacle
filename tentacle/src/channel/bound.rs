@@ -591,6 +591,32 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// Tries to receive the next high-priority message without draining the
+    /// normal-priority queue.
+    pub(crate) fn try_next_high(&mut self) -> Result<Option<T>, TryRecvError> {
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("Receiver::try_next_high called after `None`");
+
+        match unsafe { inner.quick_message_queue.pop_spin() } {
+            Some(msg) => {
+                self.unpark_one();
+                self.dec_num_messages();
+                Ok(Some(msg))
+            }
+            None => {
+                let state = decode_state(inner.state.load(SeqCst));
+                if state.is_closed() {
+                    self.inner = None;
+                    Ok(None)
+                } else {
+                    Err(TryRecvError { _priv: () })
+                }
+            }
+        }
+    }
+
     fn next_message(&mut self) -> Poll<Option<(Priority, T)>> {
         let inner = self
             .inner
