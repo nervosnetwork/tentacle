@@ -55,6 +55,13 @@ impl<T> PriorityBuffer<T> {
     }
 
     pub fn try_send(&mut self, cx: &mut Context) -> SendResult {
+        self.try_send_with_drop(cx, |_| {})
+    }
+
+    pub fn try_send_with_drop<F>(&mut self, cx: &mut Context, mut on_drop: F) -> SendResult
+    where
+        F: FnMut(T),
+    {
         while let Some(event) = self.high_buffer.pop_front() {
             match self.sender.poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
@@ -63,7 +70,8 @@ impl<T> PriorityBuffer<T> {
                             self.high_buffer.push_front(e.into_inner());
                             return SendResult::Pending;
                         } else {
-                            self.clear();
+                            on_drop(e.into_inner());
+                            self.clear_with(&mut on_drop);
                             return SendResult::Disconnect;
                         }
                     }
@@ -73,7 +81,8 @@ impl<T> PriorityBuffer<T> {
                     return SendResult::Pending;
                 }
                 Poll::Ready(Err(_)) => {
-                    self.clear();
+                    on_drop(event);
+                    self.clear_with(&mut on_drop);
                     return SendResult::Disconnect;
                 }
             }
@@ -86,7 +95,8 @@ impl<T> PriorityBuffer<T> {
                             self.normal_buffer.push_front(e.into_inner());
                             return SendResult::Pending;
                         } else {
-                            self.clear();
+                            on_drop(e.into_inner());
+                            self.clear_with(&mut on_drop);
                             return SendResult::Disconnect;
                         }
                     }
@@ -96,7 +106,8 @@ impl<T> PriorityBuffer<T> {
                     return SendResult::Pending;
                 }
                 Poll::Ready(Err(_)) => {
-                    self.clear();
+                    on_drop(event);
+                    self.clear_with(&mut on_drop);
                     return SendResult::Disconnect;
                 }
             }
@@ -105,9 +116,16 @@ impl<T> PriorityBuffer<T> {
         SendResult::Ok
     }
 
-    pub fn clear(&mut self) {
-        self.high_buffer.clear();
-        self.normal_buffer.clear();
+    pub fn clear_with<F>(&mut self, mut on_drop: F)
+    where
+        F: FnMut(T),
+    {
+        for event in self.high_buffer.drain(..) {
+            on_drop(event);
+        }
+        for event in self.normal_buffer.drain(..) {
+            on_drop(event);
+        }
     }
 }
 
