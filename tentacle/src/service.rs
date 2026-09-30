@@ -427,10 +427,67 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{builder::ServiceBuilder, secio::SecioKeyPair};
+
+    #[test]
+    fn pre_shutdown_ignores_late_handshake_success() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut service = ServiceBuilder::<SecioKeyPair>::default()
+                .forever(true)
+                .build(());
+            let mut inner = service.inner_service.take().unwrap();
+            inner.state.pre_shutdown();
+
+            let (stream, _peer) = tokio::io::duplex(64);
+            inner
+                .handle_session_event(SessionEvent::HandshakeSuccess {
+                    handle: Box::new(stream),
+                    public_key: None,
+                    address: "/ip4/127.0.0.1/tcp/1337".parse().unwrap(),
+                    ty: SessionType::Inbound,
+                    listen_address: None,
+                })
+                .await;
+
+            assert!(inner.sessions.is_empty());
+        });
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn pre_shutdown_ignores_late_listen_start() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut service = ServiceBuilder::<SecioKeyPair>::default()
+                .forever(true)
+                .build(());
+            let mut inner = service.inner_service.take().unwrap();
+            inner.state.pre_shutdown();
+
+            inner
+                .handle_session_event(SessionEvent::ListenStart {
+                    listen_address: "/ip4/127.0.0.1/tcp/1337".parse().unwrap(),
+                    incoming: MultiIncoming::TcpUpgrade,
+                })
+                .await;
+
+            assert!(inner.listens.is_empty());
+        });
+    }
+}
+
 impl<K> InnerService<K>
 where
     K: KeyProvider,
 {
+    fn is_pre_shutdown(&self) -> bool {
+        matches!(self.state, State::PreShutdown)
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn spawn_listener(&mut self, incoming: MultiIncoming, listen_address: Multiaddr) {
         let listener = Listener {
@@ -1382,7 +1439,7 @@ where
         match event {
             SessionEvent::SessionClose { id } => self.session_close(id, Source::Internal).await,
             SessionEvent::HandshakeSuccess {
-                handle,
+                mut handle,
                 public_key,
                 address,
                 ty,
@@ -1390,6 +1447,15 @@ where
             } => {
                 if ty.is_outbound() {
                     self.state.decrease();
+                }
+                if self.is_pre_shutdown() {
+                    if ty.is_outbound() {
+                        self.dial_protocols.remove(&address);
+                    }
+                    crate::runtime::spawn(async move {
+                        let _ignore = handle.shutdown().await;
+                    });
+                    return;
                 }
                 if !self.reached_max_connection_limit() {
                     self.session_open(handle, public_key, address, ty, listen_address)
@@ -1400,6 +1466,16 @@ where
             SessionEvent::QuicListenAccepted(accepted) => {
                 if accepted.ty.is_outbound() {
                     self.state.decrease();
+                }
+                if self.is_pre_shutdown() {
+                    if accepted.ty.is_outbound() {
+                        self.dial_protocols.remove(&accepted.address);
+                    }
+                    accepted
+                        .session
+                        .connection()
+                        .close(0u32.into(), b"shutdown");
+                    return;
                 }
                 if !self.reached_max_connection_limit() {
                     self.quic_session_open(
@@ -1540,6 +1616,11 @@ where
                 listen_address,
                 incoming,
             } => {
+                if self.is_pre_shutdown() {
+                    self.state.decrease();
+                    drop(incoming);
+                    return;
+                }
                 let _ignore = self
                     .handle_sender
                     .send(
