@@ -1,3 +1,47 @@
+## tentacle 0.7.8
+
+### Bug fix
+- Fixed a QUIC accept-loop denial of service. Inbound handshakes were driven one
+  at a time, and a QUIC listener cannot know who a peer is until its TLS
+  handshake completes, so any unauthenticated peer could open a connection, go
+  silent, and stall the whole listener until that handshake expired — about 30
+  seconds with the default `max_idle_timeout`, repeatable indefinitely.
+  Handshakes now run concurrently, each under an explicit deadline and with a
+  bound on how many may be in flight at once.
+
+### Features
+- Add `QuicConfig::handshake_timeout` (default 10s): deadline for a single
+  inbound handshake. Independent of `max_idle_timeout`, which only applies once
+  a connection is established.
+- Add `QuicConfig::max_pending_handshakes` (default 128): how many inbound
+  handshakes may be in flight at once, shared by every QUIC listener of a
+  `Service`. Peers arriving beyond the bound are refused immediately, capping
+  the work and memory a stranger can make a node allocate before it has
+  authenticated anyone.
+- Add `QuicListener::for_each_handshake` for projects that drive a QUIC listener
+  themselves instead of using `Service`. It applies the same concurrency and
+  bounds the service uses; the callback receives already-verified handshakes and
+  returns `ControlFlow` to keep serving or stop.
+- Add `HandshakeCapacity`, the shared in-flight handshake budget. Clone it to
+  share one budget across several listeners; `available()` reports free slots,
+  which is a useful health metric — a listener sitting at zero is being kept
+  busy by peers that never finish their handshakes.
+- Add the `quic_service` example, showing the configuration knobs and that a
+  peer parked mid-handshake no longer delays anyone else.
+
+### Breaking changes
+- Deprecate `QuicListener::accept`. Calling it in a loop serialises handshakes,
+  which is the denial of service above. It still works and is now bounded by
+  `QuicConfig::handshake_timeout`, but new code should use
+  `QuicListener::for_each_handshake`.
+- `QuicConfig` gained the two public fields above. Construct it with
+  `..QuicConfig::default()` rather than listing every field.
+- `QuicErrorKind` gained a `HandshakeTimedOut` variant.
+- `QuicEndpoint::new` now rejects a zero `handshake_timeout` or an out-of-range
+  `max_pending_handshakes` with `QuicErrorKind::Misconfigured`, surfaced at
+  listen/dial time like any other QUIC misconfiguration.
+- The `quic` feature now also enables `tokio/sync`.
+
 ## tentacle 0.7.5 yamux 0.3.18
 
 ### Bug fix

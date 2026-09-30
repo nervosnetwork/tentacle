@@ -97,6 +97,10 @@ required-features = ["unstable"]
 name = "quic_simple"
 required-features = ["quic"]
 
+[[example]]
+name = "quic_service"
+required-features = ["quic"]
+
 [[test]]
 name = "test_quic_verifier"
 required-features = ["quic"]
@@ -119,4 +123,4 @@ tokio-runtime = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread"]
 
 generic-timer = ["futures-timer", "yamux/generic-timer"]
 wasm-timer = ["futures-timer", "yamux/wasm", "futures-timer/wasm-bindgen"]
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:x509-parser", "dep:ring"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:x509-parser", "dep:ring", "tokio/sync"]

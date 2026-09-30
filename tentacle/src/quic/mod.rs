@@ -54,5 +54,7 @@ pub mod stream;
 /// parsing helpers.
 pub mod endpoint;
 
+pub(crate) mod incoming;
+
 /// QUIC-backed tentacle session main loop.
 pub mod session;
