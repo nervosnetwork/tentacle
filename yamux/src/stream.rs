@@ -148,15 +148,26 @@ impl StreamHandle {
     // Send a window update
     pub(crate) fn send_window_update(&mut self) -> Result<(), Error> {
         let buf_len = self.read_buf.iter().map(|b| b.len()).sum::<usize>() as u32;
-        let delta = self.max_recv_window - buf_len - self.recv_window;
+        // `buf_len + recv_window` should never exceed `max_recv_window`, but use
+        // saturating arithmetic so that a broken invariant degrades into a
+        // zero-sized update instead of panicking in debug builds or wrapping
+        // into a huge window update in release builds.
+        let delta = self
+            .max_recv_window
+            .saturating_sub(buf_len)
+            .saturating_sub(self.recv_window);
 
         // Check if we can omit the update
         let flags = self.get_flags();
         if delta < (self.max_recv_window / 2) && flags.value() == 0 {
             return Ok(());
         }
-        // Update our window
-        self.recv_window += delta;
+        // Update our window, clamping to the configured maximum as a second
+        // line of defense.
+        self.recv_window = self
+            .recv_window
+            .saturating_add(delta)
+            .min(self.max_recv_window);
         let frame = Frame::new_window_update(flags, self.id, delta);
         self.unbound_event_sender
             .unbounded_send(StreamEvent::Frame(frame))
@@ -863,6 +874,39 @@ mod test {
             match event {
                 StreamEvent::Frame(frame) => assert!(frame.ty() == Type::Data),
                 _ => panic!("must be a frame msg"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_send_window_update_underflow_is_saturating() {
+        let rt = rt();
+        rt.block_on(async {
+            let (_frame_sender, frame_receiver) = channel(2);
+            let (unbound_sender, mut unbound_receiver) = unbounded();
+            let mut stream = StreamHandle::new(
+                0,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                INITIAL_STREAM_WINDOW,
+            );
+
+            // Simulate a broken invariant: more accounted window than the
+            // configured maximum. Computing `max - buf_len - recv_window` must
+            // not underflow.
+            stream.recv_window = INITIAL_STREAM_WINDOW + 1;
+
+            stream.send_window_update().unwrap();
+            assert_eq!(stream.recv_window, INITIAL_STREAM_WINDOW);
+
+            // A window update frame is still emitted (the Syn flag forces it).
+            match unbound_receiver.next().await.unwrap() {
+                StreamEvent::Frame(frame) => {
+                    assert_eq!(frame.ty(), Type::WindowUpdate);
+                    assert_eq!(frame.length(), 0);
+                }
+                _ => panic!("must be a window update msg"),
             }
         });
     }
