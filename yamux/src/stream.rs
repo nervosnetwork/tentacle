@@ -1,6 +1,6 @@
 //! The substream, the main interface is AsyncRead/AsyncWrite
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use futures::{
     Stream,
     channel::mpsc::{Receiver, UnboundedSender},
@@ -25,6 +25,9 @@ use crate::{
     frame::{Flag, Flags, Frame, Type},
 };
 
+// Bound per-frame metadata by coalescing small DATA frames into larger chunks.
+const READ_BUF_CHUNK_SIZE: usize = 16 * 1024;
+
 /// The substream
 #[derive(Debug)]
 pub struct StreamHandle {
@@ -35,6 +38,8 @@ pub struct StreamHandle {
     pub(crate) recv_window: u32,
     send_window: u32,
     read_buf: Vec<BytesMut>,
+    // Cached sum of all chunk lengths, used for O(1) receive-window accounting.
+    read_buf_len: usize,
 
     // Send stream event to parent session
     unbound_event_sender: UnboundedSender<StreamEvent>,
@@ -67,6 +72,7 @@ impl StreamHandle {
             recv_window: INITIAL_STREAM_WINDOW,
             send_window: INITIAL_STREAM_WINDOW,
             read_buf: Vec::new(),
+            read_buf_len: 0,
             unbound_event_sender,
             frame_receiver,
             writeable_wake: None,
@@ -147,7 +153,7 @@ impl StreamHandle {
 
     // Send a window update
     pub(crate) fn send_window_update(&mut self) -> Result<(), Error> {
-        let buf_len = self.read_buf.iter().map(|b| b.len()).sum::<usize>() as u32;
+        let buf_len = self.read_buf_len as u32;
         let delta = self.max_recv_window - buf_len - self.recv_window;
 
         // Check if we can omit the update
@@ -259,12 +265,32 @@ impl StreamHandle {
         if let Some(data) = body {
             // yamux allows empty data frame
             // but here we just drop it
-            if length > 0 {
-                self.read_buf.push(data);
+            //
+            // Account with the actual payload size instead of the header length, so
+            // `read_buf_len` can never drift away from the real content of `read_buf`
+            // even if a frame were ever built with a mismatching header.
+            if !data.is_empty() {
+                self.read_buf_len += data.len();
+                self.push_read_data(data);
             }
         }
         self.recv_window -= length;
         Ok(())
+    }
+
+    fn push_read_data(&mut self, mut data: BytesMut) {
+        if let Some(last) = self.read_buf.last_mut() {
+            if last.len() < READ_BUF_CHUNK_SIZE {
+                let append_len = data.len().min(READ_BUF_CHUNK_SIZE - last.len());
+                last.put_slice(&data[..append_len]);
+                if append_len == data.len() {
+                    return;
+                }
+                data = data.split_off(append_len);
+            }
+        }
+
+        self.read_buf.push(data);
     }
 
     fn recv_frames(&mut self, cx: &mut Context) -> Result<bool, Error> {
@@ -335,14 +361,14 @@ impl StreamHandle {
     }
 
     fn recv_frames_wake(&mut self) -> Result<(), Error> {
-        let buf_len = self.read_buf.len();
+        let buf_len = self.read_buf_len;
         let state = self.state;
         match self.try_recv_frames() {
             Ok(should_wake_read) => {
                 // if state change to RemoteClosing, wake read
                 // if read buf len change, wake read
                 if (self.state == StreamState::RemoteClosing && state != StreamState::RemoteClosing)
-                    || (should_wake_read && buf_len != self.read_buf.len())
+                    || (should_wake_read && buf_len != self.read_buf_len)
                 {
                     if let Some(waker) = self.readable_wake.take() {
                         waker.wake();
@@ -367,7 +393,7 @@ impl StreamHandle {
     // Returns Ok(true) only if eof is reached.
     fn check_self_state(&mut self) -> io::Result<bool> {
         // if read buf is empty and state is close, return close error
-        if self.read_buf.is_empty() {
+        if self.read_buf_len == 0 {
             match self.state {
                 StreamState::RemoteClosing | StreamState::Closed => {
                     debug!("closed(EOF)");
@@ -483,14 +509,14 @@ impl AsyncRead for StreamHandle {
             }
             total_read += n;
         }
+        self.read_buf_len -= total_read;
         if let Some(offset) = offset {
+            // `drain` keeps the spare capacity, but since incoming data is coalesced
+            // into `READ_BUF_CHUNK_SIZE` chunks the chunk count is bounded by
+            // `max_recv_window / READ_BUF_CHUNK_SIZE + 1`, so the vector capacity is no
+            // longer influenced by how the peer fragments its frames and there is
+            // nothing worth shrinking here.
             self.read_buf.drain(..=offset);
-            // drain does not shrink the capacity, if the capacity is too large, shrink it
-            if self.read_buf.capacity() > 24
-                && self.read_buf.capacity() / (self.read_buf.len() + 1) > 4
-            {
-                self.read_buf.shrink_to_fit();
-            }
         }
 
         trace!(
@@ -655,9 +681,10 @@ pub enum StreamState {
 
 #[cfg(test)]
 mod test {
-    use super::{StreamEvent, StreamHandle, StreamState};
+    use super::{READ_BUF_CHUNK_SIZE, StreamEvent, StreamHandle, StreamState};
     use crate::{
         config::INITIAL_STREAM_WINDOW,
+        error::Error,
         frame::{Flag, Flags, Frame, Type},
         session::rt,
     };
@@ -1012,14 +1039,13 @@ mod test {
 
             assert_eq!(stream.read(&mut b).await.unwrap(), 2);
             assert_eq!(&b[..2], b"12");
-            assert_eq!(stream.read_buf.len(), 2);
-            assert_eq!(stream.read_buf.capacity(), 4);
+            assert_eq!(stream.read_buf.len(), 1);
+            assert_eq!(stream.read_buf_len, 6);
 
             assert_eq!(stream.read(&mut b).await.unwrap(), 2);
             assert_eq!(&b[..2], b"34");
             assert_eq!(stream.read_buf.len(), 1);
-            // Drain does not shrink the capacity
-            assert_eq!(stream.read_buf.capacity(), 4);
+            assert_eq!(stream.read_buf_len, 4);
 
             let flags = Flags::from(Flag::Syn);
             let frame = Frame::new_data(flags, 0, BytesMut::default());
@@ -1032,12 +1058,111 @@ mod test {
             assert_eq!(stream.read(&mut c).await.unwrap(), 5);
             assert_eq!(&c[..5], b"56781");
             assert_eq!(stream.read_buf.len(), 1);
-            assert_eq!(stream.read_buf.capacity(), 4);
+            assert_eq!(stream.read_buf_len, 3);
 
             assert_eq!(stream.read(&mut b).await.unwrap(), 2);
             assert_eq!(&b[..2], b"23");
             assert_eq!(stream.read_buf.len(), 1);
-            assert_eq!(stream.read_buf.capacity(), 4);
+            assert_eq!(stream.read_buf_len, 1);
+        });
+    }
+
+    #[test]
+    fn test_fragmented_data_is_coalesced_within_default_window() {
+        let (_frame_sender, frame_receiver) = channel(1);
+        let (unbound_sender, _unbound_receiver) = unbounded();
+        let mut stream = StreamHandle::new(
+            0,
+            unbound_sender,
+            frame_receiver,
+            StreamState::Init,
+            INITIAL_STREAM_WINDOW,
+        );
+        stream.state = StreamState::Established;
+
+        for _ in 0..INITIAL_STREAM_WINDOW {
+            let frame = Frame::new_data(Flags::default(), 0, BytesMut::from(&b"x"[..]));
+            stream.handle_data(frame).unwrap();
+        }
+
+        assert_eq!(stream.recv_window, 0);
+        assert_eq!(stream.read_buf_len, INITIAL_STREAM_WINDOW as usize);
+        assert_eq!(
+            stream.read_buf.len(),
+            INITIAL_STREAM_WINDOW as usize / READ_BUF_CHUNK_SIZE
+        );
+        assert!(
+            stream
+                .read_buf
+                .iter()
+                .all(|chunk| chunk.len() == READ_BUF_CHUNK_SIZE)
+        );
+
+        let extra = Frame::new_data(Flags::default(), 0, BytesMut::from(&b"x"[..]));
+        assert_eq!(stream.handle_data(extra), Err(Error::RecvWindowExceeded));
+        stream.send_window_update().unwrap();
+        assert_eq!(stream.recv_window, 0);
+    }
+
+    #[test]
+    fn test_fragmented_data_across_chunk_boundary_updates_accounting() {
+        let rt = rt();
+        rt.block_on(async {
+            let (_frame_sender, frame_receiver) = channel(1);
+            let (unbound_sender, mut unbound_receiver) = unbounded();
+            let max_window = ((READ_BUF_CHUNK_SIZE + 1) * 2) as u32;
+            let mut stream = StreamHandle::new(
+                0,
+                unbound_sender,
+                frame_receiver,
+                StreamState::Init,
+                max_window,
+            );
+            stream.state = StreamState::Established;
+            stream.recv_window = max_window;
+
+            let first = vec![b'a'; READ_BUF_CHUNK_SIZE - 1];
+            stream
+                .handle_data(Frame::new_data(
+                    Flags::default(),
+                    0,
+                    BytesMut::from(first.as_slice()),
+                ))
+                .unwrap();
+            stream
+                .handle_data(Frame::new_data(
+                    Flags::default(),
+                    0,
+                    BytesMut::from(&b"bc"[..]),
+                ))
+                .unwrap();
+
+            assert_eq!(stream.read_buf.len(), 2);
+            assert_eq!(stream.read_buf[0].len(), READ_BUF_CHUNK_SIZE);
+            assert_eq!(stream.read_buf[1].len(), 1);
+            assert_eq!(stream.read_buf_len, READ_BUF_CHUNK_SIZE + 1);
+
+            let mut first_output = vec![0; READ_BUF_CHUNK_SIZE];
+            stream.read_exact(&mut first_output).await.unwrap();
+            assert_eq!(&first_output[..READ_BUF_CHUNK_SIZE - 1], first.as_slice());
+            assert_eq!(first_output[READ_BUF_CHUNK_SIZE - 1], b'b');
+            assert_eq!(stream.read_buf.len(), 1);
+            assert_eq!(stream.read_buf_len, 1);
+
+            let mut last_output = [0];
+            stream.read_exact(&mut last_output).await.unwrap();
+            assert_eq!(last_output, [b'c']);
+            assert!(stream.read_buf.is_empty());
+            assert_eq!(stream.read_buf_len, 0);
+            assert_eq!(stream.recv_window, max_window);
+
+            match unbound_receiver.next().await.unwrap() {
+                StreamEvent::Frame(frame) => {
+                    assert_eq!(frame.ty(), Type::WindowUpdate);
+                    assert_eq!(frame.length(), (READ_BUF_CHUNK_SIZE + 1) as u32);
+                }
+                _ => panic!("must be a window update frame"),
+            }
         });
     }
 
@@ -1232,8 +1357,8 @@ mod test {
         });
     }
 
-    // Verifies that when `poll_write` calls `try_recv_frames()` and intercepts an
-    // incoming DATA frame (i.e. the read buffer grows), it proactively wakes the
+    // Verifies that when `poll_write` calls `try_recv_frames()` and intercepts
+    // incoming DATA frames (i.e. the read buffer grows), it proactively wakes the
     // parked read task via `readable_wake`.
     //
     // Motivation:
@@ -1254,8 +1379,8 @@ mod test {
     //
     // Test sequence (fully deterministic, no async scheduler involvement):
     //   1. poll_read(read_cx)  → Pending, readable_wake = read_waker.
-    //   2. Pre-queue a data frame in frame_sender (already available synchronously).
-    //   3. poll_write(write_cx) → try_recv_frames() drains the data frame →
+    //   2. Pre-queue data frames in frame_sender (already available synchronously).
+    //   3. poll_write(write_cx) → try_recv_frames() drains the data frames →
     //      read_buf grows → recv_frames_wake detects buf change →
     //      readable_wake.take().wake() → read_fw.woken() == true.
     #[test]
@@ -1290,14 +1415,21 @@ mod test {
             );
             assert!(!read_fw.woken(), "read_waker must not be woken yet");
 
-            // Step 2: pre-queue a data frame so it is ready for synchronous delivery.
-            let frame = Frame::new_data(Flags::from(Flag::Syn), 1, BytesMut::from("hello"));
-            frame_sender
-                .try_send(frame)
-                .expect("channel must accept frame");
+            // Step 2: pre-queue fragmented data so it is ready for synchronous delivery.
+            for (index, byte) in [b'a', b'b', b'c'].into_iter().enumerate() {
+                let flags = if index == 0 {
+                    Flags::from(Flag::Syn)
+                } else {
+                    Flags::default()
+                };
+                let frame = Frame::new_data(flags, 1, BytesMut::from(&[byte][..]));
+                frame_sender
+                    .try_send(frame)
+                    .expect("channel must accept frame");
+            }
 
             // Step 3: poll_write → recv_frames_wake → try_recv_frames() drains the data
-            //   frame synchronously → read_buf grows from 0 to 1 → buf_len check triggers
+            //   frames synchronously → read_buf grows from 0 to 3 bytes → buf_len check triggers
             //   → readable_wake.take().wake() → read_fw.woken() == true.
             let r = Pin::new(&mut stream).poll_write(&mut write_cx, b"ping");
             assert!(
@@ -1312,12 +1444,14 @@ mod test {
                  data is already sitting in read_buf"
             );
 
-            // Sanity: the data frame really did land in read_buf.
+            // Sanity: the data frames really did land in read_buf.
             assert_eq!(
                 stream.read_buf.len(),
                 1,
-                "data frame must be in read_buf after try_recv_frames()"
+                "fragmented data must be coalesced after try_recv_frames()"
             );
+            assert_eq!(stream.read_buf_len, 3);
+            assert_eq!(&stream.read_buf[0][..], b"abc");
         });
     }
 }
