@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use crate::{
     ProtocolId, SessionId,
-    context::SessionContext,
+    context::{PendingDataGuard, SessionContext},
     error::{DialerErrorKind, ListenErrorKind, ProtocolHandleErrorKind},
     multiaddr::Multiaddr,
-    service::{TargetProtocol, TargetSession, future_task::BoxedFutureTask},
+    service::{TargetProtocol, future_task::BoxedFutureTask},
 };
 use bytes::Bytes;
 
@@ -148,14 +148,18 @@ pub enum ServiceEvent {
 pub(crate) enum ServiceTask {
     /// Send protocol data task
     ProtocolMessage {
-        /// Specify which sessions to send to,
-        /// None means broadcast
-        target: TargetSession,
         /// protocol id
         proto_id: ProtocolId,
         /// data
         data: Bytes,
+        /// One pre-queue byte reservation for every concrete target session.
+        reservations: Vec<PendingDataGuard>,
+        /// Sessions whose send-buffer limit was reached during admission.
+        blocked: Vec<SessionContext>,
     },
+    /// A protocol sender exceeded a session's pending-byte limit before its
+    /// message entered the service queue.
+    SessionBlocked { session_context: SessionContext },
     /// Open specify protocol
     ProtocolOpen {
         /// Session id
@@ -275,6 +279,9 @@ impl fmt::Debug for ServiceTask {
         match self {
             ProtocolMessage { proto_id, data, .. } => {
                 write!(f, "proto_id: {}, message: {:?}", proto_id, data)
+            }
+            SessionBlocked { session_context } => {
+                write!(f, "session({}) send buffer blocked", session_context.id)
             }
             SetProtocolNotify {
                 proto_id, token, ..

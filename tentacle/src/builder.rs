@@ -129,6 +129,18 @@ where
     }
 
     /// Set send buffer size, default is 24Mb
+    ///
+    /// This bounds how many outbound bytes may be *queued* for one session at
+    /// any instant — not how many may be sent in total. Capacity is reserved
+    /// when a message is accepted and released once it stops being queued, so
+    /// a session draining normally can send any amount of data.
+    ///
+    /// The limit is admission-controlled: a message that would push a session
+    /// over it is refused and that session is closed, reported as
+    /// [`ServiceError::SessionBlocked`]. In particular, a single message larger
+    /// than `size` is always refused, even to a peer that is reading quickly.
+    ///
+    /// [`ServiceError::SessionBlocked`]: crate::service::ServiceError::SessionBlocked
     pub fn set_send_buffer_size(mut self, size: usize) -> Self {
         self.config.session_config.send_buffer_size = size;
         self

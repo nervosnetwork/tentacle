@@ -18,7 +18,7 @@ use crate::{
     buffer::{Buffer, SendResult},
     builder::BeforeReceive,
     channel::{mpsc as priority_mpsc, mpsc::Priority},
-    context::SessionContext,
+    context::{PendingDataGuard, SessionContext},
     protocol_handle_stream::{ServiceProtocolEvent, SessionProtocolEvent},
     service::config::SessionConfig,
     traits::Codec,
@@ -75,6 +75,10 @@ impl AsyncWrite for SubstreamInner {
     }
 }
 
+/// A frame waiting to be written, together with the send-buffer capacity it
+/// still occupies. Dropping it returns that capacity to the session.
+pub(crate) type PendingFrame = (bytes::Bytes, PendingDataGuard);
+
 /// Event generated/received by the protocol stream
 #[derive(Debug)]
 pub(crate) enum ProtocolEvent {
@@ -98,6 +102,9 @@ pub(crate) enum ProtocolEvent {
     Message {
         /// Data
         data: bytes::Bytes,
+        /// Send-buffer capacity reserved for `data`. Travels with the message
+        /// so that discarding it anywhere returns the capacity.
+        guard: PendingDataGuard,
     },
     SelectError {
         proto_name: Option<String>,
@@ -124,9 +131,9 @@ pub(crate) enum ProtocolEvent {
 /// Historically only `write_buf.len()` was checked here, which allowed
 /// high-priority traffic (`quick_send_message`, `quick_filter_broadcast`) to
 /// grow `high_write_buf` past `send_event_size` while `write_buf` stayed
-/// empty. Both queues must be gated for the reverse-pressure signal that
-/// eventually reaches `Session::distribute_to_substream` and lets the
-/// per-session byte limit (`send_buffer_size`) fire on `pending_data_size`.
+/// empty. Both queues must be gated so item-count backpressure is applied
+/// consistently; the per-session byte limit is enforced separately before
+/// queue admission.
 #[inline]
 fn write_buf_over_threshold(
     write_buf_len: usize,
@@ -147,9 +154,9 @@ pub(crate) struct Substream<U> {
 
     config: SessionConfig,
     /// The buffer will be prioritized for send to underlying network
-    high_write_buf: VecDeque<bytes::Bytes>,
+    high_write_buf: VecDeque<PendingFrame>,
     // The buffer which will send to underlying network
-    write_buf: VecDeque<bytes::Bytes>,
+    write_buf: VecDeque<PendingFrame>,
     dead: bool,
     keep_buffer: bool,
 
@@ -180,7 +187,7 @@ where
         }
     }
 
-    fn push_front(&mut self, priority: Priority, frame: bytes::Bytes) {
+    fn push_front(&mut self, priority: Priority, frame: PendingFrame) {
         if priority.is_high() {
             self.high_write_buf.push_front(frame);
         } else {
@@ -188,7 +195,7 @@ where
         }
     }
 
-    fn push_back(&mut self, priority: Priority, frame: bytes::Bytes) {
+    fn push_back(&mut self, priority: Priority, frame: PendingFrame) {
         if priority.is_high() {
             self.high_write_buf.push_back(frame);
         } else {
@@ -202,20 +209,22 @@ where
     fn send_inner(
         &mut self,
         cx: &mut Context,
-        frame: bytes::Bytes,
+        frame: PendingFrame,
         priority: Priority,
     ) -> Result<bool, io::Error> {
-        let data_size = frame.len();
+        let (data, guard) = frame;
         let mut sink = Pin::new(&mut self.substream);
 
         match sink.as_mut().poll_ready(cx)? {
             Poll::Ready(()) => {
-                sink.as_mut().start_send(frame)?;
-                self.context.decr_pending_data_size(data_size);
+                sink.as_mut().start_send(data)?;
+                // `guard` drops here: the bytes are no longer queued by us,
+                // whether `start_send` accepted them or returned an error.
+                drop(guard);
                 Ok(false)
             }
             Poll::Pending => {
-                self.push_front(priority, frame);
+                self.push_front(priority, (data, guard));
                 self.poll_complete(cx)?;
                 Ok(true)
             }
@@ -329,8 +338,8 @@ where
     /// Handling commands send by session
     fn handle_proto_event(&mut self, cx: &mut Context, event: ProtocolEvent, priority: Priority) {
         match event {
-            ProtocolEvent::Message { data } => {
-                self.push_back(priority, data);
+            ProtocolEvent::Message { data, guard } => {
+                self.push_back(priority, (data, guard));
 
                 if let Err(err) = self.send_data(cx) {
                     // Whether it is a read send error or a flush error,
@@ -678,9 +687,9 @@ pub(crate) struct SubstreamWritePart<U> {
     config: SessionConfig,
 
     /// The buffer will be prioritized for send to underlying network
-    high_write_buf: VecDeque<bytes::Bytes>,
+    high_write_buf: VecDeque<PendingFrame>,
     // The buffer which will send to underlying network
-    write_buf: VecDeque<bytes::Bytes>,
+    write_buf: VecDeque<PendingFrame>,
 
     /// Send event to session
     event_sender: Buffer<ProtocolEvent>,
@@ -694,7 +703,7 @@ impl<U> SubstreamWritePart<U>
 where
     U: Codec + Unpin,
 {
-    fn push_front(&mut self, priority: Priority, frame: bytes::Bytes) {
+    fn push_front(&mut self, priority: Priority, frame: PendingFrame) {
         if priority.is_high() {
             self.high_write_buf.push_front(frame);
         } else {
@@ -702,7 +711,7 @@ where
         }
     }
 
-    fn push_back(&mut self, priority: Priority, frame: bytes::Bytes) {
+    fn push_back(&mut self, priority: Priority, frame: PendingFrame) {
         if priority.is_high() {
             self.high_write_buf.push_back(frame);
         } else {
@@ -716,20 +725,22 @@ where
     fn send_inner(
         &mut self,
         cx: &mut Context,
-        frame: bytes::Bytes,
+        frame: PendingFrame,
         priority: Priority,
     ) -> Result<bool, io::Error> {
-        let data_size = frame.len();
+        let (data, guard) = frame;
         let mut sink = Pin::new(&mut self.substream);
 
         match sink.as_mut().poll_ready(cx)? {
             Poll::Ready(()) => {
-                sink.as_mut().start_send(frame)?;
-                self.context.decr_pending_data_size(data_size);
+                sink.as_mut().start_send(data)?;
+                // `guard` drops here: the bytes are no longer queued by us,
+                // whether `start_send` accepted them or returned an error.
+                drop(guard);
                 Ok(false)
             }
             Poll::Pending => {
-                self.push_front(priority, frame);
+                self.push_front(priority, (data, guard));
                 self.poll_complete(cx)?;
                 Ok(true)
             }
@@ -783,8 +794,8 @@ where
     /// Handling commands send by session
     fn handle_proto_event(&mut self, cx: &mut Context, event: ProtocolEvent, priority: Priority) {
         match event {
-            ProtocolEvent::Message { data } => {
-                self.push_back(priority, data);
+            ProtocolEvent::Message { data, guard } => {
+                self.push_back(priority, (data, guard));
 
                 if let Err(err) = self.send_data(cx) {
                     // Whether it is a read send error or a flush error,

@@ -1,3 +1,36 @@
+## Unreleased
+
+### Security fixes
+- Enforce the per-session send buffer limit before a message is queued instead
+  of after. The limit used to be checked only while flushing a session whose
+  service-side buffer was non-empty, so a peer that stopped reading could keep
+  data queued in the lower session and substream layers — where it is still
+  counted as pending — without the check ever running, consuming far more
+  memory than `send_buffer_size` allows. Outbound capacity is now reserved
+  atomically when a message is accepted, at both the protocol-sender and the
+  service layer, so the byte count can never exceed the configured limit.
+
+### Bug fix
+- Return reserved send-buffer capacity whenever queued outbound data is
+  discarded rather than written. Closing a protocol substream, clearing a
+  buffer or losing a channel used to drop the data while leaving its bytes
+  counted, which permanently shrank a session's usable send buffer and
+  eventually closed a healthy peer. Capacity is now tied to the data itself and
+  released automatically on every path.
+
+### Breaking changes
+- `send_buffer_size` is now an admission limit rather than a symptom check: a
+  message that would push a session over it is refused and the session is
+  closed with `ServiceError::SessionBlocked`. A single message larger than
+  `send_buffer_size` is therefore always refused, even to a fast peer.
+- `SessionContext::closed()` also becomes `true` at the moment the send buffer
+  limit is exceeded, which is when the session is scheduled to be closed —
+  slightly before the close has been carried out.
+- `ProtocolContextMutRef::send_message` / `quick_send_message` return `Ok(())`
+  when a message is deliberately dropped because the session is gone or has
+  just exceeded its send buffer. `Err(_)` now only reports that the service
+  itself is unreachable.
+
 ## tentacle 0.7.5 yamux 0.3.18
 
 ### Bug fix
