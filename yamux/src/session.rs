@@ -72,6 +72,17 @@ pub struct Session<T> {
     pending_streams: VecDeque<StreamHandle>,
     // The buffer which will send to underlying network
     write_pending_frames: VecDeque<Frame>,
+    // When the framed sink first reported back-pressure (poll_ready/poll_flush
+    // returned Pending) without making progress since. `None` means the
+    // outbound side is currently making progress, so the stall timer is not
+    // running. The timer starts only when an outbound frame actually becomes
+    // stalled, not while the connection is merely idle.
+    write_pending_since: Option<Instant>,
+    // Timer paired with `write_pending_since`. Polling it registers the
+    // session waker so a permanently blocked sink is revisited when the write
+    // timeout expires, even when keepalive is disabled and no other event
+    // arrives.
+    write_pending_timer: Option<Interval>,
     // The buffer which will distribute to sub streams
     read_pending_frames: VecDeque<Frame>,
 
@@ -178,6 +189,8 @@ where
             streams: HashMap::default(),
             pending_streams: VecDeque::default(),
             write_pending_frames: VecDeque::default(),
+            write_pending_since: None,
+            write_pending_timer: None,
             read_pending_frames: VecDeque::default(),
             event_sender,
             event_receiver,
@@ -245,6 +258,66 @@ where
         };
         let frame = Frame::new_ping(Flags::from(flag), ping_id);
         self.send_frame(cx, frame).map(|_| ping_id)
+    }
+
+    /// Returns true when the outbound side has been blocked (the framed sink
+    /// kept returning `Pending`) for longer than `connection_write_timeout`.
+    ///
+    /// The stall timer is only running when `write_pending_since` is set,
+    /// i.e. a write actually became pending. An idle connection (no pending
+    /// frames, no back-pressure) is never considered stalled.
+    fn write_stalled(&self) -> bool {
+        match self.write_pending_since {
+            Some(since) => {
+                self.now().saturating_duration_since(since) > self.config.connection_write_timeout
+            }
+            None => false,
+        }
+    }
+
+    /// Mark the outbound side as making progress, clearing the stall timer.
+    fn mark_write_progress(&mut self) {
+        self.write_pending_since = None;
+        self.write_pending_timer = None;
+    }
+
+    /// Mark the outbound side as currently blocked. The first call starts the
+    /// stall timer; subsequent calls while still pending keep the original
+    /// start time.
+    fn mark_write_pending(&mut self) {
+        if self.write_pending_since.is_none() {
+            self.write_pending_since = Some(self.now());
+            if !self.config.connection_write_timeout.is_zero() {
+                let timer = interval(self.config.connection_write_timeout);
+                #[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
+                let timer = {
+                    let mut timer = timer;
+                    timer.mock_instant(self.time_mock.clone());
+                    timer
+                };
+                self.write_pending_timer = Some(timer);
+            }
+        }
+    }
+
+    /// Poll the active write-stall deadline. This both detects an expired
+    /// deadline and registers `cx.waker()` with the timer on the first pending
+    /// write, so timeout enforcement does not depend on unrelated I/O,
+    /// control messages, or keepalive ticks waking the session.
+    fn poll_write_stall_timeout(&mut self, cx: &mut Context) -> Result<(), io::Error> {
+        if self.write_pending_since.is_none() {
+            return Ok(());
+        }
+        if self.config.connection_write_timeout.is_zero() || self.write_stalled() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+
+        if let Some(timer) = self.write_pending_timer.as_mut() {
+            if Pin::new(timer).poll_next(cx).is_ready() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+        }
+        Ok(())
     }
 
     /// GoAway can be used to prevent accepting further
@@ -356,10 +429,21 @@ where
             match sink.as_mut().poll_ready(cx)? {
                 Poll::Ready(()) => {
                     sink.as_mut().start_send(frame)?;
+                    // A frame was successfully accepted by the sink: the
+                    // outbound side is making progress, so reset the stall
+                    // timer.
+                    self.mark_write_progress();
                 }
                 Poll::Pending => {
                     debug!("[{:?}] framed_stream NotReady, frame: {:?}", self.ty, frame);
                     self.write_pending_frames.push_front(frame);
+
+                    // The write only just became blocked: start the stall
+                    // timer now (if it wasn't already running) and only fail
+                    // once we have actually been pending for longer than
+                    // `connection_write_timeout`.
+                    self.mark_write_pending();
+                    self.poll_write_stall_timeout(cx)?;
 
                     if self.poll_complete(cx)? {
                         return Ok(true);
@@ -378,8 +462,19 @@ where
     /// Sink `poll_complete` NotReady -> there is more work left to do, may wake up next poll
     fn poll_complete(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
         match Pin::new(&mut self.framed_stream).poll_flush(cx) {
-            Poll::Pending => Ok(true),
-            Poll::Ready(res) => res.map(|_| false),
+            Poll::Pending => {
+                // The flush could not complete right now. Start (or keep
+                // running) the stall timer; only treat this as an error if
+                // we have actually been stalled for too long.
+                self.mark_write_pending();
+                self.poll_write_stall_timeout(cx)?;
+                Ok(true)
+            }
+            Poll::Ready(res) => {
+                // Flush completed: the outbound side has made progress.
+                self.mark_write_progress();
+                res.map(|_| false)
+            }
         }
     }
 
@@ -651,6 +746,10 @@ where
             debug!("yamux::Session finished because is_dead");
             return Poll::Ready(None);
         }
+
+        // The timer itself wakes this session at the write-stall deadline.
+        // Check it before processing any unrelated keepalive or inbound work.
+        self.poll_write_stall_timeout(cx)?;
 
         if log_enabled!(log::Level::Trace)
             && !(self.write_pending_frames.is_empty() && self.read_pending_frames.is_empty())
@@ -1047,7 +1146,97 @@ mod test {
         }
     }
 
+    /// A transport that never accepts or flushes outbound bytes and never
+    /// wakes the session itself. Only the write-stall timer can make progress.
+    struct NeverWritableSocket;
+
+    impl AsyncRead for NeverWritableSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for NeverWritableSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     // after TIMEOUT time, will finished
+    #[test]
+    fn test_write_stalled_uses_connection_write_timeout() {
+        rt().block_on(async {
+            let (_remote, local) = MockSocket::new();
+            let config = Config {
+                enable_keepalive: false,
+                connection_write_timeout: Duration::from_millis(100),
+                ..Default::default()
+            };
+            let mut session = Session::new_server(local, config);
+            // An idle session (no outbound back-pressure) must never be reported
+            // as stalled, regardless of how long it has been idle.
+            assert!(!session.write_stalled());
+            assert!(session.write_pending_since.is_none());
+            assert!(session.write_pending_timer.is_none());
+
+            // Simulate the sink reporting back-pressure: the stall timer starts
+            // now, but the connection is not stalled yet.
+            session.mark_write_pending();
+            assert!(!session.write_stalled());
+            assert!(session.write_pending_timer.is_some());
+
+            // Pretend back-pressure has lasted longer than the configured
+            // timeout: only now should we report stalled.
+            session.write_pending_since = Some(session.now() - Duration::from_secs(1));
+            assert!(session.write_stalled());
+
+            // Once the sink makes progress again, the stall timer must be reset.
+            session.mark_write_progress();
+            assert!(!session.write_stalled());
+            assert!(session.write_pending_since.is_none());
+            assert!(session.write_pending_timer.is_none());
+        });
+    }
+
+    #[test]
+    fn test_write_stall_timer_wakes_without_an_external_event() {
+        rt().block_on(async {
+            let config = Config {
+                enable_keepalive: false,
+                connection_write_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
+            let mut session = Session::new_server(NeverWritableSocket, config);
+            session
+                .write_pending_frames
+                .push_back(Frame::new_ping(Flags::from(Flag::Syn), 1));
+
+            let result = tokio::time::timeout(Duration::from_secs(1), session.next())
+                .await
+                .expect("write-stall timer did not wake the session");
+            match result {
+                Some(Err(error)) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
+                _ => panic!("expected the session to report a write timeout"),
+            }
+        });
+    }
+
     #[test]
     fn test_keepalive_should_work_on_no_communication_scenario() {
         let rt = rt();
