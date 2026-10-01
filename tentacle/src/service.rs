@@ -1,4 +1,4 @@
-use futures::{SinkExt, channel::mpsc, future::poll_fn, prelude::*, stream::StreamExt};
+use futures::{SinkExt, channel::mpsc, future, future::poll_fn, prelude::*, stream::StreamExt};
 use log::{debug, error, trace};
 use nohash_hasher::IntMap;
 use secio::KeyProvider;
@@ -68,6 +68,235 @@ use bytes::Bytes;
 pub use crate::service::config::TlsConfig;
 
 type Result<T> = std::result::Result<T, TransportErrorKind>;
+
+async fn run_cancelable<F>(future: F, receiver: futures::channel::oneshot::Receiver<()>)
+where
+    F: Future<Output = ()>,
+{
+    let _ignore = future::select(Box::pin(future), receiver).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_cancelable;
+    use futures::channel::oneshot;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    /// A future that polls forever as `Pending`, and records on drop that it
+    /// was cancelled. Models a long-running / never-completing user protocol
+    /// callback inside `handle_event(...).await`.
+    struct PendingUntilDropped(Arc<AtomicBool>);
+
+    impl Future for PendingUntilDropped {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingUntilDropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A future that resolves once at the first poll, recording that it ran
+    /// to completion.
+    struct ImmediateReady(Arc<AtomicBool>);
+
+    impl Future for ImmediateReady {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.0.store(true, Ordering::SeqCst);
+            Poll::Ready(())
+        }
+    }
+
+    /// Baseline regression guard: the cancellation oneshot must drop a future
+    /// that is currently pending. This is the original `bf23d7f` regression's
+    /// invariant.
+    #[tokio::test]
+    async fn cancelable_protocol_task_drops_pending_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = oneshot::channel();
+        let handle = tokio::spawn(run_cancelable(
+            PendingUntilDropped(dropped.clone()),
+            receiver,
+        ));
+
+        tokio::task::yield_now().await;
+        sender.send(()).unwrap();
+        handle.await.unwrap();
+
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// If the inner future finishes naturally, `run_cancelable` must complete
+    /// without panicking, even when the cancellation `Sender` is later dropped
+    /// without ever firing. This guards the "happy path" / graceful-shutdown
+    /// case where the protocol task ends on its own.
+    #[tokio::test]
+    async fn cancelable_returns_when_inner_future_completes_first() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = oneshot::channel::<()>();
+
+        run_cancelable(ImmediateReady(ran.clone()), receiver).await;
+
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "inner future must have been polled to completion"
+        );
+        // Dropping the sender after run_cancelable returned must be harmless.
+        drop(sender);
+    }
+
+    /// If the cancellation `Sender` is dropped without sending, the oneshot
+    /// resolves with `Err(Canceled)`. `future::select` still treats that
+    /// branch as completed, so the inner future will also be dropped. This
+    /// behaviour is intentional: cleanup paths in `session.rs` rely on
+    /// "sender dropped == cancel" semantics elsewhere, and we want to confirm
+    /// `run_cancelable` does not hang on a dropped sender either.
+    #[tokio::test]
+    async fn cancelable_drops_inner_when_sender_is_dropped() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = oneshot::channel::<()>();
+        let handle = tokio::spawn(run_cancelable(
+            PendingUntilDropped(dropped.clone()),
+            receiver,
+        ));
+
+        // Give the spawned task a chance to be polled at least once.
+        tokio::task::yield_now().await;
+        drop(sender);
+
+        // Must terminate; if the regression returns the spawned task would
+        // hang and `timeout` would fire.
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run_cancelable must terminate when sender is dropped")
+            .expect("spawned task must not panic");
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "inner future must be dropped after sender is dropped",
+        );
+    }
+
+    /// Tighter reproduction of the original finding's scenario: an outer
+    /// loop dispatches events whose handlers `.await` indefinitely. The
+    /// cancellation receiver must interrupt the in-flight handler. This is
+    /// the exact behaviour the previous internal-`tokio::select!` design
+    /// failed to provide.
+    #[tokio::test]
+    async fn cancelable_interrupts_in_flight_event_handler() {
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use futures::channel::mpsc as fmpsc;
+
+        let handler_dropped = Arc::new(AtomicBool::new(false));
+        let (mut event_tx, mut event_rx) = fmpsc::channel::<()>(1);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+
+        let handler_dropped_clone = handler_dropped.clone();
+        // Mirrors `ServiceProtocolStream::run` structure: a `loop { select! }`
+        // that, on receiving an event, awaits a user callback. The callback
+        // here is `PendingUntilDropped`, which never returns.
+        let inner = async move {
+            loop {
+                tokio::select! {
+                    maybe_event = event_rx.next() => {
+                        if maybe_event.is_none() { break; }
+                        // Once we enter this branch, the previous design had
+                        // no way to observe cancellation until this completes.
+                        PendingUntilDropped(handler_dropped_clone.clone()).await;
+                    }
+                }
+            }
+        };
+
+        let task = tokio::spawn(run_cancelable(inner, cancel_rx));
+
+        // Drive into the event branch.
+        event_tx.send(()).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Now fire cancellation while the handler is `Pending`.
+        cancel_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must interrupt a pending event handler")
+            .expect("spawned task must not panic");
+
+        assert!(
+            handler_dropped.load(Ordering::SeqCst),
+            "pending handler future must be dropped on cancellation",
+        );
+    }
+
+    /// Sending cancellation before the spawned task is ever polled must still
+    /// cause it to terminate, and must not poll the inner future at all
+    /// (here we observe that polls counted is 0 since `future::select`
+    /// resolves the already-ready receiver on the first poll round).
+    #[tokio::test]
+    async fn cancelable_handles_cancellation_signaled_before_first_poll() {
+        struct CountingPending(Arc<AtomicUsize>);
+        impl Future for CountingPending {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Pending
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = oneshot::channel();
+        sender.send(()).unwrap();
+
+        run_cancelable(CountingPending(polls.clone()), receiver).await;
+
+        // `future::select` polls both sides in undefined order; in either
+        // case it must terminate immediately because the receiver is ready.
+        // The inner future may have been polled at most once.
+        assert!(
+            polls.load(Ordering::SeqCst) <= 1,
+            "pre-armed cancellation must not let the inner future loop",
+        );
+    }
+
+    /// Confirms the helper's signature accepts arbitrary `Future<Output=()>`
+    /// values, including ones containing user-provided async blocks, without
+    /// requiring `Unpin` from the caller (it `Box::pin`s internally).
+    #[tokio::test]
+    async fn cancelable_accepts_non_unpin_async_block() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        let (_sender, receiver) = oneshot::channel::<()>();
+
+        // An `async {}` block is `!Unpin` by default; this would not compile
+        // if `run_cancelable` required `F: Unpin`.
+        run_cancelable(
+            async move {
+                ran_clone.store(true, Ordering::SeqCst);
+            },
+            receiver,
+        )
+        .await;
+
+        assert!(ran.load(Ordering::SeqCst));
+    }
+}
 
 /// Output of the transport-agnostic session-registration steps. The caller
 /// uses these fields to build a per-multiplexer session loop (`Session` for
@@ -791,7 +1020,7 @@ where
                     );
                     let (sender, receiver) = futures::channel::oneshot::channel();
                     let handle = crate::runtime::spawn(async move {
-                        stream.run(receiver).await;
+                        run_cancelable(stream.run(), receiver).await;
                     });
                     handles.push((Some(sender), handle));
                 }
@@ -1290,8 +1519,11 @@ where
                 );
                 let (sender, receiver) = futures::channel::oneshot::channel();
                 let handle = crate::runtime::spawn(async move {
-                    stream.handle_event(ServiceProtocolEvent::Init).await;
-                    stream.run(receiver).await;
+                    let task = async {
+                        stream.handle_event(ServiceProtocolEvent::Init).await;
+                        stream.run().await;
+                    };
+                    run_cancelable(task, receiver).await;
                 });
                 self.wait_handle.push((Some(sender), handle));
             } else {
