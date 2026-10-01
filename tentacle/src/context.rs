@@ -8,6 +8,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::channel::QuickSinkExt;
 use crate::{
@@ -26,16 +27,19 @@ use crate::{
 pub(crate) struct SessionController {
     pub(crate) sender: mpsc::Sender<SessionEvent>,
     pub(crate) inner: Arc<SessionContext>,
+    _connection_permit: OwnedSemaphorePermit,
 }
 
 impl SessionController {
     pub(crate) fn new(
         event_sender: mpsc::Sender<SessionEvent>,
         inner: Arc<SessionContext>,
+        connection_permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
             sender: event_sender,
             inner,
+            _connection_permit: connection_permit,
         }
     }
 

@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::codec::{Framed, FramedParts, LengthDelimitedCodec};
 use yamux::{Control, Session as YamuxSession, StreamHandle};
 
@@ -75,6 +76,8 @@ pub(crate) enum SessionEvent {
         ty: SessionType,
         /// listen addr
         listen_address: Option<Multiaddr>,
+        /// Capacity reserved for this connection until its session closes.
+        connection_permit: OwnedSemaphorePermit,
     },
     /// QUIC handshake completed (TLS + tentacle identity verified) for either
     /// a dial or accept. Bypasses the secio handshake path; the recipient
@@ -88,6 +91,8 @@ pub(crate) enum SessionEvent {
         ty: SessionType,
         /// error
         error: HandshakeErrorKind,
+        /// Capacity reserved for this connection. Dropping the event releases it.
+        connection_permit: OwnedSemaphorePermit,
     },
     DialError {
         /// remote address
@@ -863,6 +868,7 @@ pub(crate) struct QuicListenAccepted {
     pub(crate) address: Multiaddr,
     pub(crate) listen_address: Option<Multiaddr>,
     pub(crate) ty: SessionType,
+    pub(crate) connection_permit: OwnedSemaphorePermit,
 }
 
 pub(crate) struct SessionMeta {

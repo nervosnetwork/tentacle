@@ -5,10 +5,12 @@ use secio::{KeyProvider, handshake::Config};
 use std::{
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use yamux::session::SessionType as YamuxType;
 
 use crate::{
@@ -80,6 +82,7 @@ pub(crate) struct HandshakeContext<K> {
     pub(crate) ty: SessionType,
     pub(crate) remote_address: Multiaddr,
     pub(crate) listen_address: Option<Multiaddr>,
+    pub(crate) connection_permit: OwnedSemaphorePermit,
 }
 
 impl<K> HandshakeContext<K>
@@ -111,6 +114,7 @@ where
                             ty: self.ty,
                             error: HandshakeErrorKind::Timeout(error.to_string()),
                             address: self.remote_address,
+                            connection_permit: self.connection_permit,
                         }
                     }
                     Ok(res) => match res {
@@ -120,6 +124,7 @@ where
                             address: self.remote_address,
                             ty: self.ty,
                             listen_address: self.listen_address,
+                            connection_permit: self.connection_permit,
                         },
                         Err(error) => {
                             debug!(
@@ -130,6 +135,7 @@ where
                                 ty: self.ty,
                                 error: HandshakeErrorKind::SecioError(error),
                                 address: self.remote_address,
+                                connection_permit: self.connection_permit,
                             }
                         }
                     },
@@ -145,6 +151,7 @@ where
                     address: self.remote_address,
                     ty: self.ty,
                     listen_address: self.listen_address,
+                    connection_permit: self.connection_permit,
                 };
                 if let Err(err) = self.event_sender.send(event).await {
                     error!("handshake result send back error: {:?}", err);
@@ -163,6 +170,7 @@ pub struct Listener<K> {
     pub(crate) timeout: Duration,
     pub(crate) listen_addr: Multiaddr,
     pub(crate) future_task_sender: mpsc::Sender<BoxedFutureTask>,
+    pub(crate) connection_limiter: Arc<Semaphore>,
     pub(crate) listens_upgrade_modes: std::sync::Arc<
         crate::lock::Mutex<
             std::collections::HashMap<
@@ -383,8 +391,12 @@ where
         });
     }
 
-    fn handshake<H>(&self, socket: H, remote_address: Multiaddr)
-    where
+    fn handshake<H>(
+        &self,
+        socket: H,
+        remote_address: Multiaddr,
+        connection_permit: OwnedSemaphorePermit,
+    ) where
         H: AsyncRead + AsyncWrite + Send + 'static + Unpin,
     {
         let handshake_task = HandshakeContext {
@@ -395,6 +407,7 @@ where
             event_sender: self.event_sender.clone(),
             max_frame_length: self.max_frame_length,
             timeout: self.timeout,
+            connection_permit,
         }
         .handshake(socket);
 
@@ -424,8 +437,18 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok((remote_address, socket)))) => {
-                self.handshake(socket, remote_address);
+            Poll::Ready(Some(Ok((remote_address, socket, connection_permit)))) => {
+                let connection_permit = match connection_permit {
+                    Some(permit) => permit,
+                    None => match self.connection_limiter.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            debug!("connection limit reached, dropping inbound stream");
+                            return Poll::Ready(Some(()));
+                        }
+                    },
+                };
+                self.handshake(socket, remote_address, connection_permit);
                 Poll::Ready(Some(()))
             }
             Poll::Ready(None) => {
