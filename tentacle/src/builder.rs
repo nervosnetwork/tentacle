@@ -192,13 +192,31 @@ where
         self
     }
 
-    /// The limit of max open connection(file descriptors)
-    /// If not limited, service will try to serve as many connections as possible until it exhausts system resources(os error),
-    /// and then close the listener, no longer accepting new connection requests, and the established connections remain working
+    /// The limit of max inbound open connections(file descriptors).
+    /// If not limited, service will try to serve as many inbound connections as possible until it exhausts system resources(os error),
+    /// and then close the listener, no longer accepting new inbound connection requests, and the established connections remain working.
+    ///
+    /// This method is kept for API compatibility. It only changes the inbound connection limit.
     ///
     /// Default is 65535
     pub fn max_connection_number(mut self, number: usize) -> Self {
-        self.config.max_connection_number = number;
+        self.config.max_inbound_connection_number = number;
+        self
+    }
+
+    /// The limit of max inbound open connections(file descriptors).
+    ///
+    /// Default is 65535
+    pub fn max_inbound_connection_number(mut self, number: usize) -> Self {
+        self.config.max_inbound_connection_number = number;
+        self
+    }
+
+    /// The limit of max outbound open connections(file descriptors).
+    ///
+    /// Default is 65535
+    pub fn max_outbound_connection_number(mut self, number: usize) -> Self {
+        self.config.max_outbound_connection_number = number;
         self
     }
 

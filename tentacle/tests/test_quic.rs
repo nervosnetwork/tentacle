@@ -35,14 +35,17 @@ use std::{
     time::Duration,
 };
 use tentacle::{
-    ProtocolId, async_trait,
+    ProtocolId, SessionId, async_trait,
     builder::{MetaBuilder, ServiceBuilder},
     context::{ProtocolContext, ProtocolContextMutRef, ServiceContext},
     error::TransportErrorKind,
     multiaddr::Multiaddr,
     quic::config::QuicConfig,
     secio::SecioKeyPair,
-    service::{ProtocolHandle, ProtocolMeta, Service, ServiceError, ServiceEvent, TargetProtocol},
+    service::{
+        ProtocolHandle, ProtocolMeta, Service, ServiceControl, ServiceError, ServiceEvent,
+        TargetProtocol,
+    },
     traits::{ServiceHandle, ServiceProtocol},
 };
 
@@ -66,6 +69,24 @@ where
         builder = builder.quic_config(QuicConfig::default());
     }
     builder.build(handle)
+}
+
+fn build_service_with_limits<F>(
+    key: SecioKeyPair,
+    handle: F,
+    max_inbound: usize,
+    max_outbound: usize,
+) -> Service<F, SecioKeyPair>
+where
+    F: ServiceHandle + Unpin + 'static,
+{
+    ServiceBuilder::default()
+        .forever(true)
+        .handshake_type(key.into())
+        .quic_config(QuicConfig::default())
+        .max_inbound_connection_number(max_inbound)
+        .max_outbound_connection_number(max_outbound)
+        .build(handle)
 }
 
 // ─────────────────────────────── protocol handles ───────────────────────────────
@@ -185,6 +206,53 @@ impl ServiceHandle for CollectingHandle {
     async fn handle_event(&mut self, _env: &mut ServiceContext, _event: ServiceEvent) {}
 }
 
+#[derive(Clone)]
+struct TrackingHandle {
+    opens: crossbeam_channel::Sender<SessionId>,
+    closes: crossbeam_channel::Sender<SessionId>,
+    errors: crossbeam_channel::Sender<String>,
+}
+
+#[async_trait]
+impl ServiceHandle for TrackingHandle {
+    async fn handle_event(&mut self, _env: &mut ServiceContext, event: ServiceEvent) {
+        match event {
+            ServiceEvent::SessionOpen { session_context } => {
+                let _ignore = self.opens.send(session_context.id);
+            }
+            ServiceEvent::SessionClose { session_context } => {
+                let _ignore = self.closes.send(session_context.id);
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_error(&mut self, _env: &mut ServiceContext, error: ServiceError) {
+        let _ignore = self.errors.send(format!("{:?}", error));
+    }
+}
+
+fn tracking_handle() -> (
+    TrackingHandle,
+    crossbeam_channel::Receiver<SessionId>,
+    crossbeam_channel::Receiver<SessionId>,
+    crossbeam_channel::Receiver<String>,
+) {
+    let (open_tx, open_rx) = crossbeam_channel::unbounded();
+    let (close_tx, close_rx) = crossbeam_channel::unbounded();
+    let (error_tx, error_rx) = crossbeam_channel::unbounded();
+    (
+        TrackingHandle {
+            opens: open_tx,
+            closes: close_tx,
+            errors: error_tx,
+        },
+        open_rx,
+        close_rx,
+        error_rx,
+    )
+}
+
 // ───────────────────────────── basic connectivity ─────────────────────────────
 
 /// Test 1: two QUIC services exchange messages over a single protocol.
@@ -250,6 +318,165 @@ fn test_quic_basic_connectivity() {
         collect(&client_rx, 10) >= 10,
         "client should receive at least 10 messages over quic"
     );
+}
+
+#[test]
+fn test_quic_inbound_connection_limit_rejects_extra_connection_and_releases_capacity() {
+    let server_key = SecioKeyPair::secp256k1_generated();
+    let (server_handle, server_open_rx, server_close_rx, _server_error_rx) = tracking_handle();
+    let (addr_tx, addr_rx) = oneshot::channel::<Multiaddr>();
+
+    let _server = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = build_service_with_limits(server_key, server_handle, 1, 16);
+        rt.block_on(async move {
+            let listen = service
+                .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .await
+                .expect("server listen");
+            let _ignore = addr_tx.send(listen);
+            service.run().await
+        });
+    });
+
+    let listen_addr = futures::executor::block_on(addr_rx).unwrap();
+
+    let client1_key = SecioKeyPair::secp256k1_generated();
+    let (client1_handle, client1_open_rx, _client1_close_rx, _client1_error_rx) = tracking_handle();
+    let (client1_control_tx, client1_control_rx) = oneshot::channel::<ServiceControl>();
+    let dial = listen_addr.clone();
+    let _client1 = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = build_service_with_limits(client1_key, client1_handle, 16, 16);
+        let control = service.control().clone().into();
+        let _ignore = client1_control_tx.send(control);
+        rt.block_on(async move {
+            service.dial(dial, TargetProtocol::All).await.expect("dial");
+            service.run().await
+        });
+    });
+
+    let client1_control = futures::executor::block_on(client1_control_rx).unwrap();
+    let client1_session = client1_open_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first client session opens");
+    server_open_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first inbound session opens");
+
+    let client2_key = SecioKeyPair::secp256k1_generated();
+    let (client2_handle, _client2_open_rx, _client2_close_rx, _client2_error_rx) =
+        tracking_handle();
+    let dial = listen_addr.clone();
+    let _client2 = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = build_service_with_limits(client2_key, client2_handle, 16, 16);
+        rt.block_on(async move {
+            service.dial(dial, TargetProtocol::All).await.expect("dial");
+            service.run().await
+        });
+    });
+
+    assert!(
+        server_open_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "second inbound QUIC connection must be rejected before session open"
+    );
+
+    client1_control.disconnect(client1_session).unwrap();
+    server_close_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first inbound session closes and releases capacity");
+
+    let client3_key = SecioKeyPair::secp256k1_generated();
+    let (client3_handle, _client3_open_rx, _client3_close_rx, _client3_error_rx) =
+        tracking_handle();
+    let dial = listen_addr.clone();
+    let _client3 = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = build_service_with_limits(client3_key, client3_handle, 16, 16);
+        rt.block_on(async move {
+            service.dial(dial, TargetProtocol::All).await.expect("dial");
+            service.run().await
+        });
+    });
+
+    server_open_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("new inbound QUIC connection opens after capacity is released");
+}
+
+#[test]
+fn test_quic_outbound_connection_limit_rejects_extra_connection_and_releases_capacity() {
+    let spawn_server = || {
+        let key = SecioKeyPair::secp256k1_generated();
+        let (handle, open_rx, _close_rx, _error_rx) = tracking_handle();
+        let (addr_tx, addr_rx) = oneshot::channel::<Multiaddr>();
+        let _server = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let mut service = build_service_with_limits(key, handle, 16, 16);
+            rt.block_on(async move {
+                let listen = service
+                    .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                    .await
+                    .expect("server listen");
+                let _ignore = addr_tx.send(listen);
+                service.run().await
+            });
+        });
+        (futures::executor::block_on(addr_rx).unwrap(), open_rx)
+    };
+
+    let (server1_addr, server1_open_rx) = spawn_server();
+    let (server2_addr, server2_open_rx) = spawn_server();
+
+    let client_key = SecioKeyPair::secp256k1_generated();
+    let (client_handle, client_open_rx, _client_close_rx, client_error_rx) = tracking_handle();
+    let (control_tx, control_rx) = oneshot::channel::<ServiceControl>();
+    let _client = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut service = build_service_with_limits(client_key, client_handle, 16, 1);
+        let control = service.control().clone().into();
+        let _ignore = control_tx.send(control);
+        rt.block_on(async move { service.run().await });
+    });
+
+    let control = futures::executor::block_on(control_rx).unwrap();
+    control.dial(server1_addr, TargetProtocol::All).unwrap();
+    let first_session = client_open_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first outbound session opens");
+    server1_open_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first server observes inbound session");
+
+    control
+        .dial(server2_addr.clone(), TargetProtocol::All)
+        .unwrap();
+    assert!(
+        client_error_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("over-capacity outbound dial reports an error")
+            .contains("outbound connection limit reached")
+    );
+    assert!(
+        server2_open_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "rejected outbound QUIC dial must not open a remote session"
+    );
+
+    control.disconnect(first_session).unwrap();
+    thread::sleep(Duration::from_millis(500));
+
+    control.dial(server2_addr, TargetProtocol::All).unwrap();
+    client_open_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("new outbound session opens after capacity is released");
+    server2_open_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second server observes inbound session after release");
 }
 
 // ────────────────────────────── multi-protocol ──────────────────────────────

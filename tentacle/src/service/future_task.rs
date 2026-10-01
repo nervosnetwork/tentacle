@@ -188,6 +188,8 @@ mod test {
         let finished_tasks_inner = Arc::clone(&finished_tasks);
         let signals_len = Arc::new(AtomicUsize::new(usize::MAX));
         let signals_len_inner = Arc::clone(&signals_len);
+        let finished_tasks_for_manager = Arc::clone(&finished_tasks);
+        let (signals_drained_sender, signals_drained_receiver) = std::sync::mpsc::sync_channel(1);
 
         let mut send_task = sender.clone();
 
@@ -207,22 +209,31 @@ mod test {
             rt.block_on(async move {
                 loop {
                     // When `sender` dropped, FutureTaskManager will stop
-                    if manager.next().await.is_none() {
-                        signals_len_inner.store(manager.signals.len(), Ordering::SeqCst);
-                        break;
+                    match manager.next().await {
+                        Some(()) => {
+                            if finished_tasks_for_manager.load(Ordering::SeqCst) == 99
+                                && manager.signals.is_empty()
+                            {
+                                let _ignore = signals_drained_sender.send(());
+                            }
+                        }
+                        None => {
+                            signals_len_inner.store(manager.signals.len(), Ordering::SeqCst);
+                            break;
+                        }
                     }
                 }
             });
         });
 
-        // Wait for tasks finish, and manager receive all signals
-        thread::sleep(time::Duration::from_millis(300));
+        signals_drained_receiver
+            .recv_timeout(time::Duration::from_secs(10))
+            .expect("tasks did not finish or completion signals were not drained");
         drop(sender);
-        // Wait for FutureTaskManager stop
-        thread::sleep(time::Duration::from_millis(100));
+
+        handle.join().unwrap();
+
         assert_eq!(finished_tasks.load(Ordering::SeqCst), 99);
         assert_eq!(signals_len.load(Ordering::SeqCst), 0);
-
-        handle.join().unwrap()
     }
 }
