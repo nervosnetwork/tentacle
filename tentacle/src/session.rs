@@ -75,6 +75,8 @@ pub(crate) enum SessionEvent {
         ty: SessionType,
         /// listen addr
         listen_address: Option<Multiaddr>,
+        /// Whether this handshake incremented the service pending-work state.
+        tracked_state: bool,
     },
     /// QUIC handshake completed (TLS + tentacle identity verified) for either
     /// a dial or accept. Bypasses the secio handshake path; the recipient
@@ -88,6 +90,8 @@ pub(crate) enum SessionEvent {
         ty: SessionType,
         /// error
         error: HandshakeErrorKind,
+        /// Whether this handshake incremented the service pending-work state.
+        tracked_state: bool,
     },
     DialError {
         /// remote address
